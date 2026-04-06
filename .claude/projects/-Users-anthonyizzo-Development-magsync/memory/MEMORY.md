@@ -1,1 +1,0 @@
-- [GitHub repo](reference_github_repo.md) — izzoa/magsync, ghcr.io/izzoa/magsync

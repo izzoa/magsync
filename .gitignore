@@ -18,7 +18,8 @@ venv/
 # OpenSpec
 openspec/
 
-# AI coding assistant configs (OpenSpec skills are installed per-tool)
+# AI coding assistant configs
+.claude/
 .agent/
 .augment/
 .cline/
