@@ -193,6 +193,25 @@ class MagazineIndex:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def reset_failed_downloads(self, magazine_title: str | None = None) -> int:
+        """Reset failed downloads back to pending. Returns count reset."""
+        if magazine_title:
+            cursor = self.conn.execute(
+                """UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL
+                   WHERE status = 'failed' AND issue_id IN (
+                       SELECT i.id FROM issues i
+                       JOIN magazines m ON i.magazine_id = m.id
+                       WHERE m.normalized_title LIKE ?
+                   )""",
+                (f"%{magazine_title}%",),
+            )
+        else:
+            cursor = self.conn.execute(
+                "UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL WHERE status = 'failed'"
+            )
+        self.conn.commit()
+        return cursor.rowcount
+
     def get_download_stats(self) -> dict:
         """Get overall download statistics."""
         row = self.conn.execute(

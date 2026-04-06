@@ -385,6 +385,64 @@ def unsubscribe(
 HEALTH_CHECK_PATH = Path("/tmp/magsync-healthy")
 
 
+@app.command()
+def retry(
+    query: str = typer.Argument(None, help="Only retry failed downloads for this magazine"),
+):
+    """Re-attempt all failed downloads."""
+    cfg = load_config()
+    idx = MagazineIndex()
+
+    try:
+        reset_count = idx.reset_failed_downloads(magazine_title=query)
+        if reset_count == 0:
+            console.print("[green]No failed downloads to retry.[/green]")
+            raise typer.Exit()
+
+        console.print(f"[cyan]Retrying {reset_count} failed download{'s' if reset_count != 1 else ''}...[/cyan]")
+
+        pending = idx.get_issues(
+            magazine_title=query,
+            status=DownloadStatus.PENDING,
+        )
+        # Only include issues that have download links
+        pending = [p for p in pending if p.get("limewire_url")]
+
+        from magsync.core.batch import download_batch
+
+        completed = [0]
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            overall = progress.add_task("Overall", total=len(pending))
+
+            def on_start(issue):
+                pass
+
+            def on_complete(issue, success, error):
+                completed[0] += 1
+                progress.update(overall, completed=completed[0])
+                title = issue["title"][:50]
+                if success:
+                    console.print(f"  [green]✓[/green] {title}")
+                else:
+                    console.print(f"  [red]✗[/red] {title}: {error}")
+
+            asyncio.run(download_batch(pending, cfg, idx, on_start, on_complete))
+
+        stats = idx.get_download_stats()
+        console.print(
+            f"\n[green]Done![/green] {stats['downloaded']} downloaded, "
+            f"{stats['pending']} pending, {stats['failed']} failed"
+        )
+    finally:
+        idx.close()
+
+
 def _parse_interval(interval: str) -> int:
     """Parse interval string like '30m', '6h', '1d' to seconds."""
     m = re.fullmatch(r"(\d+)\s*(s|m|h|d)", interval.strip().lower())

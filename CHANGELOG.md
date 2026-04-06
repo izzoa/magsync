@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Concurrent downloads**: `fetch` and `daemon` commands now download multiple issues simultaneously, bounded by `download.max_concurrent` config (default 3)
 - **Resumable downloads**: Interrupted downloads are saved as `.part` files and automatically resumed on next attempt using HTTP Range headers. Expired presigned URLs (>50 min) are refreshed before resuming.
 - **Dry run mode**: `magsync fetch --dry-run` and `magsync daemon --dry-run` preview what would be downloaded with estimated total size, without actually downloading
+- **Retry command**: `magsync retry [query]` re-attempts all failed downloads, optionally filtered by magazine title
+- **Download retry with backoff**: Transient download errors (network, timeout) are automatically retried with exponential backoff (2s, 4s, 8s) up to `retry_attempts` config value. Permanent errors (dead links) fail immediately.
 
 ### Fixed
 - LimeWire share links that are removed or expired now show a clear error ("share link is unavailable") instead of a generic SSR metadata failure

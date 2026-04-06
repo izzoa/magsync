@@ -6,6 +6,7 @@ URL fragment → PBKDF2 → AES-KW unwrap → ECDH P-256 → AES-256-CTR decrypt
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -220,19 +221,74 @@ def decrypt_file(encrypted_data: bytes, aes_key: bytes, constants: LimeWireConst
     return decryptor.update(encrypted_data) + decryptor.finalize()
 
 
+# Errors that should not be retried (permanent failures)
+_PERMANENT_ERRORS = (
+    "share link is unavailable",
+    "auto-extraction failed",
+    "Decryption failed even after",
+    "invalid PDF and could not",
+)
+
+
+def _is_permanent_error(error: str) -> bool:
+    return any(msg in error for msg in _PERMANENT_ERRORS)
+
+
 async def download_and_decrypt(
     limewire_url: str,
     dest: Path,
     *,
     constants: LimeWireConstants | None = None,
     on_progress: callable | None = None,
+    retry_attempts: int | None = None,
 ) -> DownloadResult:
     """Full pipeline: download an encrypted file from LimeWire and decrypt it.
+
+    Retries transient errors with exponential backoff. Permanent errors
+    (dead links, decryption failures) fail immediately.
 
     Returns a DownloadResult with success status and file path.
     """
     if constants is None:
-        constants = load_config().limewire
+        cfg = load_config()
+        constants = cfg.limewire
+        if retry_attempts is None:
+            retry_attempts = cfg.download.retry_attempts
+    if retry_attempts is None:
+        retry_attempts = 3
+
+    last_error = ""
+    for attempt in range(1, retry_attempts + 1):
+        result = await _download_and_decrypt_once(
+            limewire_url, dest, constants=constants, on_progress=on_progress,
+        )
+        if result.success:
+            return result
+
+        last_error = result.error or "Unknown error"
+
+        if _is_permanent_error(last_error):
+            logger.error(f"Permanent error (no retry): {last_error}")
+            return result
+
+        if attempt < retry_attempts:
+            delay = 2 ** attempt  # 2s, 4s, 8s, ...
+            logger.warning(f"Attempt {attempt}/{retry_attempts} failed: {last_error}. Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+        else:
+            logger.error(f"All {retry_attempts} attempts failed: {last_error}")
+
+    return DownloadResult(success=False, error=f"Failed after {retry_attempts} attempts: {last_error}")
+
+
+async def _download_and_decrypt_once(
+    limewire_url: str,
+    dest: Path,
+    *,
+    constants: LimeWireConstants,
+    on_progress: callable | None = None,
+) -> DownloadResult:
+    """Single download attempt (no retry)."""
 
     sharing_id, fragment = parse_limewire_url(limewire_url)
 
