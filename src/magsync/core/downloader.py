@@ -75,6 +75,10 @@ async def establish_session(
         jwt_payload = json.loads(base64.b64decode(payload_b64))
         csrf_token = jwt_payload["csrfToken"]
 
+        # Check for server-side errors (removed/expired share links)
+        if "Unexpected Server Error" in html or '"error"' in html.split("sharingBucketContentData", 1)[-1][:200]:
+            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+
         # Extract bucket_id from SSR data
         # For UUID-format sharing IDs, the sharing_id IS the bucket_id.
         # For short IDs, we need to find the resolved bucket UUID in the HTML.
@@ -96,7 +100,12 @@ async def establish_session(
         file_size = int(size_match.group(1)) if size_match else 0
 
         if not all([bucket_id, content_item_id, passphrase_wrapped, ephemeral_pub]):
-            raise RuntimeError("Failed to extract required SSR metadata from LimeWire page")
+            missing = []
+            if not bucket_id: missing.append("bucket_id")
+            if not content_item_id: missing.append("content_item_id")
+            if not passphrase_wrapped: missing.append("passphrase_wrapped_pk")
+            if not ephemeral_pub: missing.append("ephemeral_public_key")
+            raise RuntimeError(f"Failed to extract SSR metadata from LimeWire page (missing: {', '.join(missing)})")
 
         return LimeWireSession(
             jwt_token=jwt_token,
