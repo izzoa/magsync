@@ -23,7 +23,7 @@ ENV MAGSYNC_CONFIG_DIR=/config \
 
 VOLUME ["/config", "/data", "/magazines"]
 
-HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=60s --timeout=5s --start-period=5m --retries=3 \
     CMD test $( find /tmp/magsync-healthy -mmin -720 2>/dev/null | wc -l ) -gt 0 || exit 1
 
 CMD ["magsync", "daemon"]

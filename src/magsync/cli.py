@@ -481,7 +481,8 @@ def daemon(
     )
     logger = logging.getLogger("magsync")
 
-    # Startup banner
+    # Startup banner + initial health check touch
+    HEALTH_CHECK_PATH.touch()
     logger.info(f"magsync v{__version__} daemon starting")
     logger.info(f"  Output directory: {cfg.output_dir}")
     logger.info(f"  Subscriptions: {len(cfg.subscriptions)}")
