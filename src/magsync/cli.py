@@ -40,6 +40,14 @@ def main(ctx: typer.Context):
         tui_app.run()
 
 
+def _filter_results(results, query: str, exact: bool):
+    """Filter scraped results by exact title match if requested."""
+    if not exact:
+        return results
+    query_norm = strip_accents(query).lower()
+    return [r for r in results if strip_accents(normalize_title(r.title)).lower() == query_norm]
+
+
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Magazine title to search for"),
@@ -313,6 +321,7 @@ def config(
 def subscribe(
     query: str = typer.Argument(None, help="Magazine title to subscribe to"),
     since: str = typer.Option(None, "--since", help="Only fetch issues from this date (YYYY-MM)"),
+    exact: bool = typer.Option(False, "--exact", help="Only download issues whose title matches exactly"),
 ):
     """Add a magazine subscription, or list current subscriptions."""
     cfg = load_config()
@@ -320,13 +329,18 @@ def subscribe(
     if query is None:
         if not cfg.subscriptions:
             console.print("[yellow]No subscriptions configured.[/yellow]")
-            console.print("Add one with: magsync subscribe \"Magazine Name\" --since 2025-01")
+            console.print('Add one with: magsync subscribe "Magazine Name" --since 2025-01')
             raise typer.Exit()
         table = Table(title="Subscriptions")
         table.add_column("Query", style="cyan")
         table.add_column("Since")
+        table.add_column("Match")
         for sub in cfg.subscriptions:
-            table.add_row(sub.query, sub.since or "(all time)")
+            table.add_row(
+                sub.query,
+                sub.since or "(all time)",
+                "exact" if sub.exact else "partial",
+            )
         console.print(table)
         raise typer.Exit()
 
@@ -336,10 +350,11 @@ def subscribe(
             console.print(f"[yellow]Already subscribed to '{query}'[/yellow]")
             raise typer.Exit()
 
-    cfg.subscriptions.append(Subscription(query=query, since=since))
+    cfg.subscriptions.append(Subscription(query=query, since=since, exact=exact))
     save_config(cfg)
     since_str = f" since {since}" if since else ""
-    console.print(f"[green]Subscribed to '{query}'{since_str}[/green]")
+    exact_str = " (exact match)" if exact else ""
+    console.print(f"[green]Subscribed to '{query}'{since_str}{exact_str}[/green]")
 
 
 @app.command()
@@ -447,6 +462,11 @@ def daemon(
                     continue
 
                 if not results:
+                    continue
+
+                results = _filter_results(results, sub.query, sub.exact)
+                if not results:
+                    logger.info(f"  {sub.query}: no exact matches found")
                     continue
 
                 norm = normalize_title(results[0].title) if results[0].title else sub.query

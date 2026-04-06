@@ -74,6 +74,7 @@ class LimeWireSession:
 class Subscription:
     query: str = ""
     since: str | None = None  # YYYY-MM format, e.g. "2025-01"
+    exact: bool = False  # Only index issues whose normalized title matches the query exactly
 
 
 @dataclass

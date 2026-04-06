@@ -110,7 +110,8 @@ def _apply_env_overrides(cfg: Config) -> None:
         else:
             setattr(target, attr_name, val)
 
-    # Subscriptions override (comma-separated query:since pairs)
+    # Subscriptions override (comma-separated query:since pairs, prefix ! for exact)
+    # e.g. "!GQ USA:2025-01,The Economist" → GQ USA (exact, since 2025-01), The Economist (partial, all time)
     subs_env = os.environ.get("MAGSYNC_SUBSCRIPTIONS")
     if subs_env:
         cfg.subscriptions = []
@@ -118,11 +119,14 @@ def _apply_env_overrides(cfg: Config) -> None:
             entry = entry.strip()
             if not entry:
                 continue
+            exact = entry.startswith("!")
+            if exact:
+                entry = entry[1:]
             if ":" in entry:
                 query, since = entry.rsplit(":", 1)
-                cfg.subscriptions.append(Subscription(query=query.strip(), since=since.strip()))
+                cfg.subscriptions.append(Subscription(query=query.strip(), since=since.strip(), exact=exact))
             else:
-                cfg.subscriptions.append(Subscription(query=entry))
+                cfg.subscriptions.append(Subscription(query=entry, exact=exact))
 
     # Apprise URLs override
     apprise_env = os.environ.get("MAGSYNC_APPRISE_URLS")
@@ -157,7 +161,11 @@ def load_config() -> Config:
         if "subscriptions" in data:
             for sub in data["subscriptions"]:
                 cfg.subscriptions.append(
-                    Subscription(query=sub.get("query", ""), since=sub.get("since"))
+                    Subscription(
+                        query=sub.get("query", ""),
+                        since=sub.get("since"),
+                        exact=sub.get("exact", False),
+                    )
                 )
 
     _apply_env_overrides(cfg)
@@ -207,6 +215,8 @@ def save_config(cfg: Config) -> None:
         lines.append(f'query = "{sub.query}"')
         if sub.since:
             lines.append(f'since = "{sub.since}"')
+        if sub.exact:
+            lines.append("exact = true")
         lines.append("")
 
     config_path.write_text("\n".join(lines))
