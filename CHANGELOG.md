@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Download retry with backoff**: Transient download errors (network, timeout) are automatically retried with exponential backoff (2s, 4s, 8s) up to `retry_attempts` config value. Permanent errors (dead links) fail immediately.
 - **Content deduplication**: SHA-256 hash computed for each downloaded PDF. Duplicate files (same content under different titles/URLs) are detected and skipped, saving bandwidth and disk space.
 - **429 rate limit handling**: If LimeWire returns HTTP 429, all concurrent downloads pause for the `Retry-After` duration (or 30s default) via a shared `RateLimitGate`, then resume together
+- **Concurrent detail page scraping**: Magazine detail pages are now scraped 5-at-a-time instead of sequentially, ~5x faster indexing
 
 ### Fixed
 - LimeWire share links that are removed or expired now show a clear error ("share link is unavailable") instead of a generic SSR metadata failure

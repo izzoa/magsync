@@ -187,18 +187,25 @@ async def search_with_details(
     *,
     max_pages: int = 50,
     scrape_delay: float = 1.0,
+    scrape_concurrency: int = 5,
 ) -> list[ScrapedIssue]:
-    """Search and then scrape detail pages for each result."""
+    """Search and then scrape detail pages concurrently."""
     results = await search(query, max_pages=max_pages, scrape_delay=scrape_delay)
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0, headers=DEFAULT_HEADERS) as client:
-        detailed: list[ScrapedIssue] = []
-        for result in results:
+    if not results:
+        return []
+
+    semaphore = asyncio.Semaphore(scrape_concurrency)
+
+    async def _scrape_one(result: ScrapedIssue, client: httpx.AsyncClient) -> ScrapedIssue:
+        async with semaphore:
             detail = await scrape_detail_page(result.page_url, client=client)
-            # Preserve cover from search if detail didn't find one
             if not detail.cover_image_url and result.cover_image_url:
                 detail.cover_image_url = result.cover_image_url
-            detailed.append(detail)
-            await asyncio.sleep(scrape_delay)
+            return detail
 
-    return detailed
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0, headers=DEFAULT_HEADERS) as client:
+        tasks = [_scrape_one(r, client) for r in results]
+        detailed = await asyncio.gather(*tasks)
+
+    return list(detailed)
