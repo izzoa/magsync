@@ -204,7 +204,7 @@ class MagSyncApp(App):
 
     @work(thread=True)
     def _do_download(self) -> None:
-        from magsync.core.downloader import download_and_decrypt
+        from magsync.core.batch import download_batch
 
         issues = [
             i for i in self.search_results
@@ -217,37 +217,26 @@ class MagSyncApp(App):
             self._update_status("No downloadable issues selected.")
             return
 
-        self._update_status(f"Downloading {len(issues)} issues...")
-        log_lines = []
+        max_c = self.cfg.download.max_concurrent
+        self._update_status(f"Downloading {len(issues)} issues (max {max_c} concurrent)...")
+        log_lines: list[str] = []
+        completed = [0]
 
-        for n, issue in enumerate(issues, 1):
-            title = issue["title"][:50]
-            self._update_status(f"[{n}/{len(issues)}] Downloading: {title}...")
+        def on_start(issue):
+            pass
 
-            self.idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
-
-            dest = organize_path(
-                issue["title"], issue["page_url"], self.cfg.output_dir
-            )
-            result = asyncio.run(
-                download_and_decrypt(
-                    issue["limewire_url"], dest, constants=self.cfg.limewire
-                )
-            )
-
-            if result.success:
-                self.idx.update_download_status(
-                    issue["id"], DownloadStatus.COMPLETE,
-                    str(result.file_path), result.file_size_bytes,
-                )
+        def on_complete(issue, success, error):
+            completed[0] += 1
+            if success:
                 log_lines.append(f"✓ {issue['title']}")
             else:
-                self.idx.update_download_status(issue["id"], DownloadStatus.FAILED)
-                log_lines.append(f"✗ {issue['title']}: {result.error}")
-
+                log_lines.append(f"✗ {issue['title']}: {error}")
             self.app.call_from_thread(
                 self._update_download_log, "\n".join(log_lines)
             )
+            self._update_status(f"Downloaded {completed[0]}/{len(issues)}...")
+
+        asyncio.run(download_batch(issues, self.cfg, self.idx, on_start, on_complete))
 
         self._update_status(f"Done! {len(issues)} issues processed.")
         self.app.call_from_thread(self._refresh_library)

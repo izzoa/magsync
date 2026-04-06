@@ -177,10 +177,11 @@ def fetch(
             console.print("[green]All matching issues already downloaded![/green]")
             raise typer.Exit()
 
-        console.print(f"[cyan]Downloading {len(pending)} issues...[/cyan]")
+        console.print(f"[cyan]Downloading {len(pending)} issues (max {cfg.download.max_concurrent} concurrent)...[/cyan]")
 
-        from magsync.core.downloader import download_and_decrypt
+        from magsync.core.batch import download_batch
 
+        completed = [0]
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -190,42 +191,20 @@ def fetch(
         ) as progress:
             overall = progress.add_task("Overall", total=len(pending))
 
-            for issue in pending:
-                lw_url = issue.get("limewire_url")
-                if not lw_url:
-                    console.print(f"  [yellow]Skipping (no download link): {issue['title']}[/yellow]")
-                    progress.advance(overall)
-                    continue
+            def on_start(issue):
+                title = issue["title"][:50]
+                progress.add_task(f"  {title}...", total=None)
 
-                title = issue["title"]
-                dest = organize_path(title, issue["page_url"], output_dir)
-                task = progress.add_task(f"  {title[:50]}...", total=None)
-
-                idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
-
-                def on_progress(downloaded, total, _task=task):
-                    if total:
-                        progress.update(_task, total=total, completed=downloaded)
-
-                result = asyncio.run(
-                    download_and_decrypt(
-                        lw_url, dest, constants=cfg.limewire, on_progress=on_progress
-                    )
-                )
-
-                if result.success:
-                    idx.update_download_status(
-                        issue["id"],
-                        DownloadStatus.COMPLETE,
-                        str(result.file_path),
-                        result.file_size_bytes,
-                    )
-                    progress.update(task, description=f"  [green]✓[/green] {title[:50]}")
+            def on_complete(issue, success, error):
+                completed[0] += 1
+                progress.update(overall, completed=completed[0])
+                title = issue["title"][:50]
+                if success:
+                    console.print(f"  [green]✓[/green] {title}")
                 else:
-                    idx.update_download_status(issue["id"], DownloadStatus.FAILED)
-                    progress.update(task, description=f"  [red]✗[/red] {title[:50]}: {result.error}")
+                    console.print(f"  [red]✗[/red] {title}: {error}")
 
-                progress.advance(overall)
+            asyncio.run(download_batch(pending, cfg, idx, on_start, on_complete))
 
         stats = idx.get_download_stats()
         console.print(
@@ -490,7 +469,8 @@ def daemon(
                 if new:
                     logger.info(f"  {sub.query}: {new} new issues indexed")
 
-            # Phase 2: Download pending issues
+            # Phase 2: Collect all pending issues across subscriptions, then download concurrently
+            all_pending: list[dict] = []
             for sub in cfg.subscriptions:
                 if shutdown:
                     break
@@ -508,38 +488,24 @@ def daemon(
                     since_month=since_month,
                     status=DownloadStatus.PENDING,
                 )
+                all_pending.extend(p for p in pending if p.get("limewire_url"))
 
-                for issue in pending:
-                    if shutdown:
-                        break
-                    lw_url = issue.get("limewire_url")
-                    if not lw_url:
-                        continue
+            if all_pending and not shutdown:
+                from magsync.core.batch import download_batch
 
-                    dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
+                logger.info(f"Downloading {len(all_pending)} issues (max {cfg.download.max_concurrent} concurrent)...")
+
+                def on_start(issue):
                     logger.info(f"  Downloading: {issue['title'][:60]}")
 
-                    idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
-
-                    try:
-                        result = asyncio.run(
-                            download_and_decrypt(lw_url, dest, constants=cfg.limewire)
-                        )
-                    except Exception as e:
-                        logger.error(f"  Failed: {e}")
-                        idx.update_download_status(issue["id"], DownloadStatus.FAILED)
-                        continue
-
-                    if result.success:
-                        idx.update_download_status(
-                            issue["id"], DownloadStatus.COMPLETE,
-                            str(result.file_path), result.file_size_bytes,
-                        )
+                def on_complete(issue, success, error):
+                    if success:
                         downloaded_issues.append(issue)
-                        logger.info(f"  Done: {result.file_path}")
+                        logger.info(f"  Done: {issue['title'][:60]}")
                     else:
-                        idx.update_download_status(issue["id"], DownloadStatus.FAILED)
-                        logger.error(f"  Failed: {result.error}")
+                        logger.error(f"  Failed: {issue['title'][:60]}: {error}")
+
+                asyncio.run(download_batch(all_pending, cfg, idx, on_start, on_complete))
 
             # Phase 3: Notify
             if downloaded_issues:
