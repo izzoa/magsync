@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -267,22 +268,47 @@ async def download_and_decrypt(
             constants,
         )
 
+        # Prepare .part file for resumable download
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part_path = dest.with_suffix(dest.suffix + ".part")
+
+        # Check for existing partial download
+        existing_bytes = 0
+        if part_path.exists():
+            existing_bytes = part_path.stat().st_size
+            part_age_minutes = (time.time() - part_path.stat().st_mtime) / 60
+            if part_age_minutes > 50:
+                # Presigned URL likely expired — get a fresh one
+                logger.info(f"Part file is {int(part_age_minutes)}m old, refreshing session...")
+                session = await establish_session(limewire_url, client=client)
+                aes_key = derive_aes_key(
+                    sharing_id, fragment,
+                    session.passphrase_wrapped_pk,
+                    session.ephemeral_public_key,
+                    constants,
+                )
+            if existing_bytes > 0:
+                logger.info(f"Resuming download from {existing_bytes:,} bytes")
+
         # Get presigned URL
         s3_url = await get_download_url(session, client=client)
 
-        # Download encrypted file
-        encrypted_chunks: list[bytes] = []
-        total_downloaded = 0
-        async with client.stream("GET", s3_url) as stream:
-            async for chunk in stream.aiter_bytes(chunk_size=65536):
-                encrypted_chunks.append(chunk)
-                total_downloaded += len(chunk)
-                if on_progress:
-                    on_progress(total_downloaded, session.file_size)
+        # Download encrypted file (streaming to .part file)
+        headers = {}
+        if existing_bytes > 0:
+            headers["Range"] = f"bytes={existing_bytes}-"
 
-        encrypted_data = b"".join(encrypted_chunks)
+        total_downloaded = existing_bytes
+        with open(part_path, "ab") as f:
+            async with client.stream("GET", s3_url, headers=headers) as stream:
+                async for chunk in stream.aiter_bytes(chunk_size=65536):
+                    f.write(chunk)
+                    total_downloaded += len(chunk)
+                    if on_progress:
+                        on_progress(total_downloaded, session.file_size)
 
-        # Decrypt
+        # Read complete encrypted file and decrypt
+        encrypted_data = part_path.read_bytes()
         decrypted = decrypt_file(encrypted_data, aes_key, constants)
 
         # Validate
@@ -321,9 +347,9 @@ async def download_and_decrypt(
                     error="Decryption produced invalid PDF and could not auto-extract new constants.",
                 )
 
-        # Save
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Save and clean up .part file
         dest.write_bytes(decrypted)
+        part_path.unlink(missing_ok=True)
 
         return DownloadResult(
             success=True,
