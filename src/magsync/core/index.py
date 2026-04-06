@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     status TEXT NOT NULL DEFAULT 'pending',
     file_path TEXT,
     downloaded_at TEXT,
-    file_size_bytes INTEGER
+    file_size_bytes INTEGER,
+    sha256 TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_issues_magazine ON issues(magazine_id);
@@ -60,6 +61,14 @@ class MagazineIndex:
 
     def _init_schema(self):
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """Apply schema migrations for existing databases."""
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(downloads)")}
+        if "sha256" not in columns:
+            self.conn.execute("ALTER TABLE downloads ADD COLUMN sha256 TEXT")
+            self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -130,16 +139,25 @@ class MagazineIndex:
         status: DownloadStatus,
         file_path: str | None = None,
         file_size_bytes: int | None = None,
+        sha256: str | None = None,
     ):
         """Update download status for an issue."""
         downloaded_at = datetime.now().isoformat() if status == DownloadStatus.COMPLETE else None
         self.conn.execute(
             """UPDATE downloads
-               SET status = ?, file_path = ?, downloaded_at = ?, file_size_bytes = ?
+               SET status = ?, file_path = ?, downloaded_at = ?, file_size_bytes = ?, sha256 = ?
                WHERE issue_id = ?""",
-            (status.value, file_path, downloaded_at, file_size_bytes, issue_id),
+            (status.value, file_path, downloaded_at, file_size_bytes, sha256, issue_id),
         )
         self.conn.commit()
+
+    def find_by_hash(self, sha256: str) -> str | None:
+        """Find an existing download with the same SHA-256 hash. Returns file_path or None."""
+        row = self.conn.execute(
+            "SELECT file_path FROM downloads WHERE sha256 = ? AND status = 'complete' LIMIT 1",
+            (sha256,),
+        ).fetchone()
+        return row["file_path"] if row else None
 
     def get_issues(
         self,

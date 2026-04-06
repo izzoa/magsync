@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -403,6 +404,28 @@ async def _download_and_decrypt_once(
                     error="Decryption produced invalid PDF and could not auto-extract new constants.",
                 )
 
+        # Compute content hash for deduplication
+        file_hash = hashlib.sha256(decrypted).hexdigest()
+
+        # Check for duplicate content in the index
+        from magsync.core.index import MagazineIndex
+        try:
+            idx = MagazineIndex()
+            existing_path = idx.find_by_hash(file_hash)
+            idx.close()
+        except Exception:
+            existing_path = None
+
+        if existing_path:
+            logger.info(f"Duplicate detected (same content as {existing_path}), skipping save")
+            part_path.unlink(missing_ok=True)
+            return DownloadResult(
+                success=True,
+                file_path=Path(existing_path),
+                file_size_bytes=len(decrypted),
+                sha256=file_hash,
+            )
+
         # Save and clean up .part file
         dest.write_bytes(decrypted)
         part_path.unlink(missing_ok=True)
@@ -411,6 +434,7 @@ async def _download_and_decrypt_once(
             success=True,
             file_path=dest,
             file_size_bytes=len(decrypted),
+            sha256=file_hash,
         )
 
 

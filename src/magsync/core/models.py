@@ -56,6 +56,7 @@ class DownloadResult:
     file_path: Path | None = None
     error: str | None = None
     file_size_bytes: int = 0
+    sha256: str | None = None
 
 
 @dataclass

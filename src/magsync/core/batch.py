@@ -54,6 +54,7 @@ async def _download_one(
                 DownloadStatus.COMPLETE,
                 str(result.file_path),
                 result.file_size_bytes,
+                result.sha256,
             )
             if on_complete:
                 on_complete(issue, True, None)

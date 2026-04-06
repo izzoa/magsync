@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Dry run mode**: `magsync fetch --dry-run` and `magsync daemon --dry-run` preview what would be downloaded with estimated total size, without actually downloading
 - **Retry command**: `magsync retry [query]` re-attempts all failed downloads, optionally filtered by magazine title
 - **Download retry with backoff**: Transient download errors (network, timeout) are automatically retried with exponential backoff (2s, 4s, 8s) up to `retry_attempts` config value. Permanent errors (dead links) fail immediately.
+- **Content deduplication**: SHA-256 hash computed for each downloaded PDF. Duplicate files (same content under different titles/URLs) are detected and skipped, saving bandwidth and disk space.
 
 ### Fixed
 - LimeWire share links that are removed or expired now show a clear error ("share link is unavailable") instead of a generic SSR metadata failure
