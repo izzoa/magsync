@@ -37,11 +37,22 @@ async def _download_one(
         if not lw_url:
             return {"issue": issue, "success": False, "error": "No download link"}
 
+        dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
+
+        # Skip if file already exists on disk (e.g., index was wiped but files remain)
+        if dest.exists():
+            logger.info(f"Already on disk, skipping: {dest.name}")
+            idx.update_download_status(
+                issue["id"], DownloadStatus.COMPLETE, str(dest), dest.stat().st_size,
+            )
+            if on_complete:
+                on_complete(issue, True, None)
+            return {"issue": issue, "success": True, "error": None, "path": dest}
+
         if on_start:
             on_start(issue)
 
         idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
-        dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
 
         try:
             result = await download_and_decrypt(
