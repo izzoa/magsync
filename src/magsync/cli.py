@@ -10,6 +10,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import typer
 from rich.console import Console
@@ -385,6 +386,28 @@ def unsubscribe(
 HEALTH_CHECK_PATH = Path("/tmp/magsync-healthy")
 
 
+def _start_heartbeat(interval: int = 30) -> Callable:
+    """Start a daemon thread that touches the health check file every `interval` seconds.
+
+    Returns a stop function.
+    """
+    import threading
+
+    stop_event = threading.Event()
+
+    def _beat():
+        while not stop_event.is_set():
+            try:
+                HEALTH_CHECK_PATH.touch()
+            except OSError:
+                pass
+            stop_event.wait(interval)
+
+    t = threading.Thread(target=_beat, daemon=True)
+    t.start()
+    return stop_event.set
+
+
 @app.command()
 def retry(
     query: str = typer.Argument(None, help="Only retry failed downloads for this magazine"),
@@ -481,8 +504,8 @@ def daemon(
     )
     logger = logging.getLogger("magsync")
 
-    # Startup banner + initial health check touch
-    HEALTH_CHECK_PATH.touch()
+    # Start background heartbeat for Docker health check
+    stop_heartbeat = _start_heartbeat(interval=30)
     logger.info(f"magsync v{__version__} daemon starting")
     logger.info(f"  Output directory: {cfg.output_dir}")
     logger.info(f"  Subscriptions: {len(cfg.subscriptions)}")
@@ -605,10 +628,7 @@ def daemon(
             if downloaded_issues:
                 send_download_summary(downloaded_issues, cfg.notifications)
 
-            # Phase 4: Health check
-            HEALTH_CHECK_PATH.touch()
-
-            # Phase 5: Summary
+            # Phase 4: Summary
             elapsed = int(time.time() - cycle_start)
             logger.info(
                 f"Cycle complete in {elapsed}s: "
@@ -630,4 +650,5 @@ def daemon(
         while time.time() < sleep_end and not shutdown:
             time.sleep(min(5, sleep_end - time.time()))
 
+    stop_heartbeat()
     logger.info("magsync daemon stopped.")
