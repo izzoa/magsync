@@ -1,0 +1,59 @@
+# magsync Docker Compose - Full Example
+#
+# Copy this file to docker-compose.yml and customize.
+# See README.md for full documentation.
+
+services:
+  magsync:
+    build: .
+    # Or use the pre-built image from GitHub Container Registry:
+    # image: ghcr.io/izzoa/magsync:latest
+    container_name: magsync
+    volumes:
+      # Config file (create config.toml with your subscriptions)
+      # Writable so self-healing can persist updated encryption constants.
+      # Mount as :ro if you prefer — self-healing still works per-session but
+      # won't survive container restarts.
+      - ./config.toml:/config/config.toml
+      # Persistent data (SQLite index survives restarts)
+      - magsync_data:/data
+      # Magazine output directory (bind mount to your host/NAS path)
+      - /path/to/your/magazines:/magazines
+      # For Synology NAS, use something like:
+      # - /volume1/magazines:/magazines
+    environment:
+      # Output directory inside the container (matches the volume mount)
+      - MAGSYNC_OUTPUT_DIR=/magazines
+
+      # How often to check for new issues (default: 6h)
+      - MAGSYNC_INTERVAL=6h
+
+      # Magazine subscriptions (comma-separated query:since pairs)
+      # Overrides [[subscriptions]] in config.toml
+      - MAGSYNC_SUBSCRIPTIONS=The New Yorker:2025-01,The Economist:2024-06,Science News:2025-01
+
+      # Notification URLs (comma-separated Apprise URLs)
+      # See https://github.com/caronc/apprise/wiki for URL formats
+      # Examples:
+      #   Gotify:  gotify://hostname/token
+      #   Discord: discord://webhook_id/webhook_token
+      #   Slack:   slack://token_a/token_b/token_c
+      #   ntfy:    ntfy://topic
+      #   Email:   mailto://user:pass@gmail.com
+      # - MAGSYNC_APPRISE_URLS=gotify://myserver:8080/token
+
+      # Download settings
+      # - MAGSYNC_DOWNLOAD__MAX_CONCURRENT=3
+      # - MAGSYNC_DOWNLOAD__SCRAPE_DELAY=1.0
+
+      # Override LimeWire encryption constants (rarely needed - auto-heals)
+      # - MAGSYNC_LIMEWIRE__SHARING_SALT_B64=...
+      # - MAGSYNC_LIMEWIRE__FILE_IV_B64=...
+
+    restart: unless-stopped
+
+    # Optional: set user ID to match your host user (important for NAS)
+    # user: "1000:1000"
+
+volumes:
+  magsync_data:

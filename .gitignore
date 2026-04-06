@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OpenSpec
+openspec/
+
+# AI coding assistant configs (OpenSpec skills are installed per-tool)
+.agent/
+.augment/
+.cline/
+.clinerules/
+.codex/
+.continue/
+.crush/
+.cursor/
+.factory/
+.gemini/
+.kilocode/
+.kiro/
+.opencode/
+
+# magsync runtime
+*.db
+
+# OS
+.DS_Store
+Thumbs.db

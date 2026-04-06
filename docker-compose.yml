@@ -1,0 +1,19 @@
+services:
+  magsync:
+    build: .
+    container_name: magsync
+    volumes:
+      - ./config.toml:/config/config.toml
+      - magsync_data:/data
+      - ${MAGSYNC_MAGAZINES_PATH:-./magazines}:/magazines
+    environment:
+      - MAGSYNC_OUTPUT_DIR=/magazines
+      - MAGSYNC_INTERVAL=${MAGSYNC_INTERVAL:-6h}
+      # Uncomment and set your subscriptions:
+      # - MAGSYNC_SUBSCRIPTIONS=The New Yorker:2025-01,The Economist:2024-06
+      # Uncomment for notifications:
+      # - MAGSYNC_APPRISE_URLS=gotify://server/token
+    restart: unless-stopped
+
+volumes:
+  magsync_data:
