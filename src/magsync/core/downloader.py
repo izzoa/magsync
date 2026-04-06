@@ -235,6 +235,58 @@ def _is_permanent_error(error: str) -> bool:
     return any(msg in error for msg in _PERMANENT_ERRORS)
 
 
+class RateLimitGate:
+    """Shared gate that pauses all downloads when a 429 is received.
+
+    When any download hits a 429, it acquires the gate, pauses for
+    the Retry-After duration, then releases. Other downloads wait
+    on the gate before making API calls.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._ready = asyncio.Event()
+        self._ready.set()
+
+    async def wait(self):
+        """Wait until the rate limit gate is open."""
+        await self._ready.wait()
+
+    async def trigger(self, retry_after: int = 30):
+        """Pause all downloads for retry_after seconds."""
+        if self._lock.locked():
+            # Another coroutine already handling the pause
+            await self._ready.wait()
+            return
+        async with self._lock:
+            self._ready.clear()
+            logger.warning(f"Rate limited (429). Pausing all downloads for {retry_after}s...")
+            await asyncio.sleep(retry_after)
+            self._ready.set()
+            logger.info("Rate limit pause ended, resuming downloads")
+
+
+# Global gate — shared across concurrent downloads within one event loop
+_rate_limit_gate: RateLimitGate | None = None
+
+
+def get_rate_limit_gate() -> RateLimitGate:
+    """Get or create the shared rate limit gate."""
+    global _rate_limit_gate
+    if _rate_limit_gate is None:
+        _rate_limit_gate = RateLimitGate()
+    return _rate_limit_gate
+
+
+def _parse_retry_after(response: httpx.Response) -> int:
+    """Parse Retry-After header, defaulting to 30 seconds."""
+    header = response.headers.get("retry-after", "")
+    try:
+        return max(int(header), 1)
+    except (ValueError, TypeError):
+        return 30
+
+
 async def download_and_decrypt(
     limewire_url: str,
     dest: Path,
@@ -242,11 +294,13 @@ async def download_and_decrypt(
     constants: LimeWireConstants | None = None,
     on_progress: callable | None = None,
     retry_attempts: int | None = None,
+    rate_gate: RateLimitGate | None = None,
 ) -> DownloadResult:
     """Full pipeline: download an encrypted file from LimeWire and decrypt it.
 
-    Retries transient errors with exponential backoff. Permanent errors
-    (dead links, decryption failures) fail immediately.
+    Retries transient errors with exponential backoff. 429 responses
+    trigger a shared pause across all concurrent downloads.
+    Permanent errors (dead links, decryption failures) fail immediately.
 
     Returns a DownloadResult with success status and file path.
     """
@@ -257,11 +311,17 @@ async def download_and_decrypt(
             retry_attempts = cfg.download.retry_attempts
     if retry_attempts is None:
         retry_attempts = 3
+    if rate_gate is None:
+        rate_gate = get_rate_limit_gate()
 
     last_error = ""
     for attempt in range(1, retry_attempts + 1):
+        # Wait if a 429 pause is active
+        await rate_gate.wait()
+
         result = await _download_and_decrypt_once(
             limewire_url, dest, constants=constants, on_progress=on_progress,
+            rate_gate=rate_gate,
         )
         if result.success:
             return result
@@ -271,6 +331,12 @@ async def download_and_decrypt(
         if _is_permanent_error(last_error):
             logger.error(f"Permanent error (no retry): {last_error}")
             return result
+
+        # 429 is handled inside _download_and_decrypt_once via the gate,
+        # but we still retry the attempt
+        if "429" in last_error or "rate limit" in last_error.lower():
+            logger.info(f"Retrying after rate limit (attempt {attempt}/{retry_attempts})...")
+            continue
 
         if attempt < retry_attempts:
             delay = 2 ** attempt  # 2s, 4s, 8s, ...
@@ -288,8 +354,30 @@ async def _download_and_decrypt_once(
     *,
     constants: LimeWireConstants,
     on_progress: callable | None = None,
+    rate_gate: RateLimitGate | None = None,
 ) -> DownloadResult:
     """Single download attempt (no retry)."""
+    try:
+        return await _do_download(limewire_url, dest, constants=constants,
+                                  on_progress=on_progress, rate_gate=rate_gate)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            retry_after = _parse_retry_after(e.response)
+            if rate_gate:
+                await rate_gate.trigger(retry_after)
+            return DownloadResult(success=False, error=f"429 rate limited (retry-after: {retry_after}s)")
+        return DownloadResult(success=False, error=f"HTTP {e.response.status_code}: {e}")
+
+
+async def _do_download(
+    limewire_url: str,
+    dest: Path,
+    *,
+    constants: LimeWireConstants,
+    on_progress: callable | None = None,
+    rate_gate: RateLimitGate | None = None,
+) -> DownloadResult:
+    """Inner download logic, separated for 429 handling."""
 
     sharing_id, fragment = parse_limewire_url(limewire_url)
 

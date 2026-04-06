@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from magsync.config import Config
-from magsync.core.downloader import download_and_decrypt
+from magsync.core.downloader import download_and_decrypt, RateLimitGate
 from magsync.core.index import MagazineIndex
 from magsync.core.models import DownloadStatus
 from magsync.core.organizer import organize_path
@@ -21,14 +21,18 @@ async def _download_one(
     cfg: Config,
     idx: MagazineIndex,
     semaphore: asyncio.Semaphore,
+    rate_gate: RateLimitGate,
     on_start: Callable[[dict], None] | None = None,
     on_complete: Callable[[dict, bool, str | None], None] | None = None,
 ) -> dict:
-    """Download a single issue, respecting the concurrency semaphore.
+    """Download a single issue, respecting the concurrency semaphore and rate limit gate.
 
     Returns a result dict with issue info and success/error status.
     """
     async with semaphore:
+        # Wait if a 429 pause is active before starting
+        await rate_gate.wait()
+
         lw_url = issue.get("limewire_url")
         if not lw_url:
             return {"issue": issue, "success": False, "error": "No download link"}
@@ -40,7 +44,9 @@ async def _download_one(
         dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
 
         try:
-            result = await download_and_decrypt(lw_url, dest, constants=cfg.limewire)
+            result = await download_and_decrypt(
+                lw_url, dest, constants=cfg.limewire, rate_gate=rate_gate,
+            )
         except Exception as e:
             idx.update_download_status(issue["id"], DownloadStatus.FAILED)
             error_msg = str(e)
@@ -75,15 +81,19 @@ async def download_batch(
 ) -> list[dict]:
     """Download multiple issues concurrently, bounded by max_concurrent.
 
+    All downloads share a single RateLimitGate — if any download
+    receives a 429, all downloads pause until the rate limit expires.
+
     Returns a list of result dicts with success/error status for each issue.
     """
     if not issues:
         return []
 
     semaphore = asyncio.Semaphore(cfg.download.max_concurrent)
+    rate_gate = RateLimitGate()
 
     tasks = [
-        _download_one(issue, cfg, idx, semaphore, on_start, on_complete)
+        _download_one(issue, cfg, idx, semaphore, rate_gate, on_start, on_complete)
         for issue in issues
     ]
 
