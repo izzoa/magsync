@@ -89,6 +89,30 @@ async def download_batch(
     if not issues:
         return []
 
+    # Auto-extract encryption constants once before starting any downloads
+    if not cfg.limewire.file_iv_b64 or not cfg.limewire.sharing_salt_b64:
+        from magsync.core.downloader import auto_extract_constants
+        from magsync.config import save_config
+
+        logger.info("No encryption constants — extracting before batch download...")
+        extracted = await auto_extract_constants()
+        if extracted:
+            # Mutate the shared config object so all downloads see the constants
+            cfg.limewire.sharing_salt_b64 = extracted.sharing_salt_b64
+            cfg.limewire.sharing_iv_b64 = extracted.sharing_iv_b64
+            cfg.limewire.file_iv_b64 = extracted.file_iv_b64
+            cfg.limewire.file_name_iv_b64 = extracted.file_name_iv_b64
+            cfg.limewire.file_sha1_iv_b64 = extracted.file_sha1_iv_b64
+            cfg.limewire.preview_iv_b64 = extracted.preview_iv_b64
+            cfg.limewire.pbkdf2_iterations = extracted.pbkdf2_iterations
+            try:
+                save_config(cfg)
+                logger.info("Encryption constants saved to config")
+            except OSError:
+                logger.info("Config is read-only — constants in memory only")
+        else:
+            logger.error("Auto-extraction failed — downloads will fail. See UPDATE_KEYS.md.")
+
     semaphore = asyncio.Semaphore(cfg.download.max_concurrent)
     rate_gate = RateLimitGate()
 
