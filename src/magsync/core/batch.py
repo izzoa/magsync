@@ -122,7 +122,11 @@ async def download_batch(
             except OSError:
                 logger.info("Config is read-only — constants in memory only")
         else:
-            logger.error("Auto-extraction failed — downloads will fail. See UPDATE_KEYS.md.")
+            logger.error("Auto-extraction failed — aborting batch. See UPDATE_KEYS.md.")
+            return [
+                {"issue": issue, "success": False, "error": "Encryption constants unavailable"}
+                for issue in issues
+            ]
 
     semaphore = asyncio.Semaphore(cfg.download.max_concurrent)
     rate_gate = RateLimitGate()
