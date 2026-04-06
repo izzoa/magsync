@@ -36,6 +36,7 @@ openspec/
 
 # magsync runtime
 *.db
+config.toml
 
 # OS
 .DS_Store
