@@ -1,14 +1,5 @@
-<div align="center">
-
-```
-  _ __ ___   __ _  __ _ ___ _   _ _ __   ___ 
- | '_ ` _ \ / _` |/ _` / __| | | | '_ \ / __|
- | | | | | | (_| | (_| \__ \ |_| | | | | (__ 
- |_| |_| |_|\__,_|\__, |___/\__, |_| |_|\___|
-                   |___/     |___/            
-```
-
-</div>
+<h1 align="center">magsync</h1>
+<p align="center"><i>Magazine downloader and organizer for your local library</i></p>
 
 A CLI/TUI tool for indexing and downloading PDF magazines from [freemagazines.top](https://freemagazines.top), organized into a clean local library.
 
