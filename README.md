@@ -65,6 +65,9 @@ magsync search "The Economist"
 # Download all issues from March 2026 onward
 magsync fetch "The New Yorker" --since 2026-03
 
+# Preview what would be downloaded (no actual download)
+magsync fetch "The New Yorker" --since 2026-03 --dry-run
+
 # Download to a custom directory
 magsync fetch "Science News" --since 2025-01 --output ~/MyMags
 

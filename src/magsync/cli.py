@@ -123,6 +123,7 @@ def fetch(
     query: str = typer.Argument(..., help="Magazine title to fetch"),
     since: str = typer.Option(None, "--since", help="Fetch issues from this date (YYYY-MM)"),
     output: str = typer.Option(None, "--output", "-o", help="Output directory override"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be downloaded without downloading"),
 ):
     """Search, index, and download magazines."""
     cfg = load_config()
@@ -175,6 +176,34 @@ def fetch(
 
         if not pending:
             console.print("[green]All matching issues already downloaded![/green]")
+            raise typer.Exit()
+
+        if dry_run:
+            table = Table(title=f"Would download {len(pending)} issues")
+            table.add_column("#", style="dim", width=4)
+            table.add_column("Title", style="cyan", max_width=55)
+            table.add_column("Year", width=6)
+            table.add_column("Month", width=6)
+            table.add_column("Size", width=8)
+            total_size = 0
+            for i, issue in enumerate(pending, 1):
+                table.add_row(
+                    str(i),
+                    issue["title"][:55],
+                    str(issue.get("year") or "?"),
+                    str(issue.get("month") or "?"),
+                    issue.get("file_size") or "?",
+                )
+                size_str = issue.get("file_size") or ""
+                if "MB" in size_str:
+                    try:
+                        total_size += int("".join(c for c in size_str if c.isdigit()))
+                    except ValueError:
+                        pass
+            console.print(table)
+            if total_size:
+                console.print(f"\n[dim]Estimated total: ~{total_size} MB[/dim]")
+            console.print("\n[yellow]Dry run — no files downloaded.[/yellow]")
             raise typer.Exit()
 
         console.print(f"[cyan]Downloading {len(pending)} issues (max {cfg.download.max_concurrent} concurrent)...[/cyan]")
@@ -372,6 +401,7 @@ def daemon(
         None, "--interval", "-i",
         help="Time between cycles (e.g. 30m, 6h, 1d). Default: 6h",
     ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Run one cycle, show what would be downloaded, then exit"),
 ):
     """Run magsync as a daemon, periodically fetching subscribed magazines."""
     from magsync import __version__
@@ -491,21 +521,26 @@ def daemon(
                 all_pending.extend(p for p in pending if p.get("limewire_url"))
 
             if all_pending and not shutdown:
-                from magsync.core.batch import download_batch
+                if dry_run:
+                    logger.info(f"Dry run — would download {len(all_pending)} issues:")
+                    for issue in all_pending:
+                        logger.info(f"  - {issue['title']} ({issue.get('file_size') or '?'})")
+                else:
+                    from magsync.core.batch import download_batch
 
-                logger.info(f"Downloading {len(all_pending)} issues (max {cfg.download.max_concurrent} concurrent)...")
+                    logger.info(f"Downloading {len(all_pending)} issues (max {cfg.download.max_concurrent} concurrent)...")
 
-                def on_start(issue):
-                    logger.info(f"  Downloading: {issue['title'][:60]}")
+                    def on_start(issue):
+                        logger.info(f"  Downloading: {issue['title'][:60]}")
 
-                def on_complete(issue, success, error):
-                    if success:
-                        downloaded_issues.append(issue)
-                        logger.info(f"  Done: {issue['title'][:60]}")
-                    else:
-                        logger.error(f"  Failed: {issue['title'][:60]}: {error}")
+                    def on_complete(issue, success, error):
+                        if success:
+                            downloaded_issues.append(issue)
+                            logger.info(f"  Done: {issue['title'][:60]}")
+                        else:
+                            logger.error(f"  Failed: {issue['title'][:60]}: {error}")
 
-                asyncio.run(download_batch(all_pending, cfg, idx, on_start, on_complete))
+                    asyncio.run(download_batch(all_pending, cfg, idx, on_start, on_complete))
 
             # Phase 3: Notify
             if downloaded_issues:
@@ -527,7 +562,7 @@ def daemon(
         finally:
             idx.close()
 
-        if shutdown:
+        if shutdown or dry_run:
             break
 
         # Sleep with interrupt support
