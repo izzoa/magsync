@@ -225,7 +225,6 @@ def decrypt_file(encrypted_data: bytes, aes_key: bytes, constants: LimeWireConst
 # Errors that should not be retried (permanent failures)
 _PERMANENT_ERRORS = (
     "share link is unavailable",
-    "auto-extraction failed",
     "Decryption failed even after",
     "invalid PDF and could not",
 )
@@ -588,10 +587,13 @@ async def auto_extract_constants(
                 chunk_text = chunk_resp.text
                 chunks_searched += 1
                 if "saltBase64" in chunk_text:
-                    salt_b64 = _extract_js_string(chunk_text, "saltBase64")
-                    sharing_iv = _extract_js_string(chunk_text, "ivBase64")
-                    logger.info(f"  Found salt in chunk {chunks_searched}/{len(chunk_urls)}: {chunk_path}")
-                    break
+                    extracted_salt = _extract_js_string(chunk_text, "saltBase64")
+                    if extracted_salt:
+                        salt_b64 = extracted_salt
+                        sharing_iv = _extract_js_string(chunk_text, "ivBase64")
+                        logger.info(f"  Found salt in chunk {chunks_searched}/{len(chunk_urls)}: {chunk_path}")
+                        break
+                    # Chunk contains saltBase64 as a reference, not a value — keep searching
             except httpx.HTTPError as e:
                 logger.debug(f"  Chunk fetch failed: {chunk_path}: {e}")
                 continue
