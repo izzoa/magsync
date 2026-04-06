@@ -49,6 +49,43 @@ def _filter_results(results, query: str, exact: bool):
     return [r for r in results if strip_accents(normalize_title(r.title)).lower() == query_norm]
 
 
+def _index_results(results, idx: MagazineIndex, cfg) -> int:
+    """Index scraped results, grouping by normalized title.
+
+    Each unique normalized title gets its own magazine entry.
+    Returns total new issues added.
+    """
+    from collections import defaultdict
+
+    # Group results by normalized title
+    by_magazine: dict[str, list] = defaultdict(list)
+    for r in results:
+        norm = normalize_title(r.title) if r.title else "Unknown"
+        by_magazine[norm].append(r)
+
+    total_new = 0
+    for norm_title, issues in by_magazine.items():
+        display_title = norm_title
+        mag_id = idx.get_or_create_magazine(display_title, strip_accents(norm_title).lower())
+        issues_data = []
+        for r in issues:
+            parsed = parse_date(r.title, r.page_url)
+            issues_data.append({
+                "title": r.title,
+                "page_url": r.page_url,
+                "limewire_url": r.limewire_url,
+                "year": parsed.year,
+                "month": parsed.month,
+                "date_raw": r.title,
+                "genre": r.genre,
+                "file_size": r.file_size,
+                "cover_image_url": r.cover_image_url,
+            })
+        total_new += idx.add_issues(mag_id, issues_data)
+
+    return total_new
+
+
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Magazine title to search for"),
@@ -65,28 +102,13 @@ def search(
         console.print(f"[yellow]No results found for '{query}'[/yellow]")
         raise typer.Exit()
 
-    # Index the results
+    # Index the results (grouped by normalized title)
     idx = MagazineIndex()
     try:
-        norm = normalize_title(results[0].title) if results[0].title else query
-        mag_id = idx.get_or_create_magazine(query, norm)
-        issues_data = []
-        for r in results:
-            parsed = parse_date(r.title, r.page_url)
-            issues_data.append({
-                "title": r.title,
-                "page_url": r.page_url,
-                "limewire_url": r.limewire_url,
-                "year": parsed.year,
-                "month": parsed.month,
-                "date_raw": r.title,
-                "genre": r.genre,
-                "file_size": r.file_size,
-                "cover_image_url": r.cover_image_url,
-            })
-        new_count = idx.add_issues(mag_id, issues_data)
+        new_count = _index_results(results, idx, cfg)
 
         # Display results
+        norm = strip_accents(query).lower()
         table = Table(title=f"Results for '{query}' ({len(results)} issues, {new_count} new)")
         table.add_column("#", style="dim", width=4)
         table.add_column("Title", style="cyan", max_width=60)
@@ -149,25 +171,10 @@ def fetch(
 
     idx = MagazineIndex()
     try:
-        norm = normalize_title(results[0].title) if results[0].title else query
-        mag_id = idx.get_or_create_magazine(query, norm)
-        issues_data = []
-        for r in results:
-            parsed = parse_date(r.title, r.page_url)
-            issues_data.append({
-                "title": r.title,
-                "page_url": r.page_url,
-                "limewire_url": r.limewire_url,
-                "year": parsed.year,
-                "month": parsed.month,
-                "date_raw": r.title,
-                "genre": r.genre,
-                "file_size": r.file_size,
-                "cover_image_url": r.cover_image_url,
-            })
-        idx.add_issues(mag_id, issues_data)
+        _index_results(results, idx, cfg)
 
         # Get pending issues matching date filter
+        norm = strip_accents(query).lower()
         pending = idx.get_issues(
             magazine_title=norm,
             since_year=since_year,
@@ -265,21 +272,7 @@ def update():
                         mag["title"], scrape_delay=cfg.download.scrape_delay
                     )
                 )
-                issues_data = []
-                for r in results:
-                    parsed = parse_date(r.title, r.page_url)
-                    issues_data.append({
-                        "title": r.title,
-                        "page_url": r.page_url,
-                        "limewire_url": r.limewire_url,
-                        "year": parsed.year,
-                        "month": parsed.month,
-                        "date_raw": r.title,
-                        "genre": r.genre,
-                        "file_size": r.file_size,
-                        "cover_image_url": r.cover_image_url,
-                    })
-                new = idx.add_issues(mag["id"], issues_data)
+                new = _index_results(results, idx, cfg)
                 total_new += new
                 if new:
                     console.print(f"  [cyan]{mag['title']}[/cyan]: {new} new issues")
@@ -571,23 +564,7 @@ def daemon(
                     logger.info(f"  {sub.query}: no exact matches found")
                     continue
 
-                norm = normalize_title(results[0].title) if results[0].title else sub.query
-                mag_id = idx.get_or_create_magazine(sub.query, norm)
-                issues_data = []
-                for r in results:
-                    parsed = parse_date(r.title, r.page_url)
-                    issues_data.append({
-                        "title": r.title,
-                        "page_url": r.page_url,
-                        "limewire_url": r.limewire_url,
-                        "year": parsed.year,
-                        "month": parsed.month,
-                        "date_raw": r.title,
-                        "genre": r.genre,
-                        "file_size": r.file_size,
-                        "cover_image_url": r.cover_image_url,
-                    })
-                new = idx.add_issues(mag_id, issues_data)
+                new = _index_results(results, idx, cfg)
                 total_new_indexed += new
                 if new:
                     logger.info(f"  {sub.query}: {new} new issues indexed")
@@ -604,7 +581,7 @@ def daemon(
                     since_year = int(parts[0])
                     since_month = int(parts[1]) if len(parts) > 1 else None
 
-                norm = normalize_title(sub.query) if sub.query else sub.query
+                norm = strip_accents(sub.query).lower()
                 pending = idx.get_issues(
                     magazine_title=norm,
                     since_year=since_year,
