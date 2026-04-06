@@ -506,6 +506,17 @@ def daemon(
 
     # Start background heartbeat for Docker health check
     stop_heartbeat = _start_heartbeat(interval=30)
+
+    # Reset any downloads stuck in 'downloading' state from a prior crash
+    startup_idx = MagazineIndex()
+    stuck = startup_idx.conn.execute(
+        "UPDATE downloads SET status = 'pending' WHERE status = 'downloading'"
+    ).rowcount
+    startup_idx.conn.commit()
+    startup_idx.close()
+    if stuck:
+        logger.info(f"Reset {stuck} interrupted download(s) to pending")
+
     logger.info(f"magsync v{__version__} daemon starting")
     logger.info(f"  Output directory: {cfg.output_dir}")
     logger.info(f"  Subscriptions: {len(cfg.subscriptions)}")
