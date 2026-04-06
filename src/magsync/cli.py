@@ -19,7 +19,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from magsync.config import load_config, save_config, set_config_value
 from magsync.core.index import MagazineIndex
 from magsync.core.models import DownloadStatus, Subscription
-from magsync.core.organizer import normalize_title, parse_date, organize_path
+from magsync.core.organizer import normalize_title, parse_date, organize_path, strip_accents
 from magsync.core.scraper import search_with_details
 
 app = typer.Typer(
@@ -330,9 +330,9 @@ def subscribe(
         console.print(table)
         raise typer.Exit()
 
-    # Check for duplicate
+    # Check for duplicate (accent-insensitive)
     for sub in cfg.subscriptions:
-        if sub.query.lower() == query.lower():
+        if strip_accents(sub.query).lower() == strip_accents(query).lower():
             console.print(f"[yellow]Already subscribed to '{query}'[/yellow]")
             raise typer.Exit()
 
@@ -349,7 +349,7 @@ def unsubscribe(
     """Remove a magazine subscription."""
     cfg = load_config()
     original_count = len(cfg.subscriptions)
-    cfg.subscriptions = [s for s in cfg.subscriptions if s.query.lower() != query.lower()]
+    cfg.subscriptions = [s for s in cfg.subscriptions if strip_accents(s.query).lower() != strip_accents(query).lower()]
 
     if len(cfg.subscriptions) == original_count:
         console.print(f"[yellow]No subscription found for '{query}'[/yellow]")

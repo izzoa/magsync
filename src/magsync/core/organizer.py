@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,10 +107,22 @@ def parse_date(title: str, page_url: str = "") -> ParsedDate:
     return ParsedDate()
 
 
+def strip_accents(s: str) -> str:
+    """Strip accent marks from a string, preserving base characters.
+
+    "Bon Appétit" → "Bon Appetit"
+    "Zürich" → "Zurich"
+    """
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
+    )
+
+
 def normalize_title(title: str) -> str:
-    """Strip date/issue information from a title to get the base magazine name.
+    """Strip date/issue information and accents from a title to get the base magazine name.
 
     "The New Yorker – April 13, 2026" → "The New Yorker"
+    "Bon Appétit – March 2026" → "Bon Appetit"
     "Science News – Vol 208 No 05, May 2026" → "Science News"
     """
     # Remove everything after common separators (–, -, |, :) if followed by date-like content
@@ -126,14 +139,14 @@ def normalize_title(title: str) -> str:
             )
             has_year = bool(re.search(r"\b20\d{2}\b", suffix_lower))
             if has_date_words or has_year:
-                return parts[0].strip()
+                return strip_accents(parts[0].strip())
 
     # If no separator found, try to strip trailing year
     m = re.match(r"^(.+?)\s+\d{4}$", title)
     if m:
-        return m.group(1).strip()
+        return strip_accents(m.group(1).strip())
 
-    return title.strip()
+    return strip_accents(title.strip())
 
 
 def organize_path(
