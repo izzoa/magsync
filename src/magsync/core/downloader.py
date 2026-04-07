@@ -236,11 +236,11 @@ def decrypt_file(encrypted_data: bytes, aes_key: bytes, constants: LimeWireConst
     return decryptor.update(encrypted_data) + decryptor.finalize()
 
 
-# Errors that should not be retried (permanent failures)
+# Errors that should not be retried (permanent failures).
+# Keep this limited to genuinely dead/removed links; decryption problems can be
+# caused by stale LimeWire constants or other transient app-side issues.
 _PERMANENT_ERRORS = (
     "share link is unavailable",
-    "Decryption failed even after",
-    "invalid PDF and could not",
 )
 
 
