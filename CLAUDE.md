@@ -65,6 +65,7 @@ Encryption constants (salt, IVs) are in `~/.magsync/config.toml` and auto-extrac
 
 - **CHANGELOG.md**: ALL changes MUST be reflected in CHANGELOG.md, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 - **README.md**: Substantial user-facing changes (new commands, new config options, new features, changed behavior) MUST be reflected in README.md.
+- **Version bump**: On each release, bump the version in BOTH `pyproject.toml` and `src/magsync/__init__.py` to match the git tag.
 
 ## Development Workflow: OpenSpec
 
