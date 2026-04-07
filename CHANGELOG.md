@@ -4,6 +4,13 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.9] - 2026-04-07
+
+### Changed
+- Session retry count now respects `download.retry_attempts` config setting (previously hardcoded to 3). Configurable via `config.toml`, `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` env var, or `magsync config download.retry_attempts <N>`.
+- Updated README directory tree and organization docs to reflect flat file layout (Komga/Kavita compatible).
+- Added `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` to README environment variables table.
+
 ## [0.3.8] - 2026-04-07
 
 ### Fixed

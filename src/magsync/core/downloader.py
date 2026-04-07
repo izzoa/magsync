@@ -260,13 +260,10 @@ def _is_permanent_error(error: str) -> bool:
     return any(msg in error for msg in _PERMANENT_ERRORS)
 
 
-_SESSION_RETRIES = 3
-
-
 async def _establish_session_with_retry(
     limewire_url: str,
     client: httpx.AsyncClient,
-    retries: int = _SESSION_RETRIES,
+    retries: int = 3,
 ) -> LimeWireSession:
     """Establish a LimeWire session with retry for transient errors."""
     for attempt in range(1, retries + 1):
@@ -373,7 +370,7 @@ async def download_and_decrypt(
 
         result = await _download_and_decrypt_once(
             limewire_url, dest, constants=constants, on_progress=on_progress,
-            rate_gate=rate_gate,
+            rate_gate=rate_gate, retry_attempts=retry_attempts,
         )
         if result.success:
             return result
@@ -407,11 +404,13 @@ async def _download_and_decrypt_once(
     constants: LimeWireConstants,
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
+    retry_attempts: int = 3,
 ) -> DownloadResult:
     """Single download attempt (no retry)."""
     try:
         return await _do_download(limewire_url, dest, constants=constants,
-                                  on_progress=on_progress, rate_gate=rate_gate)
+                                  on_progress=on_progress, rate_gate=rate_gate,
+                                  retry_attempts=retry_attempts)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
             retry_after = _parse_retry_after(e.response)
@@ -430,6 +429,7 @@ async def _do_download(
     constants: LimeWireConstants,
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
+    retry_attempts: int = 3,
 ) -> DownloadResult:
     """Inner download logic, separated for 429 handling."""
 
@@ -456,7 +456,7 @@ async def _do_download(
                 )
 
         # Establish session (retry transient SSR errors with backoff)
-        session = await _establish_session_with_retry(limewire_url, client)
+        session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts)
 
         # Derive key
         aes_key = derive_aes_key(
@@ -479,7 +479,7 @@ async def _do_download(
             if part_age_minutes > 50:
                 # Presigned URL likely expired — get a fresh one
                 logger.info(f"Part file is {int(part_age_minutes)}m old, refreshing session...")
-                session = await _establish_session_with_retry(limewire_url, client)
+                session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts)
                 aes_key = derive_aes_key(
                     sharing_id, fragment,
                     session.passphrase_wrapped_pk,

@@ -6,13 +6,10 @@ A CLI/TUI tool for indexing and downloading PDF magazines from [freemagazines.to
 ```
 ~/Magazines/
 ├── The New Yorker/
-│   ├── 2026/
-│   │   ├── 04/
-│   │   │   ├── The_New_Yorker_-_April_06,_2026.pdf
-│   │   │   └── The_New_Yorker_-_April_13,_2026.pdf
-│   │   ├── 03/
-│   │   └── 02/
-│   └── 2025/
+│   ├── The New Yorker - 2026-04 - April 13.pdf
+│   ├── The New Yorker - 2026-04 - April 6.pdf
+│   ├── The New Yorker - 2026-03 - March 23.pdf
+│   └── ...
 ├── The Economist/
 └── Science News/
 ```
@@ -21,7 +18,7 @@ A CLI/TUI tool for indexing and downloading PDF magazines from [freemagazines.to
 
 - **Search** magazines by title with full pagination across freemagazines.top
 - **Download** PDFs automatically — handles LimeWire's E2E encryption entirely in Python (no browser needed)
-- **Organize** into `[Magazine Title]/[YYYY]/[MM]/` directory structure with smart date parsing
+- **Organize** into a flat `[Magazine Title]/` structure with uniform filenames that sort chronologically (Komga/Kavita compatible)
 - **Track** what you've downloaded with a local SQLite index — never re-download the same issue
 - **Update** your index on demand to discover new issues for tracked magazines
 - **TUI** for interactive browsing, or **CLI** for scripted/headless use
@@ -167,6 +164,7 @@ All config values can be overridden via environment variables:
 | `MAGSYNC_CONFIG_DIR` | Config directory path | `~/.magsync` |
 | `MAGSYNC_DB_PATH` | SQLite index path | `{config_dir}/index.db` |
 | `MAGSYNC_DOWNLOAD__MAX_CONCURRENT` | Max parallel downloads | `3` |
+| `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Max retry attempts per download | `3` |
 | `MAGSYNC_DOWNLOAD__SCRAPE_DELAY` | Delay between scrape requests (seconds) | `1.0` |
 
 ### NAS Deployment (Synology, QNAP)
@@ -257,13 +255,12 @@ If auto-extraction fails, see [UPDATE_KEYS.md](UPDATE_KEYS.md) for manual extrac
 
 ### Organization
 
-Magazine titles are parsed to extract dates using regex patterns that handle:
-- `April 13, 2026` → `2026/04/`
-- `February 16-23, 2026` → `2026/02/`
-- `March-April 2026` → `2026/03/`
-- `Spring 2026` → `2026/03/`
-- `Vol 208 No 05, May 2026` → `2026/05/`
-- Undatable issues → `YYYY/00-Unknown/`
+Files are organized in a flat structure per magazine title for Komga/Kavita compatibility. Dates are parsed from titles to build uniform, chronologically-sortable filenames:
+
+- `The New Yorker – April 13, 2026` → `The New Yorker/The New Yorker - 2026-04 - April 13.pdf`
+- `The Economist - February 16-23, 2026` → `The Economist/The Economist - 2026-02 - February 16-23.pdf`
+- `Science News - Vol 208 No 05, May 2026` → `Science News/Science News - 2026-05 - Vol 208 No 05 May.pdf`
+- Undatable issues use the sanitized original title as the filename
 
 ## Dependencies
 
