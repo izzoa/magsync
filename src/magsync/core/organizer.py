@@ -40,18 +40,18 @@ def parse_date(title: str, page_url: str = "") -> ParsedDate:
     """
     title_lower = title.lower()
 
-    # Pattern 1: "Month DD, YYYY" or "Month DD-DD, YYYY"
+    # Pattern 1: "Month DD, YYYY" or "Month DDth-DDth, YYYY"
     m = re.search(
         r"(january|february|march|april|may|june|july|august|september|october|november|december)"
-        r"\s+\d{1,2}(?:\s*[-–]\s*\d{1,2})?,?\s*(\d{4})",
+        r"\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[-–]\s*\d{1,2}(?:st|nd|rd|th)?)?,?\s*(\d{4})",
         title_lower,
     )
     if m:
         return ParsedDate(year=int(m.group(2)), month=MONTH_NAMES[m.group(1)])
 
-    # Pattern 2: "DD Month YYYY" (European format)
+    # Pattern 2: "DD Month YYYY" or "DDth Month YYYY" (European format)
     m = re.search(
-        r"\d{1,2}\s+(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"\d{1,2}(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)"
         r"\s+(\d{4})",
         title_lower,
     )
@@ -149,6 +149,36 @@ def normalize_title(title: str) -> str:
     return strip_accents(title.strip())
 
 
+def _extract_issue_detail(title: str, norm_title: str) -> str:
+    """Extract the issue-specific detail from a full title.
+
+    "The Economist - April 4th-10th, 2026" → "April 4th-10th"
+    "Science News - Vol 208 No 05, May 2026" → "Vol 208 No 05 May"
+    "New Scientist - 21 March 2026" → "21 March"
+    """
+    # Remove the magazine name prefix (try common separators)
+    detail = title
+    for sep in [" – ", " - ", " | ", ": "]:
+        if sep in title:
+            detail = title.split(sep, 1)[1].strip()
+            break
+
+    # Remove trailing year
+    detail = re.sub(r",?\s*\b20\d{2}\b\s*$", "", detail).strip()
+    # Remove leading/trailing punctuation and clean up stray commas
+    detail = detail.strip(" ,.-–")
+    detail = re.sub(r"\s*,\s*$", "", detail)
+
+    return detail if detail else "Issue"
+
+
+def _sanitize_filename(s: str) -> str:
+    """Sanitize a string for use as a filename."""
+    s = re.sub(r'[<>:"/\\|?*]', " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def organize_path(
     title: str,
     page_url: str,
@@ -157,28 +187,31 @@ def organize_path(
 ) -> Path:
     """Determine the full output path for a magazine PDF.
 
-    Returns: {output_dir}/{Normalized Title}/{YYYY}/{MM}/{filename}.pdf
+    Returns: {output_dir}/{Magazine Title}/{Magazine Title} - {YYYY}-{MM} - {Detail}.pdf
+
+    Flat structure for Komga/Kavita compatibility. Filenames are uniform
+    and sort chronologically.
     """
     parsed = parse_date(title, page_url)
     norm_title = normalize_title(title)
 
-    # Build path components
-    parts = [output_dir, norm_title]
-
-    if parsed.year:
-        parts.append(str(parsed.year))
-        if parsed.month:
-            parts.append(f"{parsed.month:02d}")
-        else:
-            parts.append("00-Unknown")
-    else:
-        parts.append("Unknown")
-
-    # Generate filename if not provided
     if not filename:
-        # Sanitize title for filename
-        safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)
-        safe_title = re.sub(r"\s+", "_", safe_title)
-        filename = f"{safe_title}.pdf"
+        # Build uniform filename: {Title} - {YYYY}-{MM} - {Detail}.pdf
+        date_part = ""
+        if parsed.year:
+            if parsed.month:
+                date_part = f"{parsed.year}-{parsed.month:02d}"
+            else:
+                date_part = str(parsed.year)
+        else:
+            date_part = "Unknown"
 
-    return Path(*parts) / filename
+        detail = _extract_issue_detail(title, norm_title)
+        detail = _sanitize_filename(detail)
+
+        parts = [_sanitize_filename(norm_title), date_part]
+        if detail:
+            parts.append(detail)
+        filename = " - ".join(parts) + ".pdf"
+
+    return Path(output_dir) / _sanitize_filename(norm_title) / filename
