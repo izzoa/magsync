@@ -79,7 +79,12 @@ async def establish_session(
         csrf_token = jwt_payload["csrfToken"]
 
         # Check for server-side errors (removed/expired share links)
-        if "Unexpected Server Error" in html or '"error"' in html.split("sharingBucketContentData", 1)[-1][:200]:
+        # Dead pages have: sharingBucketContentData\",{...},\"ok\",\"error\"
+        # Valid pages have: sharingBucketContentData\",{...},\"ok\",true
+        if "Unexpected Server Error" in html:
+            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+        sbc_section = html.split("sharingBucketContentData", 1)[-1][:300]
+        if r'\"ok\",\"error\"' in sbc_section:
             raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
 
         # Extract bucket_id from SSR data
