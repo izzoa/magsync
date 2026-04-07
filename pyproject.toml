@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "magsync"
-version = "0.3.6"
+version = "0.3.7"
 description = "CLI/TUI tool for indexing and downloading magazines from freemagazines.top"
 requires-python = ">=3.11"
 dependencies = [

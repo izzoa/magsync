@@ -79,22 +79,27 @@ async def establish_session(
         jwt_payload = json.loads(base64.b64decode(payload_b64))
         csrf_token = jwt_payload["csrfToken"]
 
-        # Check for server-side errors (removed/expired share links)
-        # Dead pages have: \"ok\",\"error\",["SanitizedError"...] and "Unexpected Server Error"
-        # Valid pages have: \"ok\",true,\"value\",...
-        is_error = False
-        if "Unexpected Server Error" in html:
-            is_error = True
-        elif "sharingBucketContentData" in html:
+        # Check for server-side errors in SSR data.
+        # Permanent: SanitizedError in sharingBucketContentData → link is genuinely dead.
+        # Transient: "Unexpected Server Error" → SSR backend hiccup (rate limit,
+        #   bot challenge, or datacenter IP discrimination). Should be retried.
+        if "sharingBucketContentData" in html:
             sbc_section = html.split("sharingBucketContentData", 1)[-1][:300]
-            # Only match the exact SSR error pattern: "ok" followed by "error" and "SanitizedError"
             if "SanitizedError" in sbc_section:
-                is_error = True
-        else:
+                logger.error(
+                    f"LimeWire SSR: SanitizedError in sharingBucketContentData "
+                    f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
+                )
+                raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+        elif "Unexpected Server Error" not in html:
             logger.warning(f"No sharingBucketContentData in response ({len(html)} bytes)")
 
-        if is_error:
-            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+        if "Unexpected Server Error" in html:
+            logger.warning(
+                f"LimeWire SSR: transient 'Unexpected Server Error' "
+                f"(sharing_id={sharing_id}, {len(html)} bytes) — will retry"
+            )
+            raise RuntimeError("LimeWire SSR returned transient server error")
 
         # Extract bucket_id from SSR data
         # For UUID-format sharing IDs, the sharing_id IS the bucket_id.
@@ -380,6 +385,8 @@ async def _download_and_decrypt_once(
                 await rate_gate.trigger(retry_after)
             return DownloadResult(success=False, error=f"429 rate limited (retry-after: {retry_after}s)")
         return DownloadResult(success=False, error=f"HTTP {e.response.status_code}: {e}")
+    except RuntimeError as e:
+        return DownloadResult(success=False, error=str(e))
 
 
 async def _do_download(
@@ -414,8 +421,22 @@ async def _do_download(
                     error="No encryption constants configured and auto-extraction failed. See UPDATE_KEYS.md.",
                 )
 
-        # Establish session
-        session = await establish_session(limewire_url, client=client)
+        # Establish session (retry transient SSR errors with backoff)
+        session = None
+        _SESSION_RETRIES = 3
+        for _sess_attempt in range(1, _SESSION_RETRIES + 1):
+            try:
+                session = await establish_session(limewire_url, client=client)
+                break
+            except RuntimeError as e:
+                if "transient" not in str(e) or _sess_attempt == _SESSION_RETRIES:
+                    raise
+                delay = 5 * _sess_attempt  # 5s, 10s
+                logger.info(
+                    f"Session attempt {_sess_attempt}/{_SESSION_RETRIES} failed, "
+                    f"retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
 
         # Derive key
         aes_key = derive_aes_key(

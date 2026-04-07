@@ -4,10 +4,15 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.3.6] - 2026-04-07
+## [0.3.7] - 2026-04-07
 
 ### Fixed
 - Transient decryption and constant-refresh failures are no longer marked `unavailable` permanently. Only genuinely dead LimeWire share links are classified as permanent failures, so recoverable download issues can be retried normally.
+- LimeWire "Unexpected Server Error" SSR responses (common from cloud/datacenter IPs) are now treated as transient and retried with backoff, instead of being permanently marked as dead links. Only `SanitizedError` (genuinely removed shares) is permanent.
+- Session establishment now retries up to 3 times with 5s/10s delays for transient SSR errors before falling back to the outer download retry loop.
+
+### Changed
+- Improved diagnostic logging for LimeWire error detection: logs now include the sharing ID, response size, and which specific error pattern triggered (SanitizedError vs Unexpected Server Error).
 
 ## [0.2.1] - 2026-04-06
 
