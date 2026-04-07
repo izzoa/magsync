@@ -83,14 +83,21 @@ async def establish_session(
         # Permanent: SanitizedError in sharingBucketContentData → link is genuinely dead.
         # Transient: "Unexpected Server Error" → SSR backend hiccup (rate limit,
         #   bot challenge, or datacenter IP discrimination). Should be retried.
-        if "sharingBucketContentData" in html:
-            sbc_section = html.split("sharingBucketContentData", 1)[-1][:300]
-            if "SanitizedError" in sbc_section:
+        if '"sharingBucketContentData":' in html:
+            # rsplit → last occurrence = actual SSR JSON payload, not minified JS
+            sbc_section = html.rsplit('"sharingBucketContentData":', 1)[-1][:500]
+            if '"SanitizedError"' in sbc_section:
+                logger.debug(f"SanitizedError context: {sbc_section[:300]!r}")
                 logger.error(
                     f"LimeWire SSR: SanitizedError in sharingBucketContentData "
                     f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
                 )
                 raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+            if "Unexpected Server Error" in html:
+                logger.info(
+                    f"LimeWire SSR: sharingBucketContentData present but also "
+                    f"'Unexpected Server Error' (sharing_id={sharing_id}) — treating as transient"
+                )
         elif "Unexpected Server Error" not in html:
             logger.warning(f"No sharingBucketContentData in response ({len(html)} bytes)")
 
@@ -251,6 +258,33 @@ _PERMANENT_ERRORS = (
 
 def _is_permanent_error(error: str) -> bool:
     return any(msg in error for msg in _PERMANENT_ERRORS)
+
+
+_SESSION_RETRIES = 3
+
+
+async def _establish_session_with_retry(
+    limewire_url: str,
+    client: httpx.AsyncClient,
+    retries: int = _SESSION_RETRIES,
+) -> LimeWireSession:
+    """Establish a LimeWire session with retry for transient errors."""
+    for attempt in range(1, retries + 1):
+        try:
+            return await establish_session(limewire_url, client=client)
+        except (RuntimeError, httpx.HTTPStatusError) as e:
+            is_transient = (
+                (isinstance(e, RuntimeError) and "transient" in str(e))
+                or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 500, 502, 503, 504))
+            )
+            if not is_transient or attempt == retries:
+                raise
+            delay = 5 * attempt  # 5s, 10s
+            logger.info(
+                f"Session attempt {attempt}/{retries} failed ({e}), "
+                f"retrying in {delay}s..."
+            )
+            await asyncio.sleep(delay)
 
 
 class RateLimitGate:
@@ -422,21 +456,7 @@ async def _do_download(
                 )
 
         # Establish session (retry transient SSR errors with backoff)
-        session = None
-        _SESSION_RETRIES = 3
-        for _sess_attempt in range(1, _SESSION_RETRIES + 1):
-            try:
-                session = await establish_session(limewire_url, client=client)
-                break
-            except RuntimeError as e:
-                if "transient" not in str(e) or _sess_attempt == _SESSION_RETRIES:
-                    raise
-                delay = 5 * _sess_attempt  # 5s, 10s
-                logger.info(
-                    f"Session attempt {_sess_attempt}/{_SESSION_RETRIES} failed, "
-                    f"retrying in {delay}s..."
-                )
-                await asyncio.sleep(delay)
+        session = await _establish_session_with_retry(limewire_url, client)
 
         # Derive key
         aes_key = derive_aes_key(
@@ -459,7 +479,7 @@ async def _do_download(
             if part_age_minutes > 50:
                 # Presigned URL likely expired — get a fresh one
                 logger.info(f"Part file is {int(part_age_minutes)}m old, refreshing session...")
-                session = await establish_session(limewire_url, client=client)
+                session = await _establish_session_with_retry(limewire_url, client)
                 aes_key = derive_aes_key(
                     sharing_id, fragment,
                     session.passphrase_wrapped_pk,

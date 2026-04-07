@@ -4,6 +4,17 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.8] - 2026-04-07
+
+### Fixed
+- **False positive dead links**: SanitizedError detection now targets the last occurrence of `sharingBucketContentData` (the actual SSR JSON payload) using `rsplit`, instead of the first occurrence which often landed in minified JS error-handling code. Quoted JSON key/value matching (`"SanitizedError"`) prevents false matches against substrings like `SanitizedErrorBoundary`.
+- **Session retry now catches HTTP errors**: The session establishment retry loop now catches `httpx.HTTPStatusError` (429, 500, 502, 503, 504) in addition to transient `RuntimeError`, preventing wasted download attempts on server hiccups.
+- **Session refresh for expired `.part` files now retries**: The `establish_session` call when refreshing expired presigned URLs (>50 min) is now wrapped in the same retry loop, preventing single transient errors from killing resumed downloads.
+
+### Changed
+- Improved diagnostic logging: debug-level log of the SanitizedError context window, and info-level log when both `sharingBucketContentData` and `Unexpected Server Error` coexist in a response.
+- Extracted `_establish_session_with_retry()` helper to DRY up session retry logic.
+
 ## [0.3.7] - 2026-04-07
 
 ### Fixed
