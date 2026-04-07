@@ -4,6 +4,11 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.6] - 2026-04-07
+
+### Fixed
+- Transient decryption and constant-refresh failures are no longer marked `unavailable` permanently. Only genuinely dead LimeWire share links are classified as permanent failures, so recoverable download issues can be retried normally.
+
 ## [0.2.1] - 2026-04-06
 
 ### Added
