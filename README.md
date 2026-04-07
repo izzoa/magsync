@@ -164,7 +164,7 @@ All config values can be overridden via environment variables:
 | `MAGSYNC_CONFIG_DIR` | Config directory path | `~/.magsync` |
 | `MAGSYNC_DB_PATH` | SQLite index path | `{config_dir}/index.db` |
 | `MAGSYNC_DOWNLOAD__MAX_CONCURRENT` | Max parallel downloads | `3` |
-| `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Max retry attempts per download | `3` |
+| `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Retries after a failed download (0 = no retry) | `2` |
 | `MAGSYNC_DOWNLOAD__SCRAPE_DELAY` | Delay between scrape requests (seconds) | `1.0` |
 
 ### NAS Deployment (Synology, QNAP)
@@ -207,7 +207,7 @@ output_dir = "~/Magazines"
 
 [download]
 max_concurrent = 3
-retry_attempts = 3
+retry_attempts = 2
 scrape_delay = 1.0
 
 # [limewire] section is auto-populated on first download via self-healing.

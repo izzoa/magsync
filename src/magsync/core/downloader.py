@@ -263,11 +263,11 @@ def _is_permanent_error(error: str) -> bool:
 async def _establish_session_with_retry(
     limewire_url: str,
     client: httpx.AsyncClient,
-    retries: int = 3,
+    retries: int = 2,
 ) -> LimeWireSession:
     """Establish a LimeWire session with retry for transient errors."""
-    retries = max(1, retries)
-    for attempt in range(1, retries + 1):
+    total = retries + 1  # 1 initial attempt + retries
+    for attempt in range(1, total + 1):
         try:
             return await establish_session(limewire_url, client=client)
         except (RuntimeError, httpx.HTTPStatusError) as e:
@@ -275,11 +275,11 @@ async def _establish_session_with_retry(
                 (isinstance(e, RuntimeError) and "transient" in str(e))
                 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 500, 502, 503, 504))
             )
-            if not is_transient or attempt == retries:
+            if not is_transient or attempt == total:
                 raise
             delay = 5 * attempt  # 5s, 10s
             logger.info(
-                f"Session attempt {attempt}/{retries} failed ({e}), "
+                f"Session attempt {attempt}/{total} failed ({e}), "
                 f"retrying in {delay}s..."
             )
             await asyncio.sleep(delay)
@@ -360,13 +360,13 @@ async def download_and_decrypt(
         if retry_attempts is None:
             retry_attempts = cfg.download.retry_attempts
     if retry_attempts is None:
-        retry_attempts = 3
-    retry_attempts = max(1, retry_attempts)
+        retry_attempts = 2
     if rate_gate is None:
         rate_gate = get_rate_limit_gate()
 
+    total = retry_attempts + 1  # 1 initial attempt + retry_attempts retries
     last_error = ""
-    for attempt in range(1, retry_attempts + 1):
+    for attempt in range(1, total + 1):
         # Wait if a 429 pause is active
         await rate_gate.wait()
 
@@ -386,17 +386,17 @@ async def download_and_decrypt(
         # 429 is handled inside _download_and_decrypt_once via the gate,
         # but we still retry the attempt
         if "429" in last_error or "rate limit" in last_error.lower():
-            logger.info(f"Retrying after rate limit (attempt {attempt}/{retry_attempts})...")
+            logger.info(f"Retrying after rate limit (attempt {attempt}/{total})...")
             continue
 
-        if attempt < retry_attempts:
+        if attempt < total:
             delay = 2 ** attempt  # 2s, 4s, 8s, ...
-            logger.warning(f"Attempt {attempt}/{retry_attempts} failed: {last_error}. Retrying in {delay}s...")
+            logger.warning(f"Attempt {attempt}/{total} failed: {last_error}. Retrying in {delay}s...")
             await asyncio.sleep(delay)
         else:
-            logger.error(f"All {retry_attempts} attempts failed: {last_error}")
+            logger.error(f"All {total} attempts failed: {last_error}")
 
-    return DownloadResult(success=False, error=f"Failed after {retry_attempts} attempts: {last_error}")
+    return DownloadResult(success=False, error=f"Failed after {total} attempts: {last_error}")
 
 
 async def _download_and_decrypt_once(
@@ -406,7 +406,7 @@ async def _download_and_decrypt_once(
     constants: LimeWireConstants,
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
-    retry_attempts: int = 3,
+    retry_attempts: int = 2,
 ) -> DownloadResult:
     """Single download attempt (no retry)."""
     try:
@@ -431,7 +431,7 @@ async def _do_download(
     constants: LimeWireConstants,
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
-    retry_attempts: int = 3,
+    retry_attempts: int = 2,
 ) -> DownloadResult:
     """Inner download logic, separated for 429 handling."""
 

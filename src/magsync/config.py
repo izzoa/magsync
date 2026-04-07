@@ -57,7 +57,7 @@ class LimeWireConstants:
 @dataclass
 class DownloadSettings:
     max_concurrent: int = 3
-    retry_attempts: int = 3
+    retry_attempts: int = 2
     scrape_delay: float = 1.0
 
 
