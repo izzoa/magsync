@@ -33,6 +33,9 @@ async def _download_one(
         # Wait if a 429 pause is active before starting
         await rate_gate.wait()
 
+        # Stagger concurrent requests to avoid hitting LimeWire too fast
+        await asyncio.sleep(1)
+
         lw_url = issue.get("limewire_url")
         if not lw_url:
             return {"issue": issue, "success": False, "error": "No download link"}
