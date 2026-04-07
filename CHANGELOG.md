@@ -4,7 +4,10 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.3.10] - 2026-04-07
+## [0.3.11] - 2026-04-07
+
+### Fixed
+- `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` env var now actually takes effect in batch/daemon downloads. The batch downloader was passing `constants` explicitly, which skipped config loading and ignored the retry setting.
 
 ### Changed
 - `retry_attempts` now means number of *retries* after the initial attempt (0 = no retry, 2 = 3 total attempts). Default changed from 3 to 2 to preserve the same 3-total-attempts behavior. Session retry also respects this setting (previously hardcoded).
