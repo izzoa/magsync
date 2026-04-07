@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from magsync.config import Config
-from magsync.core.downloader import download_and_decrypt, RateLimitGate
+from magsync.core.downloader import download_and_decrypt, RateLimitGate, _is_permanent_error
 from magsync.core.index import MagazineIndex
 from magsync.core.models import DownloadStatus
 from magsync.core.organizer import organize_path
@@ -59,8 +59,9 @@ async def _download_one(
                 lw_url, dest, constants=cfg.limewire, rate_gate=rate_gate,
             )
         except Exception as e:
-            idx.update_download_status(issue["id"], DownloadStatus.FAILED)
             error_msg = str(e)
+            status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error_msg) else DownloadStatus.FAILED
+            idx.update_download_status(issue["id"], status)
             if on_complete:
                 on_complete(issue, False, error_msg)
             return {"issue": issue, "success": False, "error": error_msg}
@@ -77,7 +78,9 @@ async def _download_one(
                 on_complete(issue, True, None)
             return {"issue": issue, "success": True, "error": None, "path": result.file_path}
         else:
-            idx.update_download_status(issue["id"], DownloadStatus.FAILED)
+            error = result.error or ""
+            status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error) else DownloadStatus.FAILED
+            idx.update_download_status(issue["id"], status)
             if on_complete:
                 on_complete(issue, False, result.error)
             return {"issue": issue, "success": False, "error": result.error}

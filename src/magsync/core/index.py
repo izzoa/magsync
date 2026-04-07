@@ -212,11 +212,11 @@ class MagazineIndex:
         return [dict(row) for row in rows]
 
     def reset_failed_downloads(self, magazine_title: str | None = None) -> int:
-        """Reset failed downloads back to pending. Returns count reset."""
+        """Reset failed and unavailable downloads back to pending. Returns count reset."""
         if magazine_title:
             cursor = self.conn.execute(
                 """UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL
-                   WHERE status = 'failed' AND issue_id IN (
+                   WHERE status IN ('failed', 'unavailable') AND issue_id IN (
                        SELECT i.id FROM issues i
                        JOIN magazines m ON i.magazine_id = m.id
                        WHERE m.normalized_title LIKE ?
@@ -225,7 +225,7 @@ class MagazineIndex:
             )
         else:
             cursor = self.conn.execute(
-                "UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL WHERE status = 'failed'"
+                "UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL WHERE status IN ('failed', 'unavailable')"
             )
         self.conn.commit()
         return cursor.rowcount
@@ -237,7 +237,8 @@ class MagazineIndex:
                  COUNT(*) as total_issues,
                  SUM(CASE WHEN d.status = 'complete' THEN 1 ELSE 0 END) as downloaded,
                  SUM(CASE WHEN d.status = 'pending' THEN 1 ELSE 0 END) as pending,
-                 SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) as failed
+                 SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) as failed,
+                 SUM(CASE WHEN d.status = 'unavailable' THEN 1 ELSE 0 END) as unavailable
                FROM issues i
                LEFT JOIN downloads d ON d.issue_id = i.id"""
         ).fetchone()

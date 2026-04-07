@@ -12,7 +12,8 @@ class DownloadStatus(str, Enum):
     PENDING = "pending"
     DOWNLOADING = "downloading"
     COMPLETE = "complete"
-    FAILED = "failed"
+    FAILED = "failed"          # Transient error — retried on next daemon startup
+    UNAVAILABLE = "unavailable"  # Permanent error (dead link) — never auto-retried
 
 
 @dataclass
