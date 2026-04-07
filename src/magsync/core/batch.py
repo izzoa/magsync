@@ -60,6 +60,7 @@ async def _download_one(
         try:
             result = await download_and_decrypt(
                 lw_url, dest, constants=cfg.limewire, rate_gate=rate_gate,
+                retry_attempts=cfg.download.retry_attempts,
             )
         except Exception as e:
             error_msg = str(e)
