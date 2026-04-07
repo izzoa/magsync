@@ -266,6 +266,7 @@ async def _establish_session_with_retry(
     retries: int = 3,
 ) -> LimeWireSession:
     """Establish a LimeWire session with retry for transient errors."""
+    retries = max(1, retries)
     for attempt in range(1, retries + 1):
         try:
             return await establish_session(limewire_url, client=client)
@@ -360,6 +361,7 @@ async def download_and_decrypt(
             retry_attempts = cfg.download.retry_attempts
     if retry_attempts is None:
         retry_attempts = 3
+    retry_attempts = max(1, retry_attempts)
     if rate_gate is None:
         rate_gate = get_rate_limit_gate()
 
