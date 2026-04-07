@@ -196,22 +196,22 @@ def organize_path(
     norm_title = normalize_title(title)
 
     if not filename:
-        # Build uniform filename: {Title} - {YYYY}-{MM} - {Detail}.pdf
-        date_part = ""
-        if parsed.year:
+        if not parsed.year:
+            # No date patterns matched — fall back to sanitized original title
+            filename = _sanitize_filename(title) + ".pdf"
+        else:
+            # Build uniform filename: {Title} - {YYYY}-{MM} - {Detail}.pdf
             if parsed.month:
                 date_part = f"{parsed.year}-{parsed.month:02d}"
             else:
                 date_part = str(parsed.year)
-        else:
-            date_part = "Unknown"
 
-        detail = _extract_issue_detail(title, norm_title)
-        detail = _sanitize_filename(detail)
+            detail = _extract_issue_detail(title, norm_title)
+            detail = _sanitize_filename(detail)
 
-        parts = [_sanitize_filename(norm_title), date_part]
-        if detail:
-            parts.append(detail)
-        filename = " - ".join(parts) + ".pdf"
+            parts = [_sanitize_filename(norm_title), date_part]
+            if detail:
+                parts.append(detail)
+            filename = " - ".join(parts) + ".pdf"
 
     return Path(output_dir) / _sanitize_filename(norm_title) / filename
