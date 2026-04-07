@@ -68,6 +68,7 @@ async def establish_session(
         resp = await client.get(f"https://limewire.com/d/{sharing_id}")
         resp.raise_for_status()
         html = resp.text
+        logger.debug(f"LimeWire page response: {resp.status_code}, {len(html)} bytes, sharing_id={sharing_id}")
 
         jwt_token = client.cookies.get("production_access_token")
         if not jwt_token:
@@ -79,12 +80,20 @@ async def establish_session(
         csrf_token = jwt_payload["csrfToken"]
 
         # Check for server-side errors (removed/expired share links)
-        # Dead pages have: sharingBucketContentData\",{...},\"ok\",\"error\"
-        # Valid pages have: sharingBucketContentData\",{...},\"ok\",true
+        # Dead pages have: \"ok\",\"error\",["SanitizedError"...] and "Unexpected Server Error"
+        # Valid pages have: \"ok\",true,\"value\",...
+        is_error = False
         if "Unexpected Server Error" in html:
-            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
-        sbc_section = html.split("sharingBucketContentData", 1)[-1][:300]
-        if r'\"ok\",\"error\"' in sbc_section:
+            is_error = True
+        elif "sharingBucketContentData" in html:
+            sbc_section = html.split("sharingBucketContentData", 1)[-1][:300]
+            # Only match the exact SSR error pattern: "ok" followed by "error" and "SanitizedError"
+            if "SanitizedError" in sbc_section:
+                is_error = True
+        else:
+            logger.warning(f"No sharingBucketContentData in response ({len(html)} bytes)")
+
+        if is_error:
             raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
 
         # Extract bucket_id from SSR data
