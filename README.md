@@ -71,6 +71,10 @@ magsync fetch "Science News" --since 2025-01 --output ~/MyMags
 # Update index for all tracked magazines
 magsync update
 
+# Repair indexed issues that are missing a download URL (e.g. after a site change)
+magsync backfill-urls
+magsync backfill-urls "The Economist"   # limit to one magazine
+
 # View/change configuration
 magsync config
 magsync config output_dir ~/MyMagazines
@@ -226,7 +230,7 @@ since = "2025-01"
 
 ### Scraping
 
-magsync searches freemagazines.top (a WordPress site) via its search endpoint (`/?s=query`), follows pagination, and scrapes individual magazine detail pages to extract metadata and download links.
+magsync searches freemagazines.top (a WordPress site) via its search endpoint (`/?s=query`), follows pagination, and scrapes individual magazine detail pages to extract metadata and download links. The LimeWire link is read from the download button's `data-url` attribute, falling back to a legacy `href` and then a whole-page search so the scraper survives template changes; each candidate is validated to contain the `#fragment` decryption key. If an indexed issue is ever left without a download URL, `magsync update` re-scrapes and backfills it automatically, or run `magsync backfill-urls` to repair only the affected issues.
 
 ### Downloading
 

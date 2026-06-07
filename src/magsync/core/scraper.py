@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
-from urllib.parse import quote_plus
+from html import unescape
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -14,6 +15,29 @@ BASE_URL = "https://freemagazines.top"
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 }
+
+_LIMEWIRE_RE = re.compile(r"https://limewire\.com/d/[^\s\"'<>]+")
+
+
+def _valid_limewire_url(candidate: str | None) -> str | None:
+    """Validate and normalize a candidate LimeWire share URL.
+
+    Returns the cleaned URL only when it has a ``/d/<sharing_id>`` path and a
+    non-empty ``#fragment`` (the decryption key, required by
+    ``downloader.parse_limewire_url``); otherwise ``None``. The candidate is
+    HTML-unescaped first, since regex matches run against raw page HTML where
+    entities like ``&amp;`` are still encoded.
+    """
+    if not candidate:
+        return None
+    url = unescape(candidate.strip())
+    if "limewire.com/d/" not in url:
+        return None
+    parsed = urlparse(url)
+    sharing_id = parsed.path.split("/")[-1]
+    if not sharing_id or not parsed.fragment:
+        return None
+    return url
 
 
 @dataclass
@@ -138,13 +162,26 @@ async def scrape_detail_page(
             title_tag = soup.find("title")
             title = title_tag.get_text().strip() if title_tag else ""
 
-        # Extract LimeWire download URL
+        # Extract LimeWire download URL. The current freemagazines.top template
+        # carries the real URL in a `data-url` attribute (the anchor href is
+        # "#"); older pages used a plain anchor href. Check both, then fall back
+        # to a whole-page regex so a future carrier change still works. Every
+        # candidate is validated (must have a /d/<id> path and a #fragment).
         limewire_url = None
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if "limewire.com/d/" in href:
-                limewire_url = href
+        for tag in soup.find_all(attrs={"data-url": True}):
+            limewire_url = _valid_limewire_url(tag.get("data-url"))
+            if limewire_url:
                 break
+        if not limewire_url:
+            for a_tag in soup.find_all("a", href=True):
+                limewire_url = _valid_limewire_url(a_tag["href"])
+                if limewire_url:
+                    break
+        if not limewire_url:
+            for m in _LIMEWIRE_RE.finditer(html):
+                limewire_url = _valid_limewire_url(m.group(0))
+                if limewire_url:
+                    break
 
         # Extract genre
         genre = None

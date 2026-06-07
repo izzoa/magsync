@@ -95,14 +95,34 @@ class MagazineIndex:
         return cursor.lastrowid
 
     def add_issues(self, magazine_id: int, issues: list[dict]) -> int:
-        """Upsert issues for a magazine. Returns count of new issues added."""
+        """Upsert issues for a magazine. Returns count of *new* issues added.
+
+        For a ``page_url`` that already exists, backfill any leaf metadata column
+        that is currently NULL/empty from the incoming scrape (never overwriting
+        a populated value). Backfilled rows are not counted as new. ``title`` is
+        intentionally excluded — it drives derived year/month/date_raw and
+        magazine association and cannot be repaired in isolation.
+        """
         added = 0
+        backfill_columns = ("limewire_url", "genre", "file_size", "cover_image_url")
         for issue in issues:
             existing = self.conn.execute(
-                "SELECT id FROM issues WHERE page_url = ?",
+                "SELECT id, limewire_url, genre, file_size, cover_image_url "
+                "FROM issues WHERE page_url = ?",
                 (issue["page_url"],),
             ).fetchone()
             if existing:
+                updates = {
+                    col: issue.get(col)
+                    for col in backfill_columns
+                    if issue.get(col) and not existing[col]
+                }
+                if updates:
+                    set_clause = ", ".join(f"{c} = ?" for c in updates)
+                    self.conn.execute(
+                        f"UPDATE issues SET {set_clause} WHERE id = ?",
+                        (*updates.values(), existing["id"]),
+                    )
                 continue
 
             cursor = self.conn.execute(
@@ -197,6 +217,31 @@ class MagazineIndex:
 
         rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_issues_missing_url(self, magazine_title: str | None = None) -> list[dict]:
+        """Return issues whose limewire_url is NULL/empty, optionally filtered by magazine."""
+        query = """
+            SELECT i.id, i.page_url, i.title,
+                   m.title as magazine_title, m.normalized_title
+            FROM issues i
+            JOIN magazines m ON i.magazine_id = m.id
+            WHERE (i.limewire_url IS NULL OR i.limewire_url = '')
+        """
+        params: list = []
+        if magazine_title:
+            query += " AND m.normalized_title LIKE ?"
+            params.append(f"%{magazine_title}%")
+        query += " ORDER BY m.title, i.title"
+        rows = self.conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_limewire_url(self, issue_id: int, limewire_url: str):
+        """Set the limewire_url for an issue (used by backfill)."""
+        self.conn.execute(
+            "UPDATE issues SET limewire_url = ? WHERE id = ?",
+            (limewire_url, issue_id),
+        )
+        self.conn.commit()
 
     def get_tracked_magazines(self) -> list[dict]:
         """Get all tracked magazines with issue counts."""

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "magsync"
-version = "0.3.11"
+version = "0.3.12"
 description = "CLI/TUI tool for indexing and downloading magazines from freemagazines.top"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,9 +18,15 @@ dependencies = [
 
 [project.optional-dependencies]
 notifications = ["apprise>=1.7"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [project.scripts]
 magsync = "magsync.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magsync"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

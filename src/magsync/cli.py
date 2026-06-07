@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -21,7 +22,7 @@ from magsync.config import load_config, save_config, set_config_value
 from magsync.core.index import MagazineIndex
 from magsync.core.models import DownloadStatus, Subscription
 from magsync.core.organizer import normalize_title, parse_date, organize_path, strip_accents
-from magsync.core.scraper import search_with_details
+from magsync.core.scraper import DEFAULT_HEADERS, scrape_detail_page, search_with_details
 
 app = typer.Typer(
     name="magsync",
@@ -454,6 +455,61 @@ def retry(
         console.print(
             f"\n[green]Done![/green] {stats['downloaded']} downloaded, "
             f"{stats['pending']} pending, {stats['failed']} failed"
+        )
+    finally:
+        idx.close()
+
+
+@app.command(name="backfill-urls")
+def backfill_urls(
+    query: str = typer.Argument(None, help="Only backfill issues for this magazine"),
+):
+    """Re-scrape issues missing a download URL and repair them.
+
+    Useful after a site template change leaves indexed issues without a LimeWire
+    URL. `magsync update` repairs these automatically too; this command targets
+    only the broken rows and also reaches de-tracked magazines.
+    """
+    cfg = load_config()
+    idx = MagazineIndex()
+
+    try:
+        missing = idx.get_issues_missing_url(magazine_title=query)
+        if not missing:
+            console.print("[green]No issues missing a download URL.[/green]")
+            raise typer.Exit()
+
+        console.print(
+            f"[cyan]Re-scraping {len(missing)} issue"
+            f"{'s' if len(missing) != 1 else ''} missing a download URL...[/cyan]"
+        )
+
+        async def _backfill() -> int:
+            repaired = 0
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=30.0, headers=DEFAULT_HEADERS
+            ) as client:
+                for i, row in enumerate(missing):
+                    title = (row["title"] or row["page_url"])[:50]
+                    try:
+                        detail = await scrape_detail_page(row["page_url"], client=client)
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] {title}: {e}")
+                        detail = None
+                    if detail and detail.limewire_url:
+                        idx.set_limewire_url(row["id"], detail.limewire_url)
+                        repaired += 1
+                        console.print(f"  [green]✓[/green] {title}")
+                    else:
+                        console.print(f"  [dim]–[/dim] {title}: still no URL")
+                    if i < len(missing) - 1:
+                        await asyncio.sleep(cfg.download.scrape_delay)
+            return repaired
+
+        repaired = asyncio.run(_backfill())
+        console.print(
+            f"\n[green]Backfill complete.[/green] {repaired} repaired, "
+            f"{len(missing) - repaired} still missing a URL."
         )
     finally:
         idx.close()

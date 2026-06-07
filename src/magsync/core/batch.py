@@ -38,6 +38,11 @@ async def _download_one(
 
         lw_url = issue.get("limewire_url")
         if not lw_url:
+            # No URL to try (e.g. removed upstream, or awaiting backfill). Report
+            # it so callers that don't pre-filter (e.g. `magsync fetch`) account
+            # for it instead of silently dropping it. Status stays pending.
+            if on_complete:
+                on_complete(issue, False, "No download link")
             return {"issue": issue, "success": False, "error": "No download link"}
 
         dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)

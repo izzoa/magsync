@@ -4,6 +4,16 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.12] - 2026-06-07
+
+### Fixed
+- **Downloads stopped after the freemagazines.top template change (~2026-05-27)**: the LimeWire link moved from the anchor `href` to a `data-url` attribute, so the scraper extracted no URL and every newly-indexed issue had an empty `limewire_url` — daemons reported "N new indexed, 0 downloaded". The detail-page scraper now reads `data-url`, falls back to the legacy `href`, and finally to a whole-page search, validating that each candidate has a `/d/<id>` path and a non-empty `#fragment` (the decryption key).
+- `magsync fetch` now reports issues skipped for a missing download URL instead of silently dropping them.
+
+### Added
+- **Self-healing backfill**: re-scraping an already-indexed issue now backfills empty `limewire_url`, `genre`, `file_size`, and `cover_image_url` fields (never overwriting populated values), so `magsync update` automatically repairs issues left without a download URL by the template change.
+- **`magsync backfill-urls [magazine]`**: re-scrapes only issues missing a download URL and updates them — faster than a full `update`, and also reaches de-tracked magazines.
+
 ## [0.3.11] - 2026-04-07
 
 ### Fixed
