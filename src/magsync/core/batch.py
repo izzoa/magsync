@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -24,75 +26,84 @@ async def _download_one(
     rate_gate: RateLimitGate,
     on_start: Callable[[dict], None] | None = None,
     on_complete: Callable[[dict, bool, str | None], None] | None = None,
+    dest_locks: dict | None = None,
 ) -> dict:
     """Download a single issue, respecting the concurrency semaphore and rate limit gate.
 
     Returns a result dict with issue info and success/error status.
     """
-    async with semaphore:
-        # Wait if a 429 pause is active before starting
-        await rate_gate.wait()
+    lw_url = issue.get("limewire_url")
+    if not lw_url:
+        # No URL to try (e.g. removed upstream, or awaiting backfill). Report
+        # it so callers that don't pre-filter (e.g. `magsync fetch`) account
+        # for it instead of silently dropping it. Status stays pending.
+        if on_complete:
+            on_complete(issue, False, "No download link")
+        return {"issue": issue, "success": False, "error": "No download link"}
 
-        # Stagger concurrent requests to avoid hitting LimeWire too fast
-        await asyncio.sleep(1)
+    dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
 
-        lw_url = issue.get("limewire_url")
-        if not lw_url:
-            # No URL to try (e.g. removed upstream, or awaiting backfill). Report
-            # it so callers that don't pre-filter (e.g. `magsync fetch`) account
-            # for it instead of silently dropping it. Status stays pending.
-            if on_complete:
-                on_complete(issue, False, "No download link")
-            return {"issue": issue, "success": False, "error": "No download link"}
+    # Per-destination lock: serialize issues that resolve to the same output file
+    # (e.g. hyphen vs en-dash title variants of one issue) so the on-disk dedup
+    # below short-circuits the duplicate instead of a concurrent double-fetch.
+    # Acquired OUTSIDE the semaphore so a waiting duplicate doesn't hold a slot.
+    dest_lock = dest_locks[str(dest)] if dest_locks is not None else nullcontext()
 
-        dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
+    async with dest_lock:
+        async with semaphore:
+            # Wait if a 429/throttle pause is active before starting
+            await rate_gate.wait()
 
-        # Skip if file already exists on disk (e.g., index was wiped but files remain)
-        if dest.exists():
-            logger.info(f"Already on disk, skipping: {dest.name}")
-            idx.update_download_status(
-                issue["id"], DownloadStatus.COMPLETE, str(dest), dest.stat().st_size,
-            )
-            if on_complete:
-                on_complete(issue, True, None)
-            return {"issue": issue, "success": True, "error": None, "path": dest}
+            # Stagger concurrent requests to avoid hitting LimeWire too fast
+            await asyncio.sleep(1)
 
-        if on_start:
-            on_start(issue)
+            # Skip if file already exists on disk (index wiped but files remain,
+            # or a same-destination sibling already downloaded it this batch)
+            if dest.exists():
+                logger.info(f"Already on disk, skipping: {dest.name}")
+                idx.update_download_status(
+                    issue["id"], DownloadStatus.COMPLETE, str(dest), dest.stat().st_size,
+                )
+                if on_complete:
+                    on_complete(issue, True, None)
+                return {"issue": issue, "success": True, "error": None, "path": dest}
 
-        idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
+            if on_start:
+                on_start(issue)
 
-        try:
-            result = await download_and_decrypt(
-                lw_url, dest, constants=cfg.limewire, rate_gate=rate_gate,
-                retry_attempts=cfg.download.retry_attempts,
-            )
-        except Exception as e:
-            error_msg = str(e)
-            status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error_msg) else DownloadStatus.FAILED
-            idx.update_download_status(issue["id"], status)
-            if on_complete:
-                on_complete(issue, False, error_msg)
-            return {"issue": issue, "success": False, "error": error_msg}
+            idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
 
-        if result.success:
-            idx.update_download_status(
-                issue["id"],
-                DownloadStatus.COMPLETE,
-                str(result.file_path),
-                result.file_size_bytes,
-                result.sha256,
-            )
-            if on_complete:
-                on_complete(issue, True, None)
-            return {"issue": issue, "success": True, "error": None, "path": result.file_path}
-        else:
-            error = result.error or ""
-            status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error) else DownloadStatus.FAILED
-            idx.update_download_status(issue["id"], status)
-            if on_complete:
-                on_complete(issue, False, result.error)
-            return {"issue": issue, "success": False, "error": result.error}
+            try:
+                result = await download_and_decrypt(
+                    lw_url, dest, constants=cfg.limewire, rate_gate=rate_gate,
+                    retry_attempts=cfg.download.retry_attempts,
+                )
+            except Exception as e:
+                error_msg = str(e)
+                status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error_msg) else DownloadStatus.FAILED
+                idx.update_download_status(issue["id"], status)
+                if on_complete:
+                    on_complete(issue, False, error_msg)
+                return {"issue": issue, "success": False, "error": error_msg}
+
+            if result.success:
+                idx.update_download_status(
+                    issue["id"],
+                    DownloadStatus.COMPLETE,
+                    str(result.file_path),
+                    result.file_size_bytes,
+                    result.sha256,
+                )
+                if on_complete:
+                    on_complete(issue, True, None)
+                return {"issue": issue, "success": True, "error": None, "path": result.file_path}
+            else:
+                error = result.error or ""
+                status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error) else DownloadStatus.FAILED
+                idx.update_download_status(issue["id"], status)
+                if on_complete:
+                    on_complete(issue, False, result.error)
+                return {"issue": issue, "success": False, "error": result.error}
 
 
 async def download_batch(
@@ -142,9 +153,12 @@ async def download_batch(
 
     semaphore = asyncio.Semaphore(cfg.download.max_concurrent)
     rate_gate = RateLimitGate()
+    # Shared per-destination locks so issues resolving to the same output file
+    # are downloaded once (the on-disk dedup handles the rest), not concurrently.
+    dest_locks: dict = defaultdict(asyncio.Lock)
 
     tasks = [
-        _download_one(issue, cfg, idx, semaphore, rate_gate, on_start, on_complete)
+        _download_one(issue, cfg, idx, semaphore, rate_gate, on_start, on_complete, dest_locks)
         for issue in issues
     ]
 

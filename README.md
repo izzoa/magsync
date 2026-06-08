@@ -168,7 +168,7 @@ All config values can be overridden via environment variables:
 | `MAGSYNC_CONFIG_DIR` | Config directory path | `~/.magsync` |
 | `MAGSYNC_DB_PATH` | SQLite index path | `{config_dir}/index.db` |
 | `MAGSYNC_DOWNLOAD__MAX_CONCURRENT` | Max parallel downloads | `3` |
-| `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Retries after a failed download (0 = no retry) | `2` |
+| `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Retries after a failed download (0 = no retry — **not recommended**; transient LimeWire throttling won't be retried) | `2` |
 | `MAGSYNC_DOWNLOAD__SCRAPE_DELAY` | Delay between scrape requests (seconds) | `1.0` |
 
 ### NAS Deployment (Synology, QNAP)
@@ -245,6 +245,8 @@ Downloads go through [LimeWire](https://limewire.com), a file-sharing service th
 5. Download the encrypted blob and decrypt with AES-256-CTR
 
 No browser, Playwright, or Selenium required.
+
+Downloads are resilient to LimeWire throttling: a transient server error pauses all concurrent downloads briefly (shared backoff) and retries, and issues that resolve to the same file are fetched once. Keep `download.retry_attempts` ≥ 1 so transient errors are retried.
 
 ### Self-Healing
 

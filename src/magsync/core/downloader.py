@@ -31,6 +31,12 @@ from magsync.core.models import DownloadResult, LimeWireSession
 # Regex for finding UUIDs in SSR streaming data
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
+# Session establishment retries transient errors at least this many times even
+# when retry_attempts=0 — a transient SSR/infra hiccup is not a download failure.
+_MIN_SESSION_RETRIES = 2
+# Shared pause (seconds) when LimeWire signals a transient throttle.
+_SSR_THROTTLE_PAUSE = 20
+
 
 def parse_limewire_url(url: str) -> tuple[str, str]:
     """Parse a LimeWire share URL into (sharing_id, fragment/passphrase)."""
@@ -104,7 +110,7 @@ async def establish_session(
         if "Unexpected Server Error" in html:
             logger.warning(
                 f"LimeWire SSR: transient 'Unexpected Server Error' "
-                f"(sharing_id={sharing_id}, {len(html)} bytes) — will retry"
+                f"(sharing_id={sharing_id}, {len(html)} bytes)"
             )
             raise RuntimeError("LimeWire SSR returned transient server error")
 
@@ -264,9 +270,18 @@ async def _establish_session_with_retry(
     limewire_url: str,
     client: httpx.AsyncClient,
     retries: int = 2,
+    rate_gate: "RateLimitGate | None" = None,
 ) -> LimeWireSession:
-    """Establish a LimeWire session with retry for transient errors."""
-    total = retries + 1  # 1 initial attempt + retries
+    """Establish a LimeWire session, retrying transient errors.
+
+    Transient errors (SSR throttle, 429/5xx) are retried at least
+    ``_MIN_SESSION_RETRIES`` times even when ``retries`` is 0 — a transient
+    session/infra hiccup is not a download failure, so download-level
+    ``retry_attempts`` semantics do not apply here. When a shared rate-limit
+    gate is provided, a transient failure pauses all concurrent downloads
+    before retrying instead of sleeping per-worker.
+    """
+    total = max(retries, _MIN_SESSION_RETRIES) + 1
     for attempt in range(1, total + 1):
         try:
             return await establish_session(limewire_url, client=client)
@@ -277,12 +292,11 @@ async def _establish_session_with_retry(
             )
             if not is_transient or attempt == total:
                 raise
-            delay = 5 * attempt  # 5s, 10s
-            logger.info(
-                f"Session attempt {attempt}/{total} failed ({e}), "
-                f"retrying in {delay}s..."
-            )
-            await asyncio.sleep(delay)
+            logger.info(f"Session attempt {attempt}/{total} failed ({e}); pausing then retrying...")
+            if rate_gate is not None:
+                await rate_gate.trigger(_SSR_THROTTLE_PAUSE, reason="LimeWire throttle (transient SSR)")
+            else:
+                await asyncio.sleep(5 * attempt)  # 5s, 10s
 
 
 class RateLimitGate:
@@ -297,23 +311,37 @@ class RateLimitGate:
         self._lock = asyncio.Lock()
         self._ready = asyncio.Event()
         self._ready.set()
+        self._deadline = 0.0
 
     async def wait(self):
         """Wait until the rate limit gate is open."""
         await self._ready.wait()
 
-    async def trigger(self, retry_after: int = 30):
-        """Pause all downloads for retry_after seconds."""
+    async def trigger(self, retry_after: int = 30, *, reason: str = "Rate limited (429)"):
+        """Pause all downloads until ``retry_after`` seconds from now.
+
+        A concurrent trigger requesting a later resume time extends the active
+        pause rather than being ignored, and the gate always reopens even if
+        this task is cancelled mid-pause.
+        """
+        now = asyncio.get_running_loop().time()
+        self._deadline = max(self._deadline, now + max(retry_after, 1))
         if self._lock.locked():
-            # Another coroutine already handling the pause
+            # Another task is already pausing; the deadline was extended above.
             await self._ready.wait()
             return
         async with self._lock:
             self._ready.clear()
-            logger.warning(f"Rate limited (429). Pausing all downloads for {retry_after}s...")
-            await asyncio.sleep(retry_after)
-            self._ready.set()
-            logger.info("Rate limit pause ended, resuming downloads")
+            logger.warning(f"{reason}. Pausing all downloads...")
+            try:
+                while True:
+                    remaining = self._deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(remaining)
+            finally:
+                self._ready.set()
+                logger.info("Rate limit pause ended, resuming downloads")
 
 
 # Global gate — shared across concurrent downloads within one event loop
@@ -458,7 +486,7 @@ async def _do_download(
                 )
 
         # Establish session (retry transient SSR errors with backoff)
-        session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts)
+        session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts, rate_gate=rate_gate)
 
         # Derive key
         aes_key = derive_aes_key(
@@ -481,7 +509,7 @@ async def _do_download(
             if part_age_minutes > 50:
                 # Presigned URL likely expired — get a fresh one
                 logger.info(f"Part file is {int(part_age_minutes)}m old, refreshing session...")
-                session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts)
+                session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts, rate_gate=rate_gate)
                 aes_key = derive_aes_key(
                     sharing_id, fragment,
                     session.passphrase_wrapped_pk,

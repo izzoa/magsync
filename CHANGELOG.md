@@ -4,6 +4,20 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.13] - 2026-06-07
+
+### Added
+- **Shared throttle on transient LimeWire errors**: a transient SSR "server error" (LimeWire's throttle signal) now engages the shared rate-limit gate — pausing all concurrent downloads briefly before retrying — instead of every worker hammering through the throttle. Previously only HTTP 429 triggered the gate.
+- **Per-destination batch deduplication**: issues that resolve to the same output file (e.g. hyphen vs en-dash title variants of one issue, which share a LimeWire link) are downloaded once instead of concurrently; the duplicate completes via the existing on-disk dedup.
+
+### Changed
+- Session establishment now retries transient errors a minimum number of times even when `retry_attempts=0` (a transient infra hiccup is not a download failure); download-level attempts still honor `retry_attempts` exactly.
+- `RateLimitGate` is now concurrency-safe: a longer pause extends a shorter active one, and the gate always reopens even if a paused task is cancelled (previously a cancellation mid-pause could deadlock all downloads).
+
+### Fixed
+- A warning is now logged once when `retry_attempts < 1`, since that disables download retries and makes transient LimeWire errors fail immediately.
+- Corrected a misleading "will retry" log that printed even when no retry would occur.
+
 ## [0.3.12] - 2026-06-07
 
 ### Fixed

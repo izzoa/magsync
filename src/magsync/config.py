@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from magsync.core.models import Subscription
+
+logger = logging.getLogger("magsync")
+_warned_no_retries = False
 
 
 def _get_app_dir() -> Path:
@@ -169,6 +173,16 @@ def load_config() -> Config:
                 )
 
     _apply_env_overrides(cfg)
+
+    global _warned_no_retries
+    if cfg.download.retry_attempts < 1 and not _warned_no_retries:
+        _warned_no_retries = True
+        logger.warning(
+            "download.retry_attempts=%d — download retries are disabled; transient "
+            "LimeWire errors will not be retried. Set it to >=1 (e.g. "
+            "MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS=2) for resilience to transient failures.",
+            cfg.download.retry_attempts,
+        )
     return cfg
 
 
