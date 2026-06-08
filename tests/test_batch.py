@@ -80,3 +80,26 @@ async def test_batch_dedupes_same_destination(tmp_path, monkeypatch):
     assert len(downloads) == 1                            # content fetched once, not twice
     assert len(results) == 2                              # both issues reported
     assert all(success for _t, success, _e in results)    # neither reported as a failure
+
+
+async def test_permanent_error_maps_to_unavailable(tmp_path, monkeypatch):
+    # A permanent "share link is unavailable" error → DownloadStatus.UNAVAILABLE (not FAILED).
+    cfg = Config()
+    cfg.output_dir = str(tmp_path / "out")
+    cfg.limewire.file_iv_b64 = "x"
+    cfg.limewire.sharing_salt_b64 = "x"
+
+    idx = MagazineIndex(db_path=tmp_path / "index.db")
+    mag = idx.get_or_create_magazine("M", "m")
+    idx.add_issues(mag, [{"title": "T", "page_url": "p", "limewire_url": "https://limewire.com/d/Dead#k", "year": 2025, "month": 1}])
+    pending = idx.get_issues(status=DownloadStatus.PENDING)
+
+    async def fake_dl(lw_url, dest, **kwargs):
+        raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+
+    monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_dl)
+
+    await download_batch(pending, cfg, idx, on_complete=lambda *a: None)
+    rows = idx.get_issues()
+    idx.close()
+    assert rows[0]["download_status"] == "unavailable"

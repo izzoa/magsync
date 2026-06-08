@@ -55,6 +55,24 @@ def _ssr_field(html: str, field: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _is_removed_share(html: str) -> bool:
+    """True if the SSR marks this share removed/sanitized (permanently dead).
+
+    LimeWire carries a removed-share error inside the share's
+    `sharingBucketContentData` result (an `error` tuple naming `SanitizedError`),
+    in either the current escaped streaming format
+    (`\\"...\\",\\"ok\\",false,\\"error\\",[\\"SanitizedError\\",...]`) or the
+    legacy JSON shape. Anchored to a bounded window after the (format-agnostic)
+    marker so an unrelated `SanitizedError` elsewhere on the page can't cause a
+    false positive.
+    """
+    idx = html.rfind("sharingBucketContentData")
+    if idx == -1:
+        return False
+    window = html[idx : idx + 400]
+    return re.search(r"error.{0,40}SanitizedError", window) is not None
+
+
 async def establish_session(
     limewire_url: str,
     *,
@@ -76,6 +94,26 @@ async def establish_session(
         html = resp.text
         logger.debug(f"LimeWire page response: {resp.status_code}, {len(html)} bytes, sharing_id={sharing_id}")
 
+        # Classify SSR errors BEFORE extracting JWT/CSRF, so a removed page that
+        # omits the auth cookie is still classified correctly. Order matters:
+        #   Permanent: a removed/sanitized share (SanitizedError in its result) —
+        #     genuinely dead, must take precedence (the page also says
+        #     "Unexpected Server Error").
+        #   Transient: "Unexpected Server Error" with no removed marker — SSR
+        #     backend hiccup (rate limit, bot challenge, datacenter IP). Retry.
+        if _is_removed_share(html):
+            logger.error(
+                f"LimeWire SSR: removed/sanitized share "
+                f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
+            )
+            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
+        if "Unexpected Server Error" in html:
+            logger.warning(
+                f"LimeWire SSR: transient 'Unexpected Server Error' "
+                f"(sharing_id={sharing_id}, {len(html)} bytes)"
+            )
+            raise RuntimeError("LimeWire SSR returned transient server error")
+
         jwt_token = client.cookies.get("production_access_token")
         if not jwt_token:
             raise RuntimeError("Failed to obtain JWT from LimeWire")
@@ -84,35 +122,6 @@ async def establish_session(
         payload_b64 = jwt_token.split(".")[1] + "==="
         jwt_payload = json.loads(base64.b64decode(payload_b64))
         csrf_token = jwt_payload["csrfToken"]
-
-        # Check for server-side errors in SSR data.
-        # Permanent: SanitizedError in sharingBucketContentData → link is genuinely dead.
-        # Transient: "Unexpected Server Error" → SSR backend hiccup (rate limit,
-        #   bot challenge, or datacenter IP discrimination). Should be retried.
-        if '"sharingBucketContentData":' in html:
-            # rsplit → last occurrence = actual SSR JSON payload, not minified JS
-            sbc_section = html.rsplit('"sharingBucketContentData":', 1)[-1][:500]
-            if '"SanitizedError"' in sbc_section:
-                logger.debug(f"SanitizedError context: {sbc_section[:300]!r}")
-                logger.error(
-                    f"LimeWire SSR: SanitizedError in sharingBucketContentData "
-                    f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
-                )
-                raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
-            if "Unexpected Server Error" in html:
-                logger.info(
-                    f"LimeWire SSR: sharingBucketContentData present but also "
-                    f"'Unexpected Server Error' (sharing_id={sharing_id}) — treating as transient"
-                )
-        elif "Unexpected Server Error" not in html:
-            logger.warning(f"No sharingBucketContentData in response ({len(html)} bytes)")
-
-        if "Unexpected Server Error" in html:
-            logger.warning(
-                f"LimeWire SSR: transient 'Unexpected Server Error' "
-                f"(sharing_id={sharing_id}, {len(html)} bytes)"
-            )
-            raise RuntimeError("LimeWire SSR returned transient server error")
 
         # Extract bucket_id from SSR data
         # For UUID-format sharing IDs, the sharing_id IS the bucket_id.
@@ -232,6 +241,10 @@ async def get_download_url(
             },
             json={"contentItems": [{"id": session.content_item_id}]},
         )
+        # A 404 here means the bucket no longer exists → the share is gone.
+        # Treat as permanent (UNAVAILABLE) rather than a retryable HTTP error.
+        if resp.status_code == 404:
+            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
         resp.raise_for_status()
         data = resp.json()
         items = data.get("contentItems", [])

@@ -4,6 +4,13 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.14] - 2026-06-08
+
+### Fixed
+- **Removed LimeWire shares were retried forever.** After LimeWire changed its share-page SSR serialization (JSON objects → React-Router streaming arrays), the dead-share detector — which matched the old `"sharingBucketContentData":` shape — stopped firing, so removed shares (`SanitizedError`) were misclassified as a transient "Unexpected Server Error" and retried every cycle (and, since 0.3.13, tripped the shared throttle pause, stalling the batch). Detection is now format-agnostic and anchored to the share's error tuple, so removed shares are correctly marked `unavailable` and skipped. Run `magsync retry` to re-attempt if a link returns.
+- SSR error classification now runs **before** JWT/CSRF extraction, so a removed page that omits the auth cookie is still classified correctly.
+- A download-API `404` (bucket removed) is now treated as permanent (`unavailable`) instead of retried.
+
 ## [0.3.13] - 2026-06-07
 
 ### Added

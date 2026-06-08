@@ -246,7 +246,7 @@ Downloads go through [LimeWire](https://limewire.com), a file-sharing service th
 
 No browser, Playwright, or Selenium required.
 
-Downloads are resilient to LimeWire throttling: a transient server error pauses all concurrent downloads briefly (shared backoff) and retries, and issues that resolve to the same file are fetched once. Keep `download.retry_attempts` ≥ 1 so transient errors are retried.
+Downloads are resilient to LimeWire throttling: a transient server error pauses all concurrent downloads briefly (shared backoff) and retries, and issues that resolve to the same file are fetched once. Keep `download.retry_attempts` ≥ 1 so transient errors are retried. Shares LimeWire reports as removed are detected and marked unavailable (skipped, not retried every cycle); `magsync retry` re-attempts them if a working link returns.
 
 ### Self-Healing
 
