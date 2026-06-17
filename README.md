@@ -46,10 +46,62 @@ pipx install .
 magsync
 ```
 
-Launches the terminal UI with three tabs:
+Launches an interactive terminal UI (built with [Textual](https://textual.textualize.io/)) — search, multi-select issues, and watch downloads without leaving the terminal:
+
+```
++----------------------------------------------------------------------------+
+|                                  magsync                                   |
++----------------------------------------------------------------------------+
+|   [Search]     Downloads      Library                                      |
+|                                                                            |
+|  +--------------------------------------------------------------------+    |
+|  | The New Yorker                                                     |    |
+|  +--------------------------------------------------------------------+    |
+|                                                                            |
+|  [ ] Title                             Year  Month  Size    Status         |
+|  ------------------------------------------------------------------------  |
+|  [x] The New Yorker - April 13, 2026   2026  04     18 MB   complete       |
+|  [x] The New Yorker - April 6, 2026    2026  04     17 MB   complete       |
+|  [ ] The New Yorker - March 23, 2026   2026  03     19 MB   pending        |
+|  [ ] The New Yorker - March 16, 2026   2026  03     16 MB   pending        |
+|  [ ] The New Yorker - March 9, 2026    2026  03     18 MB   pending        |
+|  [ ] The New Yorker - March 2, 2026    2026  03     15 MB   failed         |
++----------------------------------------------------------------------------+
+|  Found 24 issues (6 new)  -  2 selected                                    |
++----------------------------------------------------------------------------+
+|  q Quit    s Search    a Select All    d Download                          |
++----------------------------------------------------------------------------+
+```
+
+Three tabs:
 - **Search** — type a magazine name, browse results, select issues, download
-- **Downloads** — watch download progress
-- **Library** — browse your indexed magazines by title/year/month
+- **Downloads** — watch live download progress (`✓`/`✗` per issue)
+- **Library** — browse your indexed magazines as a tree of title → year → issue, with a download tick per issue:
+
+```
++----------------------------------------------------------------------------+
+|                                  magsync                                   |
++----------------------------------------------------------------------------+
+|    Search      Downloads     [Library]                                     |
+|                                                                            |
+|  Magazines                                                                 |
+|  +- The New Yorker  (38/52)                                                |
+|  |  +- 2026                                                                |
+|  |  |  +- [x] The New Yorker - April 13, 2026                              |
+|  |  |  +- [x] The New Yorker - April 6, 2026                               |
+|  |  |  +- [ ] The New Yorker - March 23, 2026                              |
+|  |  |  +- [ ] The New Yorker - March 16, 2026                              |
+|  |  +- 2025                                                                |
+|  +- The Economist  (12/12)                                                 |
+|  |  +- 2026                                                                |
+|  +- Science News   (5/9)                                                   |
+|     +- 2026                                                                |
++----------------------------------------------------------------------------+
+|  3 magazines tracked  -  55 issues  -  50 downloaded                       |
++----------------------------------------------------------------------------+
+|  q Quit    s Search    a Select All    d Download                          |
++----------------------------------------------------------------------------+
+```
 
 Keyboard shortcuts: `s` (search), `a` (select all), `d` (download selected), `q` (quit)
 
