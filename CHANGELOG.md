@@ -4,6 +4,23 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.16] - 2026-07-05
+
+Two complementary fixes for the freemagazines.top → LimeWire download path: the site now rotates share links after takedowns, and LimeWire changed its share-page serialization. Either one alone left downloads failing with an identical "share link is unavailable" error; both are needed to download reliably.
+
+### Fixed
+- **Downloads 404'd on live, browser-downloadable shares.** LimeWire's share page moved its server-rendered data to a React Router **turbo-stream** — a flat array where fields are index references rather than inline values — but `establish_session` still extracted `bucket_id` and `content_item_id` by text position. It picked up the neighboring UUIDs (the file-encryption-key id as the bucket, the free-user-id as the content item), so `POST /sharing/download/{bucket}` returned 404, surfacing as the *same* "share link is unavailable" message a genuinely removed share produces. magsync now decodes the turbo-stream and reads metadata structurally (`sharingBucket.id`, `contentItemList[0].id`, the `fileEncryptionKeys` entry bound to the content item's `baseFileEncryptionKeyId`, `ephemeralPublicKey`, `name`, `totalFileSize`), verified end-to-end against a live share (valid PDF, correct byte count).
+- **`file_size` read 0** for every share (the progress bar/estimate source) — `totalFileSize` is now taken from the decoded stream.
+- **Rotated LimeWire links were never picked up, and issues parked `unavailable` never recovered.** freemagazines.top swaps the LimeWire share link on an existing post when the old share is taken down (without bumping the post's modified time), but the index treated `limewire_url` as write-once — so every cycle re-scraped the fresh link, discarded it, and re-downloaded with the frozen dead one until the issue was parked `unavailable` with no path back (`retry` reused the stale URL, `backfill-urls` only fixed NULL URLs). Now:
+  - **Refresh on re-scrape**: `add_issues()` replaces a stored `limewire_url` when a re-scrape yields a validated, different link, and resets that issue's `failed`/`unavailable` download back to `pending` so the fresh link is retried (the `sha256`, and any `complete`/in-flight download, are left untouched). The incoming URL is checked with a strict host/path/fragment guard before it can overwrite a known-good value.
+  - **Re-scrape on permanent failure**: when a download fails with a permanent "share link is unavailable" error, the batch downloader re-scrapes the page once; if it now carries a different validated link, that link is persisted and the download is retried immediately (once). Only if the page still shows the same dead link — or the re-scrape yields nothing — is the issue parked `unavailable`.
+
+### Changed
+- The legacy regex extraction is retained only as a fallback for when the SSR format changes wholesale (no decodable stream); it never overrides ids resolved from a present stream, so a partial format drift fails loudly instead of silently shipping the wrong (decoy) ids.
+- Removed-share detection gained a structural backstop: a decoded container reporting `ok:false` is classified permanent even when the `SanitizedError` marker falls outside the raw-HTML detector's window; a container merely missing `ok` is treated as undecodable, never as removed.
+- **`.part` resume files are now keyed to the share link that produced them** (a hash of the full URL, including the decryption-key fragment). A refreshed or rotated link starts a clean download instead of resuming bytes from a different encrypted blob (which would decrypt to garbage and misfire self-healing). Legacy un-keyed `.part` files are discarded once on upgrade and re-downloaded.
+- **`download_batch()` de-duplicates its input by issue ID**, so overlapping subscriptions that enqueue the same issue no longer download it twice (and a dead link is re-scraped at most once per batch).
+
 ## [0.3.14] - 2026-06-08
 
 ### Fixed

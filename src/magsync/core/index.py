@@ -2,12 +2,42 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from magsync.config import get_db_path
 from magsync.core.models import DownloadStatus, Issue, Magazine
+
+logger = logging.getLogger("magsync")
+
+
+def _plausible_limewire_url(url: str) -> bool:
+    """Strict guard for overwriting a stored LimeWire URL.
+
+    Deliberately stricter than the scraper's extraction-time validation (which
+    is substring-based): requires the exact LimeWire host, a ``/d/<sharing_id>``
+    path, and a non-empty ``#fragment`` (the decryption key). Protects the
+    destructive path of replacing a known-good stored value.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.hostname not in ("limewire.com", "www.limewire.com"):
+        return False
+    segments = [s for s in parsed.path.split("/") if s]
+    if len(segments) != 2 or segments[0] != "d" or not segments[1]:
+        return False
+    return bool(parsed.fragment)
+
+
+def _sharing_id(url: str) -> str:
+    """Best-effort sharing-ID extraction for log lines (never the fragment)."""
+    path = urlparse(url).path
+    return path.rstrip("/").rsplit("/", 1)[-1] or "?"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS magazines (
@@ -98,10 +128,15 @@ class MagazineIndex:
         """Upsert issues for a magazine. Returns count of *new* issues added.
 
         For a ``page_url`` that already exists, backfill any leaf metadata column
-        that is currently NULL/empty from the incoming scrape (never overwriting
-        a populated value). Backfilled rows are not counted as new. ``title`` is
-        intentionally excluded — it drives derived year/month/date_raw and
-        magazine association and cannot be repaired in isolation.
+        that is currently NULL/empty from the incoming scrape. ``limewire_url``
+        is additionally *refreshed*: the site rotates share links on existing
+        posts after takedowns, so a validated incoming URL that differs from the
+        stored one replaces it, and a ``failed``/``unavailable`` download is
+        reset to ``pending`` so the fresh link gets retried. Other populated
+        columns are never overwritten, and existing rows are not counted as new.
+        ``title`` is intentionally excluded — it drives derived
+        year/month/date_raw and magazine association and cannot be repaired in
+        isolation.
         """
         added = 0
         backfill_columns = ("limewire_url", "genre", "file_size", "cover_image_url")
@@ -117,11 +152,34 @@ class MagazineIndex:
                     for col in backfill_columns
                     if issue.get(col) and not existing[col]
                 }
+                incoming_url = issue.get("limewire_url")
+                url_changed = bool(
+                    incoming_url
+                    and existing["limewire_url"]
+                    and incoming_url != existing["limewire_url"]
+                    and _plausible_limewire_url(incoming_url)
+                )
+                if url_changed:
+                    updates["limewire_url"] = incoming_url
                 if updates:
                     set_clause = ", ".join(f"{c} = ?" for c in updates)
                     self.conn.execute(
                         f"UPDATE issues SET {set_clause} WHERE id = ?",
                         (*updates.values(), existing["id"]),
+                    )
+                if url_changed:
+                    # The old link is dead weight now — give parked downloads
+                    # another chance with the fresh one (sha256 kept, complete
+                    # and in-flight rows untouched).
+                    self.conn.execute(
+                        """UPDATE downloads
+                           SET status = 'pending', file_path = NULL, downloaded_at = NULL
+                           WHERE issue_id = ? AND status IN ('failed', 'unavailable')""",
+                        (existing["id"],),
+                    )
+                    logger.info(
+                        f"Refreshed LimeWire link for {issue['page_url']}: "
+                        f"{_sharing_id(existing['limewire_url'])} → {_sharing_id(incoming_url)}"
                     )
                 continue
 

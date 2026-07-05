@@ -11,11 +11,36 @@ from typing import Callable
 
 from magsync.config import Config
 from magsync.core.downloader import download_and_decrypt, RateLimitGate, _is_permanent_error
-from magsync.core.index import MagazineIndex
-from magsync.core.models import DownloadStatus
+from magsync.core.index import MagazineIndex, _plausible_limewire_url
+from magsync.core.models import DownloadResult, DownloadStatus
 from magsync.core.organizer import organize_path
+from magsync.core.scraper import scrape_detail_page
 
 logger = logging.getLogger("magsync")
+
+
+async def _refresh_link_from_page(
+    issue: dict,
+    idx: MagazineIndex,
+    attempted_url: str,
+) -> str | None:
+    """Re-scrape the issue's page looking for a rotated LimeWire link.
+
+    The site swaps share links on existing posts after takedowns, so a
+    permanent dead-link failure may just mean the stored URL is stale. Returns
+    the fresh URL (persisted to the index) when the page now carries a
+    validated link different from the one just attempted; otherwise None.
+    """
+    try:
+        detail = await scrape_detail_page(issue["page_url"])
+    except Exception as e:
+        logger.debug(f"Link-refresh scrape failed for {issue.get('page_url')}: {e}")
+        return None
+    new_url = detail.limewire_url
+    if not new_url or new_url == attempted_url or not _plausible_limewire_url(new_url):
+        return None
+    idx.set_limewire_url(issue["id"], new_url)
+    return new_url
 
 
 async def _download_one(
@@ -73,20 +98,38 @@ async def _download_one(
 
             idx.update_download_status(issue["id"], DownloadStatus.DOWNLOADING)
 
-            try:
-                result = await download_and_decrypt(
-                    lw_url, dest, constants=cfg.limewire, rate_gate=rate_gate,
-                    retry_attempts=cfg.download.retry_attempts,
-                )
-            except Exception as e:
-                error_msg = str(e)
-                status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error_msg) else DownloadStatus.FAILED
-                idx.update_download_status(issue["id"], status)
-                if on_complete:
-                    on_complete(issue, False, error_msg)
-                return {"issue": issue, "success": False, "error": error_msg}
+            async def _attempt(url: str) -> tuple[DownloadResult | None, str | None]:
+                """One download attempt → (result, error); error None on success."""
+                try:
+                    r = await download_and_decrypt(
+                        url, dest, constants=cfg.limewire, rate_gate=rate_gate,
+                        retry_attempts=cfg.download.retry_attempts,
+                    )
+                except Exception as e:
+                    return None, str(e)
+                if r.success:
+                    return r, None
+                return r, r.error or ""
 
-            if result.success:
+            result, error = await _attempt(lw_url)
+
+            # A permanent dead link may just be stale: the site rotates share
+            # links on existing posts. Re-scrape the page once; a different
+            # validated link gets exactly one retry. The terminal status and
+            # on_complete reflect only the final outcome.
+            if error is not None and _is_permanent_error(error):
+                fresh_url = await _refresh_link_from_page(issue, idx, lw_url)
+                if fresh_url:
+                    logger.info(
+                        f"Link rotated on page for {issue['title'][:50]} — retrying with fresh link"
+                    )
+                    result, error = await _attempt(fresh_url)
+                else:
+                    logger.warning(
+                        f"Page still shows the dead link for {issue['title'][:50]} — marking unavailable"
+                    )
+
+            if error is None and result is not None:
                 idx.update_download_status(
                     issue["id"],
                     DownloadStatus.COMPLETE,
@@ -97,13 +140,12 @@ async def _download_one(
                 if on_complete:
                     on_complete(issue, True, None)
                 return {"issue": issue, "success": True, "error": None, "path": result.file_path}
-            else:
-                error = result.error or ""
-                status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error) else DownloadStatus.FAILED
-                idx.update_download_status(issue["id"], status)
-                if on_complete:
-                    on_complete(issue, False, result.error)
-                return {"issue": issue, "success": False, "error": result.error}
+
+            status = DownloadStatus.UNAVAILABLE if _is_permanent_error(error) else DownloadStatus.FAILED
+            idx.update_download_status(issue["id"], status)
+            if on_complete:
+                on_complete(issue, False, error)
+            return {"issue": issue, "success": False, "error": error}
 
 
 async def download_batch(
@@ -122,6 +164,20 @@ async def download_batch(
     """
     if not issues:
         return []
+
+    # De-duplicate by issue id: overlapping subscriptions can enqueue the same
+    # issue twice, which would double-download it and defeat the one-refresh
+    # bound on dead-link re-scrapes. First occurrence wins, order preserved.
+    seen_ids: set = set()
+    deduped: list[dict] = []
+    for issue in issues:
+        issue_id = issue.get("id")
+        if issue_id is not None:
+            if issue_id in seen_ids:
+                continue
+            seen_ids.add(issue_id)
+        deduped.append(issue)
+    issues = deduped
 
     # Auto-extract encryption constants once before starting any downloads
     if not cfg.limewire.file_iv_b64 or not cfg.limewire.sharing_salt_b64:

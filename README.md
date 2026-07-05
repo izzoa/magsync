@@ -300,6 +300,8 @@ No browser, Playwright, or Selenium required.
 
 Downloads are resilient to LimeWire throttling: a transient server error pauses all concurrent downloads briefly (shared backoff) and retries, and issues that resolve to the same file are fetched once. Keep `download.retry_attempts` ≥ 1 so transient errors are retried. Shares LimeWire reports as removed are detected and marked unavailable (skipped, not retried every cycle); `magsync retry` re-attempts them if a working link returns.
 
+freemagazines.top rotates a post's LimeWire link when the old share is taken down, so magsync treats the stored link as self-healing: re-scraping an issue refreshes its link if the site now serves a different one (re-queuing any issue previously parked as unavailable), and a download that fails on a dead link re-scrapes the page once and retries immediately with the fresh link before giving up.
+
 ### Self-Healing
 
 LimeWire's encryption constants (salt, IVs) are embedded in their JavaScript bundles and may change on deploys. If decryption produces an invalid PDF, magsync automatically:

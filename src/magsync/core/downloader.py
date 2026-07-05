@@ -38,6 +38,27 @@ _MIN_SESSION_RETRIES = 2
 _SSR_THROTTLE_PAUSE = 20
 
 
+def _part_path_for(dest: Path, limewire_url: str) -> Path:
+    """Return the resume ``.part`` path for this dest+URL, removing stale partials.
+
+    Partials are keyed to the exact share URL (including the #fragment key) via
+    a hash-prefix in the filename, so a rotated link never resumes bytes fetched
+    for a different blob/key — splicing ciphertexts would decrypt to garbage and
+    masquerade as a stale-constants failure. Partials keyed to any other URL,
+    and legacy un-fingerprinted ``<dest>.part`` files, are deleted here.
+    """
+    fp = hashlib.sha256(limewire_url.encode("utf-8")).hexdigest()[:8]
+    part_path = dest.parent / f"{dest.name}.{fp}.part"
+    if dest.parent.is_dir():
+        for existing in dest.parent.iterdir():
+            name = existing.name
+            if name == part_path.name:
+                continue
+            if name.startswith(dest.name + ".") and name.endswith(".part"):
+                existing.unlink(missing_ok=True)
+    return part_path
+
+
 def parse_limewire_url(url: str) -> tuple[str, str]:
     """Parse a LimeWire share URL into (sharing_id, fragment/passphrase)."""
     parsed = urlparse(url)
@@ -73,6 +94,174 @@ def _is_removed_share(html: str) -> bool:
     return re.search(r"error.{0,40}SanitizedError", window) is not None
 
 
+_ENQUEUE_RE = re.compile(r'streamController\.enqueue\(')
+
+
+def _decode_react_stream(html: str):
+    """Decode LimeWire's React Router turbo-stream SSR into a nested structure.
+
+    The page ships its loader data as one or more ``streamController.enqueue("…")``
+    string literals that concatenate into a single flattened array. The array is
+    reference-encoded: an object ``{"_K": V}`` maps key ``arr[K]`` (a string) to
+    ``resolve(V)``; a list is either a tagged value (``["D", ms]`` → a date) or a
+    plain array whose integer elements are indices to resolve and whose
+    non-integer elements are literals; a primitive lives at its slot and is
+    returned as-is. Negative and out-of-range indices resolve to ``None``.
+    Resolution is memoized and cycle-guarded. Returns the resolved root
+    (``arr[0]``), or ``None`` when no enqueue payload is present.
+    """
+    chunks: list[str] = []
+    for m in _ENQUEUE_RE.finditer(html):
+        # The argument is a JS double-quoted string literal; scan to its close.
+        i = m.end()
+        if i >= len(html) or html[i] != '"':
+            continue
+        i += 1
+        start = i
+        while i < len(html):
+            c = html[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                break
+            i += 1
+        try:
+            chunks.append(json.loads('"' + html[start:i] + '"'))
+        except (ValueError, json.JSONDecodeError):
+            continue
+    if not chunks:
+        return None
+    try:
+        arr = json.loads("".join(chunks))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(arr, list) or not arr:
+        return None
+
+    memo: dict[int, object] = {}
+
+    def resolve(index, active: frozenset):
+        if not isinstance(index, int) or index < 0 or index >= len(arr):
+            return None
+        if index in memo:
+            return memo[index]
+        if index in active:            # cycle
+            return None
+        node = arr[index]
+        if isinstance(node, dict):
+            active2 = active | {index}
+            out = {}
+            for k, v in node.items():
+                key = arr[int(k[1:])] if isinstance(k, str) and k.startswith("_") else k
+                out[key] = resolve(v, active2) if isinstance(v, int) else v
+            memo[index] = out
+            return out
+        if isinstance(node, list):
+            if node and isinstance(node[0], str):    # tagged value (e.g. ["D", ms])
+                memo[index] = node[1] if (node[0] == "D" and len(node) > 1) else node
+                return memo[index]
+            active2 = active | {index}
+            out = [resolve(e, active2) if isinstance(e, int) else e for e in node]
+            memo[index] = out
+            return out
+        memo[index] = node
+        return node
+
+    return resolve(0, frozenset())
+
+
+def _find_key(obj, target):
+    """Depth-first search for the first value under ``target`` in a nested dict/list."""
+    if isinstance(obj, dict):
+        if target in obj:
+            return obj[target]
+        for v in obj.values():
+            found = _find_key(v, target)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for e in obj:
+            found = _find_key(e, target)
+            if found is not None:
+                return found
+    return None
+
+
+# Sentinel distinguishing "share is removed" from "no decodable container".
+_REMOVED = object()
+
+
+def _extract_share_metadata(decoded):
+    """Pull share metadata from a decoded turbo-stream.
+
+    Returns a dict of metadata (``bucket_id`` from ``sharingBucket.id``,
+    ``content_item_id``/``ephemeral_public_key`` from ``contentItemList[0]``, the
+    passphrase-wrapped key from the ``fileEncryptionKeys`` entry matching the
+    content item's ``baseFileEncryptionKeyId``, plus file name/size), or
+    ``_REMOVED`` when the container is explicitly ``ok: false`` (a removed
+    share), or ``None`` when no usable container is found (absent or malformed —
+    never treated as removed, so a format drift can't misclassify a live share).
+    """
+    if decoded is None:
+        return None
+    container = _find_key(decoded, "sharingBucketContentData")
+    if not isinstance(container, dict) or "ok" not in container:
+        return None
+    if container["ok"] is False:
+        return _REMOVED
+    if container["ok"] is not True:
+        return None
+    value = container.get("value")
+    if not isinstance(value, dict):
+        return None
+
+    bucket = value.get("sharingBucket") or {}
+    items = value.get("contentItemList") or []
+    keys = value.get("fileEncryptionKeys") or []
+    item = items[0] if items else {}
+
+    wrapped = None
+    if keys:
+        base_key_id = item.get("baseFileEncryptionKeyId")
+        match = next((k for k in keys if k.get("id") == base_key_id), keys[0])
+        wrapped = match.get("passphraseWrappedPrivateKey")
+
+    return {
+        "bucket_id": bucket.get("id"),
+        "content_item_id": item.get("id"),
+        "ephemeral_public_key": item.get("ephemeralPublicKey"),
+        "passphrase_wrapped_pk": wrapped,
+        "file_name": bucket.get("name") or "",
+        "file_size": bucket.get("totalFileSize") or 0,
+    }
+
+
+def _extract_ssr_metadata_regex(html: str, sharing_id: str) -> dict:
+    """Legacy text-position extraction, kept as a fallback for stream-shape drift.
+
+    Used only when no decodable turbo-stream container is found. This path is
+    fragile (it matches UUIDs by position) and MUST NOT override ids resolved
+    from a present stream — see ``establish_session``.
+    """
+    if _is_uuid(sharing_id):
+        bucket_id = sharing_id
+    else:
+        sb_idx = html.find("sharingBucket")
+        bucket_match = re.search(UUID_RE, html[sb_idx:]) if sb_idx > -1 else None
+        bucket_id = bucket_match.group(0) if bucket_match else None
+    ci = re.search(r"contentItemIds.*?(" + UUID_RE + ")", html)
+    size_match = re.search(r'"totalFileSize",(\d+)', html)
+    return {
+        "bucket_id": bucket_id,
+        "content_item_id": ci.group(1) if ci else None,
+        "ephemeral_public_key": _ssr_field(html, "ephemeralPublicKey"),
+        "passphrase_wrapped_pk": _ssr_field(html, "passphraseWrappedPrivateKey"),
+        "file_name": _ssr_field(html, "name") or "",
+        "file_size": int(size_match.group(1)) if size_match else 0,
+    }
+
+
 async def establish_session(
     limewire_url: str,
     *,
@@ -96,12 +285,15 @@ async def establish_session(
 
         # Classify SSR errors BEFORE extracting JWT/CSRF, so a removed page that
         # omits the auth cookie is still classified correctly. Order matters:
-        #   Permanent: a removed/sanitized share (SanitizedError in its result) —
-        #     genuinely dead, must take precedence (the page also says
-        #     "Unexpected Server Error").
+        #   Permanent: a removed/sanitized share, caught two ways — the raw-HTML
+        #     fast path, then a structural backstop (decoded container ok:false)
+        #     for markers that fall outside the raw detector's window. Removed
+        #     must take precedence over the generic transient message.
         #   Transient: "Unexpected Server Error" with no removed marker — SSR
         #     backend hiccup (rate limit, bot challenge, datacenter IP). Retry.
-        if _is_removed_share(html):
+        decoded = _decode_react_stream(html)
+        meta = _extract_share_metadata(decoded)
+        if _is_removed_share(html) or meta is _REMOVED:
             logger.error(
                 f"LimeWire SSR: removed/sanitized share "
                 f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
@@ -123,43 +315,35 @@ async def establish_session(
         jwt_payload = json.loads(base64.b64decode(payload_b64))
         csrf_token = jwt_payload["csrfToken"]
 
-        # Extract bucket_id from SSR data
-        # For UUID-format sharing IDs, the sharing_id IS the bucket_id.
-        # For short IDs, we need to find the resolved bucket UUID in the HTML.
+        # Structural extraction from the turbo-stream. Fall back to the legacy
+        # regex path ONLY when no container decoded (whole SSR format changed) —
+        # never let it substitute ids for a present-but-incomplete stream, since
+        # the regex path matches the wrong (decoy) UUIDs on the current format.
+        if meta is None:
+            meta = _extract_ssr_metadata_regex(html, sharing_id)
+
+        # UUID-format shares keep sharing_id as the bucket (current behavior);
+        # short-ID shares use the decoded sharingBucket.id.
         if _is_uuid(sharing_id):
-            bucket_id = sharing_id
-        else:
-            sb_idx = html.find("sharingBucket")
-            bucket_match = re.search(UUID_RE, html[sb_idx:]) if sb_idx > -1 else None
-            bucket_id = bucket_match.group(0) if bucket_match else None
-        content_item_id = re.search(
-            r"contentItemIds.*?(" + UUID_RE + ")", html
-        )
-        passphrase_wrapped = _ssr_field(html, "passphraseWrappedPrivateKey")
-        ephemeral_pub = _ssr_field(html, "ephemeralPublicKey")
+            meta["bucket_id"] = sharing_id
 
-        # Extract file name and size
-        file_name = _ssr_field(html, "name") or ""
-        size_match = re.search(r'"totalFileSize",(\d+)', html)
-        file_size = int(size_match.group(1)) if size_match else 0
-
-        if not all([bucket_id, content_item_id, passphrase_wrapped, ephemeral_pub]):
-            missing = []
-            if not bucket_id: missing.append("bucket_id")
-            if not content_item_id: missing.append("content_item_id")
-            if not passphrase_wrapped: missing.append("passphrase_wrapped_pk")
-            if not ephemeral_pub: missing.append("ephemeral_public_key")
+        # Required ids; the passphrase-wrapped key is required only on the
+        # short-ID (passphrase) path — UUID shares derive from the raw fragment.
+        missing = [f for f in ("bucket_id", "content_item_id", "ephemeral_public_key") if not meta.get(f)]
+        if not _is_uuid(sharing_id) and not meta.get("passphrase_wrapped_pk"):
+            missing.append("passphrase_wrapped_pk")
+        if missing:
             raise RuntimeError(f"Failed to extract SSR metadata from LimeWire page (missing: {', '.join(missing)})")
 
         return LimeWireSession(
             jwt_token=jwt_token,
             csrf_token=csrf_token,
-            bucket_id=bucket_id,
-            content_item_id=content_item_id.group(1),
-            passphrase_wrapped_pk=passphrase_wrapped,
-            ephemeral_public_key=ephemeral_pub,
-            file_name=file_name,
-            file_size=file_size,
+            bucket_id=meta["bucket_id"],
+            content_item_id=meta["content_item_id"],
+            passphrase_wrapped_pk=meta.get("passphrase_wrapped_pk") or "",
+            ephemeral_public_key=meta["ephemeral_public_key"],
+            file_name=meta.get("file_name") or "",
+            file_size=meta.get("file_size") or 0,
         )
     finally:
         if should_close:
@@ -510,9 +694,10 @@ async def _do_download(
             constants,
         )
 
-        # Prepare .part file for resumable download
+        # Prepare .part file for resumable download (keyed to this URL; stale
+        # partials from a different/rotated link are removed)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        part_path = dest.with_suffix(dest.suffix + ".part")
+        part_path = _part_path_for(dest, limewire_url)
 
         # Check for existing partial download
         existing_bytes = 0
