@@ -125,7 +125,10 @@ async def _download_one(
                     )
                     result, error = await _attempt(fresh_url)
                 else:
-                    logger.warning(
+                    # INFO, not WARNING: an unrecovered dead link is an expected
+                    # outcome; interactive commands convey it via the summary's
+                    # `unavailable` count. The daemon (INFO) still logs it.
+                    logger.info(
                         f"Page still shows the dead link for {issue['title'][:50]} — marking unavailable"
                     )
 

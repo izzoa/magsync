@@ -200,3 +200,107 @@ def test_get_issues_missing_url_filtered_by_magazine(tmp_path):
     missing = idx.get_issues_missing_url(magazine_title="alpha")
     assert [m["page_url"] for m in missing] == ["pa"]
     idx.close()
+
+
+# --- reset_failed_downloads / reset_stuck_downloads / get_issues_by_ids ---
+
+
+def _add_with_status(idx, mag, key, url, status=None):
+    """Add one issue; optionally move its download to `status`. Returns issue id."""
+    idx.add_issues(mag, [{"title": key, "page_url": key, "limewire_url": url}])
+    issue_id = idx.conn.execute(
+        "SELECT id FROM issues WHERE page_url = ?", (key,)
+    ).fetchone()[0]
+    if status is not None:
+        idx.update_download_status(issue_id, status)
+    return issue_id
+
+
+def _status_of(idx, issue_id):
+    return idx.conn.execute(
+        "SELECT status FROM downloads WHERE issue_id = ?", (issue_id,)
+    ).fetchone()[0]
+
+
+def test_reset_failed_returns_flipped_ids_and_skipped_count(tmp_path):
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    failed = _add_with_status(idx, mag, "pf", LW_A, DownloadStatus.FAILED)
+    unavailable = _add_with_status(idx, mag, "pu", LW_B, DownloadStatus.UNAVAILABLE)
+    linkless = _add_with_status(idx, mag, "pn", None, DownloadStatus.FAILED)
+    backlog = _add_with_status(idx, mag, "pp", LW_A)  # pending, never attempted
+
+    reset_ids, skipped = idx.reset_failed_downloads()
+
+    assert sorted(reset_ids) == sorted([failed, unavailable])
+    assert skipped == 1
+    assert _status_of(idx, failed) == "pending"
+    assert _status_of(idx, unavailable) == "pending"
+    assert _status_of(idx, linkless) == "failed"      # preserved, not stranded
+    assert backlog not in reset_ids                    # backlog untouched
+    idx.close()
+
+
+def test_reset_failed_scoped_to_magazine(tmp_path):
+    idx = _index(tmp_path)
+    a = idx.get_or_create_magazine("Alpha", "alpha")
+    b = idx.get_or_create_magazine("Beta", "beta")
+    in_scope = _add_with_status(idx, a, "pa", LW_A, DownloadStatus.FAILED)
+    out_of_scope = _add_with_status(idx, b, "pb", LW_B, DownloadStatus.FAILED)
+
+    reset_ids, skipped = idx.reset_failed_downloads(magazine_title="alpha")
+
+    assert reset_ids == [in_scope]
+    assert skipped == 0
+    assert _status_of(idx, out_of_scope) == "failed"
+    idx.close()
+
+
+def test_reset_failed_leaves_other_statuses_alone(tmp_path):
+    # The UPDATE re-asserts the status guard: rows that are complete (or any
+    # non-failed status) are neither reset nor returned.
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    done = _add_with_status(idx, mag, "pc", LW_A, DownloadStatus.COMPLETE)
+
+    reset_ids, skipped = idx.reset_failed_downloads()
+
+    assert reset_ids == [] and skipped == 0
+    assert _status_of(idx, done) == "complete"
+    idx.close()
+
+
+def test_reset_stuck_downloads_keeps_linkless_failures(tmp_path):
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    linkless_failed = _add_with_status(idx, mag, "pn", None, DownloadStatus.FAILED)
+    linked_failed = _add_with_status(idx, mag, "pf", LW_A, DownloadStatus.FAILED)
+    stuck = _add_with_status(idx, mag, "pd", LW_B, DownloadStatus.DOWNLOADING)
+
+    count = idx.reset_stuck_downloads()
+
+    assert count == 2
+    assert _status_of(idx, linkless_failed) == "failed"
+    assert _status_of(idx, linked_failed) == "pending"
+    assert _status_of(idx, stuck) == "pending"
+    idx.close()
+
+
+def test_get_issues_by_ids_round_trips_large_list(tmp_path):
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    idx.add_issues(
+        mag,
+        [{"title": f"I{n:04d}", "page_url": f"p{n}", "limewire_url": LW_A} for n in range(600)],
+    )
+    ids = [r[0] for r in idx.conn.execute("SELECT id FROM issues").fetchall()]
+    assert len(ids) > 500  # forces chunking
+
+    rows = idx.get_issues_by_ids(ids)
+
+    assert len(rows) == len(ids)
+    assert sorted(r["id"] for r in rows) == sorted(ids)
+    sample = rows[0]
+    for key in ("magazine_title", "normalized_title", "download_status", "file_path", "limewire_url"):
+        assert key in sample
+    idx.close()

@@ -16,13 +16,13 @@ import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from magsync.config import load_config, save_config, set_config_value
 from magsync.core.index import MagazineIndex
 from magsync.core.models import DownloadStatus, Subscription
 from magsync.core.organizer import normalize_title, parse_date, organize_path, strip_accents
 from magsync.core.scraper import DEFAULT_HEADERS, scrape_detail_page, search_with_details
+from magsync.output import BatchOutput, resolve_mode
 
 app = typer.Typer(
     name="magsync",
@@ -31,6 +31,21 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 console = Console()
+
+
+def _reject_conflicting_flags(verbose: bool, quiet: bool) -> None:
+    """Fail fast (before any work) if mutually exclusive flags are combined."""
+    if verbose and quiet:
+        console.print("[red]--verbose and --quiet are mutually exclusive[/red]")
+        raise typer.Exit(2)
+
+
+def _batch_output(total: int, title: str, verbose: bool, quiet: bool, no_progress: bool) -> BatchOutput:
+    """Build a coordinated progress/logging surface for a bulk command."""
+    use_live_bar, log_level = resolve_mode(verbose, quiet, no_progress)
+    return BatchOutput(
+        console, total, title=title, use_live_bar=use_live_bar, log_level=log_level, verbose=verbose
+    )
 
 
 @app.callback()
@@ -148,8 +163,12 @@ def fetch(
     since: str = typer.Option(None, "--since", help="Fetch issues from this date (YYYY-MM)"),
     output: str = typer.Option(None, "--output", "-o", help="Output directory override"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be downloaded without downloading"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-issue detail (dead-link logs, ✓/✗ lines)"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Only show the final summary (errors still surface)"),
+    no_progress: bool = typer.Option(False, "--no-progress", help="Disable the live progress bar"),
 ):
     """Search, index, and download magazines."""
+    _reject_conflicting_flags(verbose, quiet)
     cfg = load_config()
     output_dir = output or cfg.output_dir
 
@@ -219,36 +238,9 @@ def fetch(
 
         from magsync.core.batch import download_batch
 
-        completed = [0]
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            overall = progress.add_task("Overall", total=len(pending))
-
-            def on_start(issue):
-                title = issue["title"][:50]
-                progress.add_task(f"  {title}...", total=None)
-
-            def on_complete(issue, success, error):
-                completed[0] += 1
-                progress.update(overall, completed=completed[0])
-                title = issue["title"][:50]
-                if success:
-                    console.print(f"  [green]✓[/green] {title}")
-                else:
-                    console.print(f"  [red]✗[/red] {title}: {error}")
-
-            asyncio.run(download_batch(pending, cfg, idx, on_start, on_complete))
-
-        stats = idx.get_download_stats()
-        console.print(
-            f"\n[green]Done![/green] {stats['downloaded']} downloaded, "
-            f"{stats['pending']} pending, {stats['failed']} failed"
-        )
+        with _batch_output(len(pending), "Downloading", verbose, quiet, no_progress) as out:
+            results = asyncio.run(download_batch(pending, cfg, idx, out.on_start, out.on_complete))
+        out.summarize(results)
     finally:
         idx.close()
 
@@ -405,57 +397,44 @@ def _start_heartbeat(interval: int = 30) -> Callable:
 @app.command()
 def retry(
     query: str = typer.Argument(None, help="Only retry failed downloads for this magazine"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-issue detail (dead-link logs, ✓/✗ lines)"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Only show the final summary (errors still surface)"),
+    no_progress: bool = typer.Option(False, "--no-progress", help="Disable the live progress bar"),
 ):
     """Re-attempt all failed downloads."""
+    _reject_conflicting_flags(verbose, quiet)
     cfg = load_config()
     idx = MagazineIndex()
 
     try:
-        reset_count = idx.reset_failed_downloads(magazine_title=query)
-        if reset_count == 0:
+        # Retry exactly what was failed/unavailable at invocation — never the
+        # pending backlog (indexing marks every discovered issue pending, so
+        # the backlog includes issues the user never queued).
+        reset_ids, skipped = idx.reset_failed_downloads(magazine_title=query)
+        if not reset_ids and not skipped:
             console.print("[green]No failed downloads to retry.[/green]")
             raise typer.Exit()
 
-        console.print(f"[cyan]Retrying {reset_count} failed download{'s' if reset_count != 1 else ''}...[/cyan]")
-
-        pending = idx.get_issues(
-            magazine_title=query,
-            status=DownloadStatus.PENDING,
+        skipped_msg = (
+            f"[yellow]{skipped} failed download{'s' if skipped != 1 else ''} "
+            f"skipped: no download link (run 'magsync backfill-urls' to repair).[/yellow]"
+            if skipped else None
         )
-        # Only include issues that have download links
-        pending = [p for p in pending if p.get("limewire_url")]
+        if not reset_ids:
+            console.print(skipped_msg)
+            raise typer.Exit()
+
+        console.print(f"[cyan]Retrying {len(reset_ids)} failed download{'s' if len(reset_ids) != 1 else ''}...[/cyan]")
+
+        pending = idx.get_issues_by_ids(reset_ids)
 
         from magsync.core.batch import download_batch
 
-        completed = [0]
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            overall = progress.add_task("Overall", total=len(pending))
-
-            def on_start(issue):
-                pass
-
-            def on_complete(issue, success, error):
-                completed[0] += 1
-                progress.update(overall, completed=completed[0])
-                title = issue["title"][:50]
-                if success:
-                    console.print(f"  [green]✓[/green] {title}")
-                else:
-                    console.print(f"  [red]✗[/red] {title}: {error}")
-
-            asyncio.run(download_batch(pending, cfg, idx, on_start, on_complete))
-
-        stats = idx.get_download_stats()
-        console.print(
-            f"\n[green]Done![/green] {stats['downloaded']} downloaded, "
-            f"{stats['pending']} pending, {stats['failed']} failed"
-        )
+        with _batch_output(len(pending), "Retrying", verbose, quiet, no_progress) as out:
+            results = asyncio.run(download_batch(pending, cfg, idx, out.on_start, out.on_complete))
+        out.summarize(results)
+        if skipped_msg:
+            console.print(skipped_msg)
     finally:
         idx.close()
 
@@ -463,6 +442,9 @@ def retry(
 @app.command(name="backfill-urls")
 def backfill_urls(
     query: str = typer.Argument(None, help="Only backfill issues for this magazine"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-issue detail"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Only show the final summary (errors still surface)"),
+    no_progress: bool = typer.Option(False, "--no-progress", help="Disable the live progress bar"),
 ):
     """Re-scrape issues missing a download URL and repair them.
 
@@ -470,6 +452,7 @@ def backfill_urls(
     URL. `magsync update` repairs these automatically too; this command targets
     only the broken rows and also reaches de-tracked magazines.
     """
+    _reject_conflicting_flags(verbose, quiet)
     cfg = load_config()
     idx = MagazineIndex()
 
@@ -484,29 +467,35 @@ def backfill_urls(
             f"{'s' if len(missing) != 1 else ''} missing a download URL...[/cyan]"
         )
 
-        async def _backfill() -> int:
-            repaired = 0
+        async def _backfill(out: BatchOutput) -> None:
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=30.0, headers=DEFAULT_HEADERS
             ) as client:
                 for i, row in enumerate(missing):
                     title = (row["title"] or row["page_url"])[:50]
+                    detail = None
                     try:
                         detail = await scrape_detail_page(row["page_url"], client=client)
                     except Exception as e:
-                        console.print(f"  [red]✗[/red] {title}: {e}")
-                        detail = None
-                    if detail and detail.limewire_url:
-                        idx.set_limewire_url(row["id"], detail.limewire_url)
-                        repaired += 1
-                        console.print(f"  [green]✓[/green] {title}")
+                        if out.verbose:
+                            console.print(f"  [red]✗[/red] {title}: {e}")
+                        out.record("error")
                     else:
-                        console.print(f"  [dim]–[/dim] {title}: still no URL")
+                        if detail and detail.limewire_url:
+                            idx.set_limewire_url(row["id"], detail.limewire_url)
+                            if out.verbose:
+                                console.print(f"  [green]✓[/green] {title}")
+                            out.record("repaired")
+                        else:
+                            if out.verbose:
+                                console.print(f"  [dim]–[/dim] {title}: still no URL")
+                            out.record("missing")
                     if i < len(missing) - 1:
                         await asyncio.sleep(cfg.download.scrape_delay)
-            return repaired
 
-        repaired = asyncio.run(_backfill())
+        with _batch_output(len(missing), "Backfilling", verbose, quiet, no_progress) as out:
+            asyncio.run(_backfill(out))
+        repaired = out.counts.get("repaired", 0)
         console.print(
             f"\n[green]Backfill complete.[/green] {repaired} repaired, "
             f"{len(missing) - repaired} still missing a URL."
@@ -557,11 +546,9 @@ def daemon(
     stop_heartbeat = _start_heartbeat(interval=30)
 
     # Reset stuck and failed downloads so they get retried this cycle
+    # (link-less failures keep their status — see reset_stuck_downloads)
     startup_idx = MagazineIndex()
-    stuck = startup_idx.conn.execute(
-        "UPDATE downloads SET status = 'pending' WHERE status IN ('downloading', 'failed')"
-    ).rowcount
-    startup_idx.conn.commit()
+    stuck = startup_idx.reset_stuck_downloads()
     startup_idx.close()
     if stuck:
         logger.info(f"Reset {stuck} interrupted/failed download(s) to pending")

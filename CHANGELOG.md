@@ -4,6 +4,21 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-07-05
+
+### Added
+- **Coordinated batch progress output** for `fetch`, `retry`, and `backfill-urls`. Previously these commands left the `magsync` logger unconfigured, so its records hit Python's lastResort handler (raw, stderr, WARNING+) and collided with the Rich progress bar on stdout — on a big dead-link backlog that was a wall of ~hundreds of interleaved lines with the bar buried, and no bar at all under `docker exec` without `-t`. Now a single coordinated surface routes logs through the same console as one overall progress bar (logs render *above* the bar), with live outcome counters (downloaded / unavailable / failed).
+- **TTY-aware output**: interactive terminal shows the live bar; a non-TTY (piped, `docker exec` without `-t`, cron) shows throttled textual progress lines instead of a garbled bar; the `daemon` is unchanged and never renders a bar.
+- **`--verbose/-v`, `--quiet/-q`, `--no-progress` flags** on the bulk commands (plus the `MAGSYNC_NO_PROGRESS` env). Default interactive output is no longer flooded by expected per-issue dead-link lines; `-v` restores them, `-q` shows only the summary (genuine errors still surface).
+- The end-of-run summary now reports the **`unavailable` (dead links)** count alongside downloaded/failed, reconciled from the batch results so a batch-level abort is still counted.
+
+### Changed
+- The three expected-during-bulk dead-link log messages (removed share, permanent error, "marking unavailable") are now logged at INFO instead of ERROR/WARNING — a dead link during a bulk retry is a normal outcome. The daemon logs at INFO so they still appear in `docker logs`; interactive commands hide them by default and show them under `-v`.
+
+### Fixed
+- **`magsync retry` downloaded the entire pending backlog, not just failed downloads.** Every indexed issue starts life `pending`, and issues get indexed as side effects the user never queued (partial-title search results, non-exact subscriptions, `--since`-excluded issues) — only the daemon's cycle applies subscription scoping. `retry` reset failed/unavailable rows and then downloaded *all* pending rows, so a bare `docker exec magsync magsync retry` drained the whole backlog (898 unwanted downloads). It now re-attempts exactly the downloads that were failed/unavailable at invocation (`reset_failed_downloads` returns the reset issue IDs and the new `get_issues_by_ids` feeds the batch); the optional magazine filter still narrows the set. The reset runs as a single write transaction with the status guard re-asserted on the UPDATE, so a retry racing a daemon cycle can never flip an in-flight or completed row back to pending.
+- **Link-less failures are no longer stranded as permanently-pending.** A failed download whose issue has no LimeWire URL used to be flipped to `pending` and then silently filtered out of the batch — no longer visible as a failure, never downloadable. Both `retry` and the daemon's startup reset now leave such rows `failed`/`unavailable` (interrupted `downloading` rows still reset unconditionally); `retry` reports the skipped count in its summary (shown under `-q` too) and points at `backfill-urls` to repair them. When *all* failures lack links, `retry` says so instead of the misleading "No failed downloads to retry."
+
 ## [0.3.16] - 2026-07-05
 
 Two complementary fixes for the freemagazines.top → LimeWire download path: the site now rotates share links after takedowns, and LimeWire changed its share-page serialization. Either one alone left downloads failing with an identical "share link is unavailable" error; both are needed to download reliably.

@@ -123,6 +123,10 @@ magsync fetch "Science News" --since 2025-01 --output ~/MyMags
 # Update index for all tracked magazines
 magsync update
 
+# Re-attempt failed downloads (only those — the not-yet-downloaded backlog is never touched)
+magsync retry
+magsync retry "The Economist"   # limit to one magazine
+
 # Repair indexed issues that are missing a download URL (e.g. after a site change)
 magsync backfill-urls
 magsync backfill-urls "The Economist"   # limit to one magazine
@@ -131,6 +135,10 @@ magsync backfill-urls "The Economist"   # limit to one magazine
 magsync config
 magsync config output_dir ~/MyMagazines
 ```
+
+**Batch output.** `fetch`, `retry`, and `backfill-urls` show one progress bar with live outcome counters (downloaded / unavailable / failed) on an interactive terminal, and fall back to periodic textual progress lines when output is piped or run under `docker exec` without a TTY. The end-of-run summary reports how many links were dead (`unavailable`). Expected per-issue dead-link messages are hidden by default; use `-v/--verbose` to see them, `-q/--quiet` for the summary only, and `--no-progress` (or `MAGSYNC_NO_PROGRESS=1`) to disable the live bar in scripts. The `daemon` is unaffected — it keeps its structured, timestamped logs.
+
+**Retry scope.** `magsync retry` re-attempts exactly the downloads that were in a failed/unavailable state when it ran; issues that are merely indexed-but-not-downloaded are left alone. Failed issues with no stored download link are skipped and counted in the summary (also under `-q`) — run `magsync backfill-urls` to repair them first.
 
 ## Subscriptions
 
@@ -222,6 +230,7 @@ All config values can be overridden via environment variables:
 | `MAGSYNC_DOWNLOAD__MAX_CONCURRENT` | Max parallel downloads | `3` |
 | `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Retries after a failed download (0 = no retry — **not recommended**; transient LimeWire throttling won't be retried) | `2` |
 | `MAGSYNC_DOWNLOAD__SCRAPE_DELAY` | Delay between scrape requests (seconds) | `1.0` |
+| `MAGSYNC_NO_PROGRESS` | Disable the live progress bar in bulk commands (use the textual fallback) | (unset) |
 
 ### NAS Deployment (Synology, QNAP)
 

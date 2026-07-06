@@ -39,6 +39,11 @@ def _sharing_id(url: str) -> str:
     path = urlparse(url).path
     return path.rstrip("/").rsplit("/", 1)[-1] or "?"
 
+
+# Keep IN-clause parameter counts under SQLite's host-parameter limit
+# (999 on older builds).
+_SQL_IN_CHUNK = 500
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS magazines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -314,24 +319,116 @@ class MagazineIndex:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def reset_failed_downloads(self, magazine_title: str | None = None) -> int:
-        """Reset failed and unavailable downloads back to pending. Returns count reset."""
+    def reset_failed_downloads(
+        self, magazine_title: str | None = None
+    ) -> tuple[list[int], int]:
+        """Reset failed and unavailable downloads back to pending.
+
+        Only rows whose issue has a download link are reset — link-less rows
+        keep their status so they stay visible as failures and reachable by
+        ``backfill-urls`` instead of being stranded as permanently-pending.
+
+        Runs as a single write transaction (``BEGIN IMMEDIATE``) and the
+        UPDATE re-asserts the status guard, so a concurrent writer (the
+        daemon shares this DB) can never have an in-flight or completed row
+        clobbered back to pending.
+
+        Returns ``(reset_issue_ids, skipped_missing_link_count)``.
+        """
+        query = """
+            SELECT i.id, i.limewire_url
+            FROM downloads d
+            JOIN issues i ON d.issue_id = i.id
+            JOIN magazines m ON i.magazine_id = m.id
+            WHERE d.status IN ('failed', 'unavailable')
+        """
+        params: list = []
         if magazine_title:
-            cursor = self.conn.execute(
-                """UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL
-                   WHERE status IN ('failed', 'unavailable') AND issue_id IN (
-                       SELECT i.id FROM issues i
-                       JOIN magazines m ON i.magazine_id = m.id
-                       WHERE m.normalized_title LIKE ?
-                   )""",
-                (f"%{magazine_title}%",),
-            )
-        else:
-            cursor = self.conn.execute(
-                "UPDATE downloads SET status = 'pending', file_path = NULL, downloaded_at = NULL WHERE status IN ('failed', 'unavailable')"
-            )
+            query += " AND m.normalized_title LIKE ?"
+            params.append(f"%{magazine_title}%")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.conn.execute(query, params).fetchall()
+            linked = [row["id"] for row in rows if row["limewire_url"]]
+            skipped = len(rows) - len(linked)
+
+            reset_ids: list[int] = []
+            for start in range(0, len(linked), _SQL_IN_CHUNK):
+                chunk = linked[start : start + _SQL_IN_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                cursor = self.conn.execute(
+                    f"""UPDATE downloads
+                        SET status = 'pending', file_path = NULL, downloaded_at = NULL
+                        WHERE issue_id IN ({placeholders})
+                          AND status IN ('failed', 'unavailable')""",
+                    chunk,
+                )
+                if cursor.rowcount == len(chunk):
+                    reset_ids.extend(chunk)
+                else:
+                    # Belt-and-braces: the write lock should make this
+                    # unreachable, but never report a row we didn't flip.
+                    flipped = self.conn.execute(
+                        f"""SELECT issue_id FROM downloads
+                            WHERE issue_id IN ({placeholders}) AND status = 'pending'""",
+                        chunk,
+                    ).fetchall()
+                    reset_ids.extend(r["issue_id"] for r in flipped)
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        return reset_ids, skipped
+
+    def reset_stuck_downloads(self) -> int:
+        """Daemon-startup reset: re-queue interrupted and failed downloads.
+
+        Interrupted (``downloading``) rows are reset unconditionally — they
+        were in-flight when the process died. ``failed`` rows are reset only
+        when the issue still has a download link, mirroring
+        ``reset_failed_downloads``, so link-less failures survive restarts.
+        Returns count reset.
+        """
+        count = self.conn.execute(
+            "UPDATE downloads SET status = 'pending' WHERE status = 'downloading'"
+        ).rowcount
+        count += self.conn.execute(
+            """UPDATE downloads SET status = 'pending'
+               WHERE status = 'failed' AND issue_id IN (
+                   SELECT id FROM issues
+                   WHERE limewire_url IS NOT NULL AND limewire_url != ''
+               )"""
+        ).rowcount
         self.conn.commit()
-        return cursor.rowcount
+        return count
+
+    def get_issues_by_ids(self, issue_ids: list[int]) -> list[dict]:
+        """Fetch issues by explicit IDs, in the same joined shape as
+        ``get_issues()``. Chunks the IN clause to stay under SQLite's
+        host-parameter limit."""
+        results: list[dict] = []
+        for start in range(0, len(issue_ids), _SQL_IN_CHUNK):
+            chunk = issue_ids[start : start + _SQL_IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT i.*, d.status as download_status, d.file_path,
+                           m.title as magazine_title, m.normalized_title
+                    FROM issues i
+                    JOIN magazines m ON i.magazine_id = m.id
+                    LEFT JOIN downloads d ON d.issue_id = i.id
+                    WHERE i.id IN ({placeholders})""",
+                chunk,
+            ).fetchall()
+            results.extend(dict(row) for row in rows)
+        results.sort(
+            key=lambda r: (
+                r["year"] is None, -(r["year"] or 0),
+                r["month"] is None, -(r["month"] or 0),
+                r["title"],
+            )
+        )
+        return results
 
     def get_download_stats(self) -> dict:
         """Get overall download statistics."""

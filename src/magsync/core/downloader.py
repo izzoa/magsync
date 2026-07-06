@@ -294,7 +294,10 @@ async def establish_session(
         decoded = _decode_react_stream(html)
         meta = _extract_share_metadata(decoded)
         if _is_removed_share(html) or meta is _REMOVED:
-            logger.error(
+            # INFO, not ERROR: a removed share is an expected outcome during bulk
+            # retries (the raise below carries the failure). Interactive commands
+            # hide INFO by default; the daemon (INFO) still logs it.
+            logger.info(
                 f"LimeWire SSR: removed/sanitized share "
                 f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
             )
@@ -605,7 +608,11 @@ async def download_and_decrypt(
         last_error = result.error or "Unknown error"
 
         if _is_permanent_error(last_error):
-            logger.error(f"Permanent error (no retry): {last_error}")
+            # INFO: safe only while _PERMANENT_ERRORS is dead-link-only (a dead
+            # link during bulk work is expected, not exceptional). If a new
+            # permanent-error string is added, re-check whether it should log
+            # louder here.
+            logger.info(f"Permanent error (no retry): {last_error}")
             return result
 
         # 429 is handled inside _download_and_decrypt_once via the gate,
