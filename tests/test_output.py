@@ -81,11 +81,12 @@ def test_resolve_mode_conflict():
 
 def test_on_complete_classifies_outcomes():
     console, buf = _capture_console()
-    with _batch(console, 3) as out:
+    with _batch(console, 4) as out:
         out.on_complete({"title": "A"}, True, None)
         out.on_complete({"title": "B"}, False, "LimeWire share link is unavailable (removed or expired)")
         out.on_complete({"title": "C"}, False, "HTTP 500 transient")
-    assert out.counts == {"downloaded": 1, "unavailable": 1, "failed": 1}
+        out.on_complete({"title": "D"}, False, "Unsupported payload: The Economist Audio 06.6.2026.zip")
+    assert out.counts == {"downloaded": 1, "unavailable": 1, "failed": 1, "unsupported": 1}
 
 
 def test_summarize_reconciles_from_results_including_aborts():
@@ -99,9 +100,25 @@ def test_summarize_reconciles_from_results_including_aborts():
     with _batch(console, 3) as out:
         pass  # no callbacks fired at all
     counts = out.summarize(results)
-    assert counts == {"downloaded": 1, "unavailable": 0, "failed": 2}
+    assert counts == {"downloaded": 1, "unavailable": 0, "unsupported": 0, "failed": 2}
     text = buf.getvalue()
     assert "2 failed" in text and "unavailable (dead links)" in text
+
+
+def test_summary_and_labels_report_unsupported():
+    console, buf = _capture_console()
+    results = [
+        # Structured flag from batch results...
+        {"issue": {}, "success": False, "unsupported": True, "error": "Unsupported payload: a.zip"},
+        # ...and the error-text fallback for results without the flag.
+        {"issue": {}, "success": False, "error": "Unsupported payload: b.zip"},
+        {"issue": {}, "success": True},
+    ]
+    with _batch(console, 3) as out:
+        pass
+    counts = out.summarize(results)
+    assert counts == {"downloaded": 1, "unavailable": 0, "unsupported": 2, "failed": 0}
+    assert "2 unsupported (non-PDF)" in buf.getvalue()
 
 
 def test_summary_reports_unavailable_count():

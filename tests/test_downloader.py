@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -12,7 +13,9 @@ import httpx
 import pytest
 
 import magsync.core.downloader as dl
+from magsync.config import LimeWireConstants
 from magsync.core.downloader import RateLimitGate, _establish_session_with_retry
+from magsync.core.models import DownloadResult, LimeWireSession
 
 URL = "https://limewire.com/d/x#k"
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -500,3 +503,338 @@ async def test_permanent_session_error_skips_gate(monkeypatch):
     assert "unavailable" in str(ei.value)
     assert calls["n"] == 1       # not retried (permanent)
     assert triggered["n"] == 0   # gate never engaged
+
+
+# --- download pipeline: payload gate, stream-status handling, classification ---
+
+DL_URL = "https://limewire.com/d/TEST#fragkey"
+CONSTS = LimeWireConstants(sharing_salt_b64="eA==", file_iv_b64="eA==")
+BLOB = b"%PDF" + bytes(996)          # a 1000-byte "PDF" object
+ZIP_BLOB = b"PK\x03\x04" + bytes(996)
+
+
+def test_classify_payload_units():
+    assert dl._classify_payload(b"%PDF-1.7\n") == "pdf"
+    for magic in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",
+                  b"Rar!\x1a\x07\x00", b"7z\xbc\xaf\x27\x1c",
+                  b"\x1f\x8b\x08\x00", b"ID3\x04", b"OggS\x00"):
+        assert dl._classify_payload(magic + bytes(8)) == "unsupported", magic
+    assert dl._classify_payload(b"\x00\x00\x00\x20ftypM4A ") == "unsupported"  # ftyp at offset 4
+    assert dl._classify_payload(b"\x1f\x8b\x01" + bytes(8)) == "unknown"  # 2-byte gzip alone: too weak
+    assert dl._classify_payload(b"\xffgarbage-not-a-container") == "unknown"
+    assert dl._classify_payload(b"") == "unknown"
+
+
+def test_error_string_predicates():
+    assert dl._is_unsupported_error("Unsupported payload: x.zip")
+    assert not dl._is_unsupported_error("HTTP 500")
+    assert dl._is_no_retry_error(dl._DECRYPT_FAILED_MSG)
+    assert not dl._is_no_retry_error("incomplete download (1 of 2 bytes)")
+
+
+def test_content_range_parsing():
+    assert dl._content_range_parts("bytes */242901023") == (None, 242901023)
+    assert dl._content_range_parts("bytes 100-999/1000") == (100, 1000)
+    assert dl._content_range_parts("bytes 0-9/*") == (0, None)
+    assert dl._content_range_parts(None) == (None, None)
+    assert dl._content_range_parts("garbage") == (None, None)
+    assert dl._content_range_total("bytes */7") == 7
+
+
+class _StubIdx:
+    """Stands in for MagazineIndex so dedup lookups never touch a real DB."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def find_by_hash(self, h):
+        return None
+
+    def close(self):
+        pass
+
+
+def _pipeline(monkeypatch, tmp_path, *, file_name="Issue.pdf", file_size=0,
+              handler=None, heal_constants=None):
+    """Wire _do_download's collaborators to fakes; returns (dest, calls)."""
+    calls = {"get_url": 0, "derive": 0, "heal": 0}
+    session = LimeWireSession(
+        jwt_token="j", csrf_token="c", bucket_id="b", content_item_id="i",
+        passphrase_wrapped_pk="", ephemeral_public_key="e",
+        file_name=file_name, file_size=file_size,
+    )
+
+    async def fake_session(url, client, retries=0, rate_gate=None):
+        return session
+
+    def fake_derive(*a, **k):
+        calls["derive"] += 1
+        return b"\x00" * 32
+
+    async def fake_get_url(sess, client=None):
+        calls["get_url"] += 1
+        return "https://storage.test/blob"
+
+    async def fake_heal(client=None):
+        calls["heal"] += 1
+        return heal_constants
+
+    monkeypatch.setattr(dl, "_establish_session_with_retry", fake_session)
+    monkeypatch.setattr(dl, "derive_aes_key", fake_derive)
+    monkeypatch.setattr(dl, "decrypt_file", lambda data, key, consts: bytes(data))  # identity
+    monkeypatch.setattr(dl, "get_download_url", fake_get_url)
+    monkeypatch.setattr(dl, "auto_extract_constants", fake_heal)
+    monkeypatch.setattr("magsync.core.index.MagazineIndex", _StubIdx)
+    if handler is not None:
+        real_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            httpx, "AsyncClient",
+            lambda *a, **k: real_client(transport=httpx.MockTransport(handler)),
+        )
+    dest = tmp_path / "Mag" / "Issue.pdf"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return dest, calls
+
+
+def _part_for(dest: Path) -> Path:
+    return dl._part_path_for(dest, DL_URL)
+
+
+async def test_gate_zip_skips_before_key_derivation(tmp_path, monkeypatch):
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_name="The Economist Audio 06.6.2026.zip")
+    part = _part_for(dest)
+    part.write_bytes(b"poisoned")
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.unsupported is True and result.success is False
+    assert "Unsupported payload" in result.error and ".zip" in result.error
+    assert calls["derive"] == 0 and calls["get_url"] == 0  # gated before any expensive work
+    assert not part.exists()                               # poisoned .part reclaimed
+
+
+async def test_gate_unlink_failure_still_unsupported(tmp_path, monkeypatch, caplog):
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_name="X.zip")
+    part = _part_for(dest)
+    part.write_bytes(b"data")
+
+    def bad_unlink(self, missing_ok=False):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "unlink", bad_unlink)
+    with caplog.at_level(logging.WARNING, logger="magsync"):
+        result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.unsupported is True  # outcome survives cleanup failure
+    assert any("Could not remove partial file" in r.getMessage() for r in caplog.records)
+
+
+async def test_gate_ambiguous_suffix_falls_through_and_downloads(tmp_path, monkeypatch):
+    def handler(request):
+        assert "range" not in {k.lower() for k in request.headers}  # fresh download
+        return httpx.Response(200, content=BLOB)
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_name="Issue 06.6.2026", handler=handler)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is True
+    assert dest.read_bytes() == BLOB
+    assert not _part_for(dest).exists()
+
+
+async def test_416_truncates_poisoned_part_and_completes(tmp_path, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["range"] = request.headers.get("Range")
+        return httpx.Response(416, content=b"<Error>xml</Error>",
+                              headers={"Content-Range": f"bytes */{len(BLOB)}"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    part = _part_for(dest)
+    junk = b"<Error>appended by old versions</Error>" * 16
+    part.write_bytes(BLOB + junk)  # poisoned: complete object + junk tail
+    progress: list[tuple[int, int]] = []
+    result = await dl._do_download(
+        DL_URL, dest, constants=CONSTS,
+        on_progress=lambda cur, tot: progress.append((cur, tot)),
+    )
+    assert result.success is True
+    assert seen["range"] == f"bytes={len(BLOB) + len(junk)}-"
+    assert dest.read_bytes() == BLOB                              # junk excluded from output
+    assert result.sha256 == hashlib.sha256(BLOB).hexdigest()      # ...and from the dedup hash
+    assert progress[-1] == (len(BLOB), len(BLOB))                 # final tick, transferless completion
+    assert not part.exists()
+
+
+async def test_416_total_beyond_local_is_transient(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(416, content=b"x", headers={"Content-Range": "bytes */1000"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    part = _part_for(dest)
+    part.write_bytes(bytes(500))
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is False and result.unsupported is False
+    assert "unverifiable" in result.error
+    assert part.read_bytes() == bytes(500)  # error body never written
+    assert calls["heal"] == 0
+
+
+async def test_416_without_content_range_confirms_via_ssr_exact_match(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(416, content=b"x")  # no Content-Range header
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_size=len(BLOB), handler=handler)
+    _part_for(dest).write_bytes(BLOB)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is True and dest.read_bytes() == BLOB
+
+
+async def test_416_without_content_range_or_ssr_is_transient(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(416, content=b"x")
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_size=0, handler=handler)
+    part = _part_for(dest)
+    part.write_bytes(BLOB)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is False and "unverifiable" in result.error
+    assert part.read_bytes() == BLOB  # never manufactured completion, never truncated
+
+
+async def test_206_resume_appends_at_verified_offset(tmp_path, monkeypatch):
+    head, tail = BLOB[:100], BLOB[100:]
+
+    def handler(request):
+        assert request.headers["Range"] == "bytes=100-"
+        return httpx.Response(206, content=tail,
+                              headers={"Content-Range": f"bytes 100-999/{len(BLOB)}"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    _part_for(dest).write_bytes(head)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is True and dest.read_bytes() == BLOB
+
+
+async def test_206_wrong_offset_rejected_without_write(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(206, content=BLOB,
+                              headers={"Content-Range": f"bytes 0-999/{len(BLOB)}"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    part = _part_for(dest)
+    part.write_bytes(BLOB[:100])
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is False and "offset mismatch" in result.error
+    assert part.read_bytes() == BLOB[:100]  # mis-offset body never spliced (CTR is positional)
+
+
+async def test_200_after_range_restarts_from_zero(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(200, content=BLOB)  # server ignored the Range
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    _part_for(dest).write_bytes(b"stale-bytes-from-before")
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is True and dest.read_bytes() == BLOB
+
+
+async def test_http_error_body_never_written(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(500, content=b"<Error>storage exploded</Error>")
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    part = _part_for(dest)
+    part.write_bytes(BLOB[:100])
+    with pytest.raises(httpx.HTTPStatusError):
+        await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert part.read_bytes() == BLOB[:100]
+
+
+async def test_short_fetch_is_transient_without_self_heal(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(206, content=BLOB[100:500],
+                              headers={"Content-Range": f"bytes 100-999/{len(BLOB)}"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    part = _part_for(dest)
+    part.write_bytes(BLOB[:100])
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is False and "incomplete download" in result.error
+    assert part.stat().st_size == 500  # kept for resume
+    assert calls["heal"] == 0          # not a crypto problem
+
+
+async def test_zip_payload_detected_by_magic_is_terminal(tmp_path, monkeypatch):
+    def handler(request):
+        return httpx.Response(200, content=ZIP_BLOB)
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_name="Issue 06.6.2026", handler=handler)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.unsupported is True
+    assert calls["heal"] == 0          # decryption worked; healing is pointless
+    assert not _part_for(dest).exists()
+    assert not dest.exists()
+
+
+async def test_unknown_magic_heals_once_then_keeps_part(tmp_path, monkeypatch):
+    garbage = b"\x81\x9anot-a-known-container" + bytes(976)
+
+    def handler(request):
+        return httpx.Response(200, content=garbage)
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler, heal_constants=CONSTS)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is False and result.unsupported is False
+    assert result.error == dl._DECRYPT_FAILED_MSG
+    assert calls["heal"] == 1
+    assert _part_for(dest).exists()    # kept: next attempt is one probe + a local decrypt
+
+
+async def test_ssr_under_report_never_truncates_good_download(tmp_path, monkeypatch):
+    # SSR claims 700 bytes; storage says 1000. Nothing may be cut to 700.
+    def handler(request):
+        return httpx.Response(416, content=b"x",
+                              headers={"Content-Range": f"bytes */{len(BLOB)}"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_size=700, handler=handler)
+    _part_for(dest).write_bytes(BLOB)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is True
+    assert dest.read_bytes() == BLOB   # full object — SSR size was ignored
+
+
+async def test_ssr_over_report_resolved_by_probe(tmp_path, monkeypatch):
+    # SSR claims 1500 bytes; the object is 1000 and fully on disk. One ranged
+    # probe (416) resolves it — no eternal "incomplete" limbo.
+    def handler(request):
+        return httpx.Response(416, content=b"x",
+                              headers={"Content-Range": f"bytes */{len(BLOB)}"})
+
+    dest, calls = _pipeline(monkeypatch, tmp_path, file_size=1500, handler=handler)
+    _part_for(dest).write_bytes(BLOB)
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS)
+    assert result.success is True and result.file_size_bytes == len(BLOB)
+
+
+async def test_download_and_decrypt_returns_unsupported_without_retry(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    async def fake_once(url, dest, *, constants, on_progress=None, rate_gate=None, retry_attempts=2):
+        calls["n"] += 1
+        return DownloadResult(success=False, unsupported=True, error="Unsupported payload: x.zip")
+
+    monkeypatch.setattr(dl, "_download_and_decrypt_once", fake_once)
+    result = await dl.download_and_decrypt(DL_URL, tmp_path / "x.pdf", constants=CONSTS, retry_attempts=3)
+    assert calls["n"] == 1             # terminal: no retries, no backoff
+    assert result.unsupported is True
+
+
+async def test_download_and_decrypt_no_retry_on_deterministic_decrypt_failure(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    async def fake_once(url, dest, *, constants, on_progress=None, rate_gate=None, retry_attempts=2):
+        calls["n"] += 1
+        return DownloadResult(success=False, error=dl._DECRYPT_FAILED_MSG)
+
+    monkeypatch.setattr(dl, "_download_and_decrypt_once", fake_once)
+    result = await dl.download_and_decrypt(DL_URL, tmp_path / "x.pdf", constants=CONSTS, retry_attempts=3)
+    assert calls["n"] == 1             # deterministic within one run — retrying repeats the same decrypt
+    assert result.error == dl._DECRYPT_FAILED_MSG

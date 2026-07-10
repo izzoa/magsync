@@ -141,6 +141,8 @@ def search(
                 "pending": "[dim]pending[/dim]",
                 "failed": "[red]failed[/red]",
                 "downloading": "[yellow]downloading[/yellow]",
+                "unavailable": "[red dim]unavailable[/red dim]",
+                "unsupported": "[magenta]unsupported[/magenta]",
             }.get(status, status)
 
             table.add_row(
@@ -583,6 +585,7 @@ def daemon(
 
         idx = MagazineIndex()
         downloaded_issues: list[dict] = []
+        unsupported_count = 0
         total_new_indexed = 0
 
         try:
@@ -640,6 +643,7 @@ def daemon(
                         logger.info(f"  - {issue['title']} ({issue.get('file_size') or '?'})")
                 else:
                     from magsync.core.batch import download_batch
+                    from magsync.core.downloader import _is_unsupported_error
 
                     logger.info(f"Downloading {len(all_pending)} issues (max {cfg.download.max_concurrent} concurrent)...")
 
@@ -650,10 +654,15 @@ def daemon(
                         if success:
                             downloaded_issues.append(issue)
                             logger.info(f"  Done: {issue['title'][:60]}")
+                        elif _is_unsupported_error(error or ""):
+                            # Terminal by policy, not a failure — INFO keeps it
+                            # out of error-level alerting.
+                            logger.info(f"  Skipped (non-PDF): {issue['title'][:60]}")
                         else:
                             logger.error(f"  Failed: {issue['title'][:60]}: {error}")
 
-                    asyncio.run(download_batch(all_pending, cfg, idx, on_start, on_complete))
+                    results = asyncio.run(download_batch(all_pending, cfg, idx, on_start, on_complete))
+                    unsupported_count += sum(1 for r in results if r.get("unsupported"))
 
             # Phase 3: Notify
             if downloaded_issues:
@@ -665,6 +674,7 @@ def daemon(
                 f"Cycle complete in {elapsed}s: "
                 f"{total_new_indexed} new indexed, "
                 f"{len(downloaded_issues)} downloaded"
+                + (f", {unsupported_count} unsupported (non-PDF)" if unsupported_count else "")
             )
 
         except Exception as e:

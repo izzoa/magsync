@@ -147,7 +147,7 @@ Manage magazine subscriptions for daemon mode:
 ```bash
 # Add a subscription
 magsync subscribe "The New Yorker" --since 2025-01
-magsync subscribe "The Economist" --since 2024-06
+magsync subscribe "The Economist" --since 2024-06 --exact
 
 # List subscriptions
 magsync subscribe
@@ -166,7 +166,10 @@ since = "2025-01"
 [[subscriptions]]
 query = "The Economist"
 since = "2024-06"
+exact = true
 ```
+
+**Matching scope.** Subscriptions match by substring, so `"The Economist"` also captures sibling titles like *The Economist Audio* or regional editions. Set `exact = true` (CLI: `--exact`; env: prefix the entry with `!`, e.g. `!The Economist`) to index only issues whose normalized title matches the query exactly.
 
 ## Docker
 
@@ -223,7 +226,7 @@ All config values can be overridden via environment variables:
 |----------|-------------|---------|
 | `MAGSYNC_OUTPUT_DIR` | Magazine output directory | `~/Magazines` |
 | `MAGSYNC_INTERVAL` | Daemon cycle interval | `6h` |
-| `MAGSYNC_SUBSCRIPTIONS` | Comma-separated `query:since` pairs | (none) |
+| `MAGSYNC_SUBSCRIPTIONS` | Comma-separated `query:since` pairs; prefix an entry with `!` for exact title matching (e.g. `!The Economist:2024-06`) | (none) |
 | `MAGSYNC_APPRISE_URLS` | Comma-separated [Apprise](https://github.com/caronc/apprise/wiki) notification URLs | (none) |
 | `MAGSYNC_CONFIG_DIR` | Config directory path | `~/.magsync` |
 | `MAGSYNC_DB_PATH` | SQLite index path | `{config_dir}/index.db` |
@@ -311,9 +314,11 @@ Downloads are resilient to LimeWire throttling: a transient server error pauses 
 
 freemagazines.top rotates a post's LimeWire link when the old share is taken down, so magsync treats the stored link as self-healing: re-scraping an issue refreshes its link if the site now serves a different one (re-queuing any issue previously parked as unavailable), and a download that fails on a dead link re-scrapes the page once and retries immediately with the fresh link before giving up.
 
+**PDFs only.** Some shares carry non-PDF payloads (e.g. *The Economist Audio* ships a ZIP of MP3s even though the site labels everything `[PDF]`). magsync detects these — by the share's file-name extension before downloading, or by the decrypted file's signature after — and marks them `unsupported`: never saved, never auto-retried, `.part` leftovers cleaned up. An `unsupported` issue is re-probed only if the site rotates its share link (the replacement blob might be a real PDF). To keep such titles out of the index entirely, use exact subscription matching (see [Subscriptions](#subscriptions)).
+
 ### Self-Healing
 
-LimeWire's encryption constants (salt, IVs) are embedded in their JavaScript bundles and may change on deploys. If decryption produces an invalid PDF, magsync automatically:
+LimeWire's encryption constants (salt, IVs) are embedded in their JavaScript bundles and may change on deploys. If decryption produces output matching no known file signature (a decrypted ZIP or other non-PDF is *not* a decryption failure — see above), magsync automatically:
 
 1. Fetches LimeWire's current JS bundles
 2. Extracts updated encryption constants

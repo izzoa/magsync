@@ -175,11 +175,13 @@ class MagazineIndex:
                 if url_changed:
                     # The old link is dead weight now — give parked downloads
                     # another chance with the fresh one (sha256 kept, complete
-                    # and in-flight rows untouched).
+                    # and in-flight rows untouched). 'unsupported' is included:
+                    # a rotated blob may carry a different payload type, so it
+                    # gets exactly one cheap re-probe.
                     self.conn.execute(
                         """UPDATE downloads
                            SET status = 'pending', file_path = NULL, downloaded_at = NULL
-                           WHERE issue_id = ? AND status IN ('failed', 'unavailable')""",
+                           WHERE issue_id = ? AND status IN ('failed', 'unavailable', 'unsupported')""",
                         (existing["id"],),
                     )
                     logger.info(
@@ -327,6 +329,8 @@ class MagazineIndex:
         Only rows whose issue has a download link are reset — link-less rows
         keep their status so they stay visible as failures and reachable by
         ``backfill-urls`` instead of being stranded as permanently-pending.
+        'unsupported' rows are deliberately excluded: a non-PDF payload is
+        terminal until the share link rotates (see add_issues).
 
         Runs as a single write transaction (``BEGIN IMMEDIATE``) and the
         UPDATE re-asserts the status guard, so a concurrent writer (the
@@ -388,7 +392,8 @@ class MagazineIndex:
         were in-flight when the process died. ``failed`` rows are reset only
         when the issue still has a download link, mirroring
         ``reset_failed_downloads``, so link-less failures survive restarts.
-        Returns count reset.
+        'unavailable' and 'unsupported' rows are deliberately untouched — both
+        are terminal until the share link rotates. Returns count reset.
         """
         count = self.conn.execute(
             "UPDATE downloads SET status = 'pending' WHERE status = 'downloading'"
@@ -438,7 +443,8 @@ class MagazineIndex:
                  SUM(CASE WHEN d.status = 'complete' THEN 1 ELSE 0 END) as downloaded,
                  SUM(CASE WHEN d.status = 'pending' THEN 1 ELSE 0 END) as pending,
                  SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) as failed,
-                 SUM(CASE WHEN d.status = 'unavailable' THEN 1 ELSE 0 END) as unavailable
+                 SUM(CASE WHEN d.status = 'unavailable' THEN 1 ELSE 0 END) as unavailable,
+                 SUM(CASE WHEN d.status = 'unsupported' THEN 1 ELSE 0 END) as unsupported
                FROM issues i
                LEFT JOIN downloads d ON d.issue_id = i.id"""
         ).fetchone()

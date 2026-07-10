@@ -304,3 +304,50 @@ def test_get_issues_by_ids_round_trips_large_list(tmp_path):
     for key in ("magazine_title", "normalized_title", "download_status", "file_path", "limewire_url"):
         assert key in sample
     idx.close()
+
+
+# --- 'unsupported' terminal-status semantics ---
+
+def test_resets_leave_unsupported_untouched(tmp_path):
+    # Both reset paths must skip 'unsupported' even when a link exists —
+    # a non-PDF payload is terminal until the share link rotates.
+    idx = _index(tmp_path)
+    issue_id = _add_one(idx, LW_A)
+    idx.update_download_status(issue_id, DownloadStatus.UNSUPPORTED)
+
+    assert idx.reset_stuck_downloads() == 0
+    reset_ids, skipped = idx.reset_failed_downloads()
+    assert reset_ids == [] and skipped == 0
+
+    status = idx.conn.execute(
+        "SELECT status FROM downloads WHERE issue_id = ?", (issue_id,)
+    ).fetchone()[0]
+    assert status == "unsupported"
+    idx.close()
+
+
+def test_link_rotation_requeues_unsupported(tmp_path):
+    # A rotated blob may carry a different payload type → one cheap re-probe.
+    idx = _index(tmp_path)
+    issue_id = _add_one(idx, LW_A)
+    idx.update_download_status(issue_id, DownloadStatus.UNSUPPORTED)
+
+    _add_one(idx, LW_B)  # same page_url, different validated link → rotation
+
+    row = idx.conn.execute(
+        "SELECT status, file_path FROM downloads WHERE issue_id = ?", (issue_id,)
+    ).fetchone()
+    assert row["status"] == "pending"
+    assert row["file_path"] is None
+    idx.close()
+
+
+def test_download_stats_count_unsupported(tmp_path):
+    idx = _index(tmp_path)
+    issue_id = _add_one(idx, LW_A)
+    idx.update_download_status(issue_id, DownloadStatus.UNSUPPORTED)
+
+    stats = idx.get_download_stats()
+    assert stats["unsupported"] == 1
+    assert stats["failed"] == 0
+    idx.close()

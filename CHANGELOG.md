@@ -4,6 +4,26 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-07-10
+
+Ends the permanent nightly failure loop on shares whose payload isn't a PDF (e.g. "The Economist Audio" ZIP editions), and hardens the resume path so a `.part` file can never again be corrupted by the server's own error responses. Diagnosed from a live NAS: two audio issues had been retried every cycle for days — each attempt appended a 633-byte storage-error body to an already-complete `.part` file (15–16 accumulated), re-ran constants self-healing (~30 LimeWire requests) twice, and re-decrypted 242 MB six times, for nothing.
+
+### Added
+- **Non-PDF payloads are terminally skipped** with a new `unsupported` download status. Two layers: a **pre-download gate** on the share's file name (a known non-PDF extension like `.zip`/`.mp3`/`.epub` skips before key derivation and without requesting a single payload byte), and **magic-number classification** after decryption (ZIP/RAR/7z/gzip/ID3/OggS/MP4 signatures mean decryption *worked* — the content just isn't a PDF). Unsupported issues are never auto-retried, never saved, and their `.part` files are cleaned up; they are re-probed only when the site rotates the share link (a new blob may be a different type). `magsync retry` and the daemon's startup reset leave them alone; the TUI's select-all won't re-queue them.
+- **`unsupported` surfaced everywhere**: batch summaries (`N unsupported (non-PDF)`), daemon cycle log (skips log at INFO as `Skipped (non-PDF)`, not ERROR), `magsync list` status column, TUI (`⊘` marker), and `get_download_stats`.
+
+### Fixed
+- **Valid non-PDF downloads were misclassified as decryption failures.** Validation required a `%PDF` header, so a perfectly decrypted ZIP triggered constants self-healing (which "succeeded" — the constants were never stale — and changed nothing), a FAILED status, and infinite daily retries.
+- **Storage error bodies were appended to `.part` files.** The streaming loop wrote whatever body arrived with no status check; each 416 added its XML error document to the file. The stream status is now inspected *before* the file is opened for writing: non-2xx bodies are never written, a 200 answering a `Range` request restarts the file from byte zero, and a 206 is accepted only when its `Content-Range` offset matches the local file exactly (AES-CTR is positional — a mis-offset splice would silently decrypt to garbage).
+- **Completed downloads re-requested a `Range` beyond EOF every attempt** (HTTP 416 loop). Resume state is now reconciled against the storage layer's own totals: a non-empty `.part` resolves via one ranged probe, and the `Content-Range`/`Content-Length` total — never the SSR-advertised size, which reports bucket totals and can drift — is the only authority for truncating or slicing local bytes. Poisoned `.part` files from earlier versions **self-repair automatically** (416 → truncate to the storage-reported size, zero payload bytes transferred); decryption reads exactly the object's bytes, so trailing junk can never reach the saved file or the dedup SHA-256.
+- **A short fetch is now a transient "incomplete download" failure** (kept for resume, no self-healing) instead of being decrypted and misdiagnosed as a crypto failure.
+
+### Changed
+- **Self-healing now runs only when decrypted output matches no known file signature** — a true stale-constants signal — instead of on anything that wasn't a PDF.
+- **The `.part` is kept after a terminal decryption failure** (unknown output even with fresh constants): the bytes are size-consistent, so the next daily attempt costs one ranged probe plus a local decrypt instead of a full re-download. In-process retries for this deterministic failure are skipped entirely. `.part` cleanup on terminal outcomes is best-effort — a filesystem error (e.g. NAS permissions) logs a warning and never converts a skip back into a retryable failure.
+- Removed the 50-minute `.part`-age session refresh — every attempt already establishes a fresh session before requesting the presigned URL, so the check only ever added a redundant second session fetch.
+- Documented the `--exact` subscription flag (config `exact = true`, env `!Query` prefix) — substring matching is how "The Economist" pulls in "The Economist Audio" issues in the first place.
+
 ## [0.4.0] - 2026-07-05
 
 ### Added

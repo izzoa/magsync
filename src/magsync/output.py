@@ -175,22 +175,30 @@ class BatchOutput:
 
     @staticmethod
     def _failure_label(error: str | None) -> str:
-        from magsync.core.downloader import _is_permanent_error
+        from magsync.core.downloader import _is_permanent_error, _is_unsupported_error
 
-        return "unavailable" if _is_permanent_error(error or "") else "failed"
+        err = error or ""
+        if _is_permanent_error(err):
+            return "unavailable"
+        if _is_unsupported_error(err):
+            return "unsupported"
+        return "failed"
 
     # -- summary ---------------------------------------------------------
     def summarize(self, results: list[dict]) -> dict[str, int]:
         """Print a run-scoped download summary reconciled from ``download_batch``
         results (covers batch aborts that never fired per-issue callbacks)."""
-        counts = {"downloaded": 0, "unavailable": 0, "failed": 0}
+        counts = {"downloaded": 0, "unavailable": 0, "unsupported": 0, "failed": 0}
         for r in results:
             if r.get("success"):
                 counts["downloaded"] += 1
+            elif r.get("unsupported"):
+                counts["unsupported"] += 1
             else:
                 counts[self._failure_label(r.get("error"))] += 1
         self.console.print(
             f"\n[green]Done![/green] {counts['downloaded']} downloaded, "
-            f"{counts['unavailable']} unavailable (dead links), {counts['failed']} failed"
+            f"{counts['unavailable']} unavailable (dead links), "
+            f"{counts['unsupported']} unsupported (non-PDF), {counts['failed']} failed"
         )
         return counts

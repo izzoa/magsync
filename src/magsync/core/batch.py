@@ -113,6 +113,15 @@ async def _download_one(
 
             result, error = await _attempt(lw_url)
 
+            # A live share with a non-PDF payload is terminal: mark it
+            # unsupported and skip the dead-link refresh below (the link works —
+            # re-scraping the page can't change what the payload is).
+            if result is not None and result.unsupported:
+                idx.update_download_status(issue["id"], DownloadStatus.UNSUPPORTED)
+                if on_complete:
+                    on_complete(issue, False, error)
+                return {"issue": issue, "success": False, "error": error, "unsupported": True}
+
             # A permanent dead link may just be stale: the site rotates share
             # links on existing posts. Re-scrape the page once; a different
             # validated link gets exactly one retry. The terminal status and

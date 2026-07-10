@@ -14,6 +14,7 @@ class DownloadStatus(str, Enum):
     COMPLETE = "complete"
     FAILED = "failed"          # Transient error — retried on next daemon startup
     UNAVAILABLE = "unavailable"  # Permanent error (dead link) — never auto-retried
+    UNSUPPORTED = "unsupported"  # Live share, non-PDF payload — never auto-retried; re-queued only on link rotation
 
 
 @dataclass
@@ -58,6 +59,7 @@ class DownloadResult:
     error: str | None = None
     file_size_bytes: int = 0
     sha256: str | None = None
+    unsupported: bool = False  # live share but non-PDF payload — terminal, never retried
 
 
 @dataclass

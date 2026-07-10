@@ -28,6 +28,19 @@ from magsync.core.organizer import normalize_title, parse_date, organize_path
 from magsync.core.scraper import search_with_details
 
 
+def _is_queueable(issue: dict, selected: set[int]) -> bool:
+    """True when a selected issue may enter the download queue.
+
+    "unsupported" is terminal (non-PDF payload) — bulk selection must not
+    re-queue it; it only re-probes when the share link rotates.
+    """
+    return (
+        issue["id"] in selected
+        and issue.get("download_status") not in ("complete", "unsupported")
+        and bool(issue.get("limewire_url"))
+    )
+
+
 class MagSyncApp(App):
     """magsync - Magazine Sync Tool."""
 
@@ -153,6 +166,8 @@ class MagSyncApp(App):
         table.clear()
         for issue in issues:
             status = issue.get("download_status", "pending")
+            if status == "unsupported":
+                status = "⊘ non-PDF"
             check = "☐"
             table.add_row(
                 check,
@@ -206,12 +221,7 @@ class MagSyncApp(App):
     def _do_download(self) -> None:
         from magsync.core.batch import download_batch
 
-        issues = [
-            i for i in self.search_results
-            if i["id"] in self.selected_issues
-            and i.get("download_status") != "complete"
-            and i.get("limewire_url")
-        ]
+        issues = [i for i in self.search_results if _is_queueable(i, self.selected_issues)]
 
         if not issues:
             self._update_status("No downloadable issues selected.")
@@ -267,7 +277,8 @@ class MagSyncApp(App):
                 year_label = str(year) if year else "Unknown"
                 year_node = mag_node.add(year_label)
                 for issue in years[year]:
-                    status = "✓" if issue.get("download_status") == "complete" else "○"
+                    ds = issue.get("download_status")
+                    status = "✓" if ds == "complete" else ("⊘" if ds == "unsupported" else "○")
                     year_node.add_leaf(f"{status} {issue['title'][:60]}")
 
     def _update_status(self, text: str) -> None:

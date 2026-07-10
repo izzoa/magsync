@@ -113,3 +113,26 @@ def test_retry_reports_no_failed_downloads_only_when_none_exist(tmp_path, monkey
     result = runner.invoke(cli.app, ["retry"])
     assert result.exit_code == 0
     assert "No failed downloads to retry" in result.output
+
+
+def test_retry_leaves_unsupported_untouched(tmp_path, monkeypatch):
+    # 'unsupported' is terminal by policy (non-PDF payload): `magsync retry`
+    # must not re-queue it even though it has a working link.
+    idx = _open_index(tmp_path, monkeypatch)
+    unsupported_id = _add_issue(idx, "unsup", LW.format("u"), DownloadStatus.UNSUPPORTED)
+    failed_id = _add_issue(idx, "failed", LW.format("f"), DownloadStatus.FAILED)
+    idx.close()
+
+    attempted: list[int] = []
+    monkeypatch.setattr("magsync.core.batch.download_batch", _fake_batch(attempted))
+
+    result = runner.invoke(cli.app, ["retry"])
+    assert result.exit_code == 0
+    assert attempted == [failed_id]  # unsupported row never re-queued
+
+    idx = _open_index(tmp_path, monkeypatch)
+    status = idx.conn.execute(
+        "SELECT status FROM downloads WHERE issue_id = ?", (unsupported_id,)
+    ).fetchone()[0]
+    idx.close()
+    assert status == "unsupported"

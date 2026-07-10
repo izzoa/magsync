@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 import re
-import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -57,6 +56,75 @@ def _part_path_for(dest: Path, limewire_url: str) -> Path:
             if name.startswith(dest.name + ".") and name.endswith(".part"):
                 existing.unlink(missing_ok=True)
     return part_path
+
+
+def _cleanup_part(part_path: Path) -> None:
+    """Best-effort ``.part`` removal for terminal outcomes.
+
+    A filesystem error here must never change the download outcome — an
+    unsupported skip whose cleanup failed would otherwise resurface as a
+    retryable failure and resume the churn it exists to stop.
+    """
+    try:
+        part_path.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not remove partial file {part_path}: {e}")
+
+
+# Share file-name extensions that can never be PDF payloads: skipped before any
+# payload bytes are requested. Deliberately a blocklist — an allowlist would
+# falsely skip PDFs with dotty names (e.g. "Issue 06.6.2026" → suffix ".2026").
+_NON_PDF_EXTENSIONS = frozenset({
+    ".zip", ".rar", ".7z", ".gz", ".tar",
+    ".mp3", ".m4a", ".m4b", ".mp4", ".m4v", ".mkv", ".avi",
+    ".wav", ".flac", ".aac", ".ogg",
+    ".epub", ".mobi", ".azw", ".azw3", ".djvu", ".cbz", ".cbr",
+    ".txt", ".docx", ".png", ".jpg", ".jpeg", ".gif",
+})
+
+# Magic numbers of known non-PDF containers. AES-CTR is unauthenticated, so
+# classification is heuristic; every entry is ≥3 bytes to keep the
+# false-positive rate on wrong-key garbage below ~1/16M (a bare 2-byte gzip
+# magic would be 1/65k, raw MP3 frame-sync ~1/2048 — both excluded).
+_NON_PDF_MAGICS = (
+    b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",  # zip (also epub/cbz)
+    b"Rar!\x1a\x07",
+    b"7z\xbc\xaf\x27\x1c",
+    b"\x1f\x8b\x08",  # gzip, incl. deflate method byte
+    b"ID3",           # mp3 with ID3 tag
+    b"OggS",
+)
+
+
+def _classify_payload(head: bytes) -> str:
+    """Classify decrypted output by magic number: "pdf" | "unsupported" | "unknown"."""
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if any(head.startswith(magic) for magic in _NON_PDF_MAGICS):
+        return "unsupported"
+    if len(head) >= 8 and head[4:8] == b"ftyp":  # mp4/m4a/m4b container
+        return "unsupported"
+    return "unknown"
+
+
+_CONTENT_RANGE_RE = re.compile(r"bytes\s+(?:(\d+)-\d+|\*)/(\d+|\*)")
+
+
+def _content_range_parts(value: str | None) -> tuple[int | None, int | None]:
+    """(start, total) from a Content-Range header; None for absent/'*' parts."""
+    if not value:
+        return None, None
+    m = _CONTENT_RANGE_RE.match(value.strip())
+    if not m:
+        return None, None
+    start = int(m.group(1)) if m.group(1) is not None else None
+    total = int(m.group(2)) if m.group(2) != "*" else None
+    return start, total
+
+
+def _content_range_total(value: str | None) -> int | None:
+    """Total from a Content-Range header ("bytes */N" or "bytes S-E/N")."""
+    return _content_range_parts(value)[1]
 
 
 def parse_limewire_url(url: str) -> tuple[str, str]:
@@ -227,13 +295,17 @@ def _extract_share_metadata(decoded):
         match = next((k for k in keys if k.get("id") == base_key_id), keys[0])
         wrapped = match.get("passphraseWrappedPrivateKey")
 
+    size = bucket.get("totalFileSize")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        size = 0  # advisory only — a malformed SSR size must not drive decisions
+
     return {
         "bucket_id": bucket.get("id"),
         "content_item_id": item.get("id"),
         "ephemeral_public_key": item.get("ephemeralPublicKey"),
         "passphrase_wrapped_pk": wrapped,
         "file_name": bucket.get("name") or "",
-        "file_size": bucket.get("totalFileSize") or 0,
+        "file_size": size,
     }
 
 
@@ -466,6 +538,26 @@ def _is_permanent_error(error: str) -> bool:
     return any(msg in error for msg in _PERMANENT_ERRORS)
 
 
+# Deterministic decryption failure: the attempt already re-tried the same bytes
+# with freshly-extracted constants, so in-process retries cannot change it.
+# Status stays FAILED — the next daily cycle re-attempts cheaply (one ranged
+# probe + a local decrypt, since the .part is kept).
+_DECRYPT_FAILED_MSG = "Decryption failed even after refreshing constants. See UPDATE_KEYS.md."
+
+
+def _is_no_retry_error(error: str) -> bool:
+    return "Decryption failed even after refreshing constants" in error
+
+
+def _is_unsupported_error(error: str) -> bool:
+    """True when the error text marks a live-but-non-PDF payload.
+
+    Display layers (output.py, daemon logs) only see the error string; control
+    flow uses ``DownloadResult.unsupported``.
+    """
+    return "Unsupported payload" in error
+
+
 async def _establish_session_with_retry(
     limewire_url: str,
     client: httpx.AsyncClient,
@@ -607,6 +699,18 @@ async def download_and_decrypt(
 
         last_error = result.error or "Unknown error"
 
+        if result.unsupported:
+            # Terminal by policy: a live share with a non-PDF payload. No retry
+            # (and no constants refresh) can change what the payload is.
+            logger.info(f"Unsupported payload (no retry): {last_error}")
+            return result
+
+        if _is_no_retry_error(last_error):
+            # Deterministic for this run: the attempt already re-tried the same
+            # bytes with freshly-extracted constants.
+            logger.error(f"Giving up without retry: {last_error}")
+            return result
+
         if _is_permanent_error(last_error):
             # INFO: safe only while _PERMANENT_ERRORS is dead-link-only (a dead
             # link during bulk work is expected, not exceptional). If a new
@@ -692,6 +796,21 @@ async def _do_download(
         # Establish session (retry transient SSR errors with backoff)
         session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts, rate_gate=rate_gate)
 
+        # Payload gate: a share whose file name has a known non-PDF extension
+        # is skipped before key derivation, .part preparation, and the
+        # download-URL request — no payload bytes are ever requested.
+        # Ambiguous suffixes (e.g. ".2026" from a dotty issue name) fall
+        # through to the magic-number check after decryption.
+        suffix = Path(session.file_name).suffix.lower() if session.file_name else ""
+        if suffix in _NON_PDF_EXTENSIONS:
+            _cleanup_part(_part_path_for(dest, limewire_url))
+            logger.info(f"Unsupported payload (non-PDF): {session.file_name} — skipping")
+            return DownloadResult(
+                success=False,
+                unsupported=True,
+                error=f"Unsupported payload: {session.file_name}",
+            )
+
         # Derive key
         aes_key = derive_aes_key(
             sharing_id,
@@ -706,80 +825,151 @@ async def _do_download(
         dest.parent.mkdir(parents=True, exist_ok=True)
         part_path = _part_path_for(dest, limewire_url)
 
-        # Check for existing partial download
-        existing_bytes = 0
-        if part_path.exists():
-            existing_bytes = part_path.stat().st_size
-            part_age_minutes = (time.time() - part_path.stat().st_mtime) / 60
-            if part_age_minutes > 50:
-                # Presigned URL likely expired — get a fresh one
-                logger.info(f"Part file is {int(part_age_minutes)}m old, refreshing session...")
-                session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts, rate_gate=rate_gate)
-                aes_key = derive_aes_key(
-                    sharing_id, fragment,
-                    session.passphrase_wrapped_pk,
-                    session.ephemeral_public_key,
-                    constants,
-                )
-            if existing_bytes > 0:
-                logger.info(f"Resuming download from {existing_bytes:,} bytes")
+        existing_bytes = part_path.stat().st_size if part_path.exists() else 0
+        if existing_bytes > 0:
+            logger.info(f"Resuming download from {existing_bytes:,} bytes")
 
-        # Get presigned URL
+        # Get presigned URL (the session above is this attempt's — always fresh)
         s3_url = await get_download_url(session, client=client)
 
-        # Download encrypted file (streaming to .part file)
+        # Fetch. A non-empty .part resumes via a ranged request, and the
+        # storage response — never the SSR-advertised size — is the authority
+        # for truncating local bytes: SSR reports bucket totals and may drift,
+        # so truncating on it could destroy a good download.
         headers = {}
         if existing_bytes > 0:
             headers["Range"] = f"bytes={existing_bytes}-"
 
+        effective_total = 0  # storage-reported object size, once known
+        streamed = False     # whether any payload bytes were transferred
         total_downloaded = existing_bytes
-        with open(part_path, "ab") as f:
-            async with client.stream("GET", s3_url, headers=headers) as stream:
-                async for chunk in stream.aiter_bytes(chunk_size=65536):
-                    f.write(chunk)
-                    total_downloaded += len(chunk)
-                    if on_progress:
-                        on_progress(total_downloaded, session.file_size)
-
-        # Read complete encrypted file and decrypt
-        encrypted_data = part_path.read_bytes()
-        decrypted = decrypt_file(encrypted_data, aes_key, constants)
-
-        # Validate
-        if not decrypted[:4] == b"%PDF":
-            logger.warning("Decryption produced invalid output — attempting self-healing...")
-            new_constants = await auto_extract_constants(client=client)
-            if new_constants:
-                aes_key = derive_aes_key(
-                    sharing_id,
-                    fragment,
-                    session.passphrase_wrapped_pk,
-                    session.ephemeral_public_key,
-                    new_constants,
-                )
-                decrypted = decrypt_file(encrypted_data, aes_key, new_constants)
-                if decrypted[:4] == b"%PDF":
-                    logger.info("Self-healing successful — decryption now valid")
-                    try:
-                        cfg = load_config()
-                        cfg.limewire = new_constants
-                        save_config(cfg)
-                        logger.info("Updated constants saved to config")
-                    except OSError:
-                        # Config may be read-only (e.g., Docker :ro mount).
-                        # Keep new constants in memory — they'll be used for
-                        # remaining downloads this session but won't survive restart.
-                        pass
+        async with client.stream("GET", s3_url, headers=headers) as stream:
+            status = stream.status_code
+            if status == 416:
+                # Range start >= object size. The error body is NEVER written.
+                total = _content_range_total(stream.headers.get("content-range"))
+                if total is not None and existing_bytes >= total:
+                    effective_total = total
+                elif total is None and session.file_size > 0 and existing_bytes == session.file_size:
+                    # No Content-Range: the SSR size may CONFIRM completeness
+                    # (exact match only); it never justifies truncation.
+                    effective_total = existing_bytes
                 else:
                     return DownloadResult(
                         success=False,
-                        error="Decryption failed even after refreshing constants. See UPDATE_KEYS.md.",
+                        error=(
+                            f"HTTP 416 but completeness unverifiable (local "
+                            f"{existing_bytes:,} bytes, Content-Range total "
+                            f"{total if total is not None else 'absent'})"
+                        ),
                     )
+            elif status in (200, 206):
+                if status == 206:
+                    start, total = _content_range_parts(stream.headers.get("content-range"))
+                    if start != existing_bytes:
+                        # AES-CTR is positional: appending a mis-offset body
+                        # would splice ciphertext into garbage.
+                        return DownloadResult(
+                            success=False,
+                            error=(
+                                f"Resume offset mismatch (requested {existing_bytes}, "
+                                f"Content-Range {stream.headers.get('content-range')!r})"
+                            ),
+                        )
+                    effective_total = total or 0
+                    mode = "ab"
+                else:
+                    if existing_bytes > 0:
+                        logger.info("Server ignored Range request — restarting from byte 0")
+                    content_length = stream.headers.get("content-length", "")
+                    effective_total = int(content_length) if content_length.isdigit() else 0
+                    mode = "wb"
+                    total_downloaded = 0
+                streamed = True
+                with open(part_path, mode) as f:
+                    async for chunk in stream.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                        total_downloaded += len(chunk)
+                        if on_progress:
+                            on_progress(total_downloaded, effective_total or session.file_size)
             else:
+                # Error bodies must never reach the .part file.
+                stream.raise_for_status()
+                return DownloadResult(success=False, error=f"Unexpected HTTP {status} from storage")
+
+        part_size = part_path.stat().st_size if part_path.exists() else 0
+        if effective_total <= 0:
+            effective_total = part_size  # no authoritative size reported → take the file as-is
+        if part_size > effective_total:
+            with open(part_path, "r+b") as f:
+                f.truncate(effective_total)
+            logger.info(
+                f"Truncated partial file to storage-reported {effective_total:,} bytes "
+                f"(reclaimed {part_size - effective_total:,} junk bytes)"
+            )
+            part_size = effective_total
+        if part_size < effective_total:
+            # Short read: transient and resumable — not a decryption problem,
+            # so validation and self-healing must not run.
+            return DownloadResult(
+                success=False,
+                error=f"incomplete download ({part_size:,} of {effective_total:,} bytes)",
+            )
+        if not streamed and on_progress:
+            on_progress(effective_total, effective_total)
+
+        # Read exactly the object's bytes and decrypt (anything beyond
+        # effective_total can never reach the output or the dedup hash)
+        encrypted_data = part_path.read_bytes()[:effective_total]
+        decrypted = decrypt_file(encrypted_data, aes_key, constants)
+
+        # Classify: a known non-PDF signature means decryption WORKED but the
+        # payload is unwanted — terminal, self-healing cannot change it. Only
+        # unrecognized output suggests stale constants.
+        verdict = _classify_payload(decrypted[:16])
+        if verdict == "unknown":
+            logger.warning("Decryption produced unrecognized output — attempting self-healing...")
+            new_constants = await auto_extract_constants(client=client)
+            if not new_constants:
                 return DownloadResult(
                     success=False,
-                    error="Decryption produced invalid PDF and could not auto-extract new constants.",
+                    error="Decryption produced invalid output and could not auto-extract new constants.",
                 )
+            aes_key = derive_aes_key(
+                sharing_id,
+                fragment,
+                session.passphrase_wrapped_pk,
+                session.ephemeral_public_key,
+                new_constants,
+            )
+            decrypted = decrypt_file(encrypted_data, aes_key, new_constants)
+            verdict = _classify_payload(decrypted[:16])
+            if verdict == "unknown":
+                # Keep the .part: it is size-consistent (junk-free up to
+                # effective_total), so the next attempt costs one ranged probe
+                # plus a local decrypt — not a full re-download.
+                return DownloadResult(success=False, error=_DECRYPT_FAILED_MSG)
+            if verdict == "pdf":
+                logger.info("Self-healing successful — decryption now valid")
+                try:
+                    cfg = load_config()
+                    cfg.limewire = new_constants
+                    save_config(cfg)
+                    logger.info("Updated constants saved to config")
+                except OSError:
+                    # Config may be read-only (e.g., Docker :ro mount).
+                    # Keep new constants in memory — they'll be used for
+                    # remaining downloads this session but won't survive restart.
+                    pass
+        if verdict == "unsupported":
+            _cleanup_part(part_path)
+            name = session.file_name or dest.name
+            logger.info(f"Unsupported payload (non-PDF content): {name} — skipping")
+            return DownloadResult(
+                success=False,
+                unsupported=True,
+                error=f"Unsupported payload: {name}",
+            )
 
         # Compute content hash for deduplication
         file_hash = hashlib.sha256(decrypted).hexdigest()

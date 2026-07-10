@@ -280,3 +280,32 @@ async def test_batch_dedupes_duplicate_issue_ids(tmp_path, monkeypatch):
 
     assert len(downloads) == 1                       # duplicate row dropped
     assert calls == [True]                           # one callback total
+
+
+async def test_unsupported_result_marks_status_and_skips_refresh(tmp_path, monkeypatch):
+    # A live share with a non-PDF payload: terminal 'unsupported' status, no
+    # dead-link page re-scrape (the link works), structured flag in the result.
+    cfg, idx, issue = _setup(tmp_path)
+    scrape_calls: list[str] = []
+    monkeypatch.setattr(batch_mod, "scrape_detail_page", _fake_scrape(FRESH, scrape_calls))
+
+    async def fake_download(url, dest, **kwargs):
+        return DownloadResult(success=False, unsupported=True,
+                              error="Unsupported payload: x.zip")
+
+    monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_download)
+
+    outcomes: list[tuple[bool, str | None]] = []
+    result = await _download_one(
+        issue, cfg, idx, asyncio.Semaphore(1), RateLimitGate(),
+        on_complete=lambda i, s, e: outcomes.append((s, e)),
+    )
+    status = idx.conn.execute(
+        "SELECT status FROM downloads WHERE issue_id = ?", (issue["id"],)
+    ).fetchone()[0]
+    idx.close()
+
+    assert result["unsupported"] is True and result["success"] is False
+    assert status == DownloadStatus.UNSUPPORTED.value
+    assert scrape_calls == []  # dead-link refresh never invoked for a live share
+    assert outcomes == [(False, "Unsupported payload: x.zip")]
