@@ -200,6 +200,8 @@ def test_backfill_reports_blocked_then_skipped_and_exits_nonzero(
             },
         ],
     )
+    # Wanted rows: default backfill-urls repairs requested rows only.
+    idx.mark_manual([issue["id"] for issue in idx.get_issues()])
     idx.close()
     source = ScriptedSource()
     _install_source(monkeypatch, source)
@@ -246,6 +248,7 @@ def test_retry_claim_bypasses_future_schedule(tmp_path, monkeypatch):
         ],
     )
     issue_id = idx.get_issues()[0]["id"]
+    idx.mark_manual([issue_id])  # wanted: retry excludes never-requested rows
     idx.record_download_failure(
         issue_id,
         DownloadFailureKind.TRANSIENT,

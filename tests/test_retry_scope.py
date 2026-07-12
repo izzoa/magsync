@@ -22,12 +22,15 @@ def _open_index(tmp_path, monkeypatch) -> MagazineIndex:
 
 
 def _add_issue(idx: MagazineIndex, key: str, url: str | None, status=None) -> int:
+    """Add one wanted (manual-provenance) issue; retry ignores unwanted rows,
+    and that exclusion has its own dedicated test below."""
     mag = idx.get_or_create_magazine("Mag", "mag")
     idx.add_issues(mag, [{"title": f"{key} - Jan 2026", "page_url": key,
                           "limewire_url": url, "year": 2026, "month": 1}])
     issue_id = idx.conn.execute(
         "SELECT id FROM issues WHERE page_url = ?", (key,)
     ).fetchone()[0]
+    idx.mark_manual([issue_id])
     if status is not None:
         idx.update_download_status(issue_id, status)
     return issue_id

@@ -48,6 +48,9 @@ def _setup(tmp_path: Path, rows: list[dict]):
     magazine_id = idx.get_or_create_magazine("Batch Tests", "batch tests")
     idx.add_issues(magazine_id, rows)
     issues_by_page = {row["page_url"]: row for row in idx.get_issues()}
+    # Wanted (manual) provenance: batch mechanics are provenance-independent,
+    # and intent scoping has its own dedicated tests.
+    idx.mark_manual([row["id"] for row in issues_by_page.values()])
     return cfg, idx, issues_by_page
 
 
@@ -393,7 +396,7 @@ async def test_due_refresh_rotates_without_requesting_dead_share(tmp_path, monke
         "dead share",
     )
     idx.schedule_link_refresh(issue["id"], datetime.now(timezone.utc))
-    claimed = idx.claim_due_link_refreshes(now=datetime.now(timezone.utc))
+    claimed = idx.claim_due_link_refreshes([], now=datetime.now(timezone.utc))
     assert len(claimed) == 1
 
     async def fake_scrape(page_url, **kwargs):

@@ -76,11 +76,16 @@ def _filter_results(results, query: str, exact: bool):
     return [r for r in results if strip_accents(normalize_title(r.title)).lower() == query_norm]
 
 
-def _index_results(results, idx: MagazineIndex, cfg) -> int:
+def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> int:
     """Index scraped results, grouping by normalized title.
 
     Each unique normalized title gets its own magazine entry.
     Returns total new issues added.
+
+    ``subscription`` is the subscription whose search produced these results,
+    when there is one: matching rows record subscription provenance (and
+    null-provenance re-encounters are promoted); fuzzy strangers are cataloged
+    without provenance and are never claimable work.
     """
     from collections import defaultdict
 
@@ -108,7 +113,7 @@ def _index_results(results, idx: MagazineIndex, cfg) -> int:
                 "file_size": r.file_size,
                 "cover_image_url": r.cover_image_url,
             })
-        total_new += idx.add_issues(mag_id, issues_data)
+        total_new += idx.add_issues(mag_id, issues_data, subscription=subscription)
 
     return total_new
 
@@ -205,9 +210,16 @@ def search(
         all_issues = idx.get_issues(magazine_title=norm)
         for i, issue in enumerate(all_issues, 1):
             status = issue.get("download_status", "pending")
+            # Never-requested rows are catalog entries, not queued work — a
+            # parked side-effect row must not present itself as "pending".
+            if status not in ("complete", "downloading") and issue.get(
+                "requested_by"
+            ) not in ("manual", "subscription"):
+                status = "cataloged"
             status_style = {
                 "complete": "[green]done[/green]",
                 "pending": "[dim]pending[/dim]",
+                "cataloged": "[dim italic]cataloged[/dim italic]",
                 "failed": "[red]failed[/red]",
                 "downloading": "[yellow]downloading[/yellow]",
                 "unavailable": "[red dim]unavailable[/red dim]",
@@ -286,7 +298,38 @@ def fetch(
                 _print_partial_details(detail_failures)
                 _index_results(source_result.items, idx, cfg)
 
+                # Record explicit intent for everything in this fetch's query
+                # scope — every non-complete status, not just pending — so a
+                # parked (never-requested) failure becomes recoverable via
+                # `magsync retry`. Provenance backfill first, then manual
+                # marking; the download set below stays pending-only. Dry runs
+                # mutate nothing.
                 norm = strip_accents(query).lower()
+                if not dry_run:
+                    idx.promote_subscribed(cfg.subscriptions)
+                    scope = idx.get_issues(
+                        magazine_title=norm,
+                        since_year=since_year,
+                        since_month=since_month,
+                    )
+                    non_complete = [
+                        i for i in scope
+                        if i.get("download_status") != "complete"
+                    ]
+                    if non_complete:
+                        idx.mark_manual([i["id"] for i in non_complete])
+                    recoverable = sum(
+                        1 for i in non_complete
+                        if i.get("download_status") in ("failed", "unavailable")
+                    )
+                    if recoverable:
+                        console.print(
+                            f"[yellow]{recoverable} previously failed/unavailable "
+                            f"issue{'s' if recoverable != 1 else ''} marked as "
+                            "requested — run 'magsync retry' to attempt "
+                            "them.[/yellow]"
+                        )
+
                 pending = idx.get_issues(
                     magazine_title=norm,
                     since_year=since_year,
@@ -568,11 +611,28 @@ def retry(
     idx = MagazineIndex()
 
     try:
-        # Atomically claim exactly the failed/unavailable invocation snapshot,
-        # bypassing persisted schedules without touching the pending backlog.
-        claimed, skipped = idx.claim_manual_retry_downloads(magazine_title=query)
+        # Provenance backfill first: legacy rows matching a current
+        # subscription become wanted before the snapshot is taken.
+        idx.promote_subscribed(cfg.subscriptions)
+
+        # Atomically claim exactly the wanted failed/unavailable invocation
+        # snapshot, bypassing persisted schedules without touching the pending
+        # backlog. Never-requested (null-provenance) rows are excluded and
+        # reported with their recovery path.
+        claimed, skipped, excluded = idx.claim_manual_retry_downloads(
+            magazine_title=query
+        )
+        excluded_msg = (
+            f"[yellow]{excluded} failed/unavailable row"
+            f"{'s' if excluded != 1 else ''} excluded: never requested "
+            f"(subscribe, or 'magsync fetch \"<title>\"' first, then retry).[/yellow]"
+            if excluded else None
+        )
         if not claimed and not skipped:
-            console.print("[green]No failed downloads to retry.[/green]")
+            if excluded_msg:
+                console.print(excluded_msg)
+            else:
+                console.print("[green]No failed downloads to retry.[/green]")
             raise typer.Exit()
 
         skipped_msg = (
@@ -582,6 +642,8 @@ def retry(
         )
         if not claimed:
             console.print(skipped_msg)
+            if excluded_msg:
+                console.print(excluded_msg)
             raise typer.Exit()
 
         console.print(
@@ -606,6 +668,8 @@ def retry(
         out.summarize(results)
         if skipped_msg:
             console.print(skipped_msg)
+        if excluded_msg:
+            console.print(excluded_msg)
     finally:
         idx.close()
 
@@ -613,6 +677,10 @@ def retry(
 @app.command(name="backfill-urls")
 def backfill_urls(
     query: str = typer.Argument(None, help="Only backfill issues for this magazine"),
+    include_all: bool = typer.Option(
+        False, "--all",
+        help="Repair the full catalog, including never-requested rows",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-issue detail"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only show the final summary (errors still surface)"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable the live progress bar"),
@@ -621,14 +689,29 @@ def backfill_urls(
 
     Useful after a site template change leaves indexed issues without a LimeWire
     URL. `magsync update` repairs these automatically too; this command targets
-    only the broken rows and also reaches de-tracked magazines.
+    only the broken rows and also reaches de-tracked magazines. By default only
+    wanted (requested) rows are repaired; --all covers the whole catalog.
     """
     _reject_conflicting_flags(verbose, quiet)
     cfg = load_config()
     idx = MagazineIndex()
 
     try:
-        missing = idx.get_issues_missing_url(magazine_title=query)
+        idx.promote_subscribed(cfg.subscriptions)
+        missing = idx.get_issues_missing_url(
+            magazine_title=query, wanted_only=not include_all
+        )
+        parked_skipped = 0
+        if not include_all:
+            parked_skipped = len(
+                idx.get_issues_missing_url(magazine_title=query)
+            ) - len(missing)
+        if parked_skipped:
+            console.print(
+                f"[dim]{parked_skipped} never-requested issue"
+                f"{'s' if parked_skipped != 1 else ''} skipped "
+                "(use --all to include them).[/dim]"
+            )
         if not missing:
             console.print("[green]No issues missing a download URL.[/green]")
             raise typer.Exit()
@@ -894,6 +977,8 @@ async def _run_daemon_cycle(
     now: datetime | None = None,
     clock: Callable[[], float] = time.monotonic,
     source_client_factory: Callable[..., Any] | None = None,
+    subscriptions: list[Any] | None = None,
+    config_failure_reason: str | None = None,
 ) -> Any:
     """Run one complete daemon cycle in one event loop and source session.
 
@@ -901,6 +986,13 @@ async def _run_daemon_cycle(
     share the same ``FreemagazinesClient`` and therefore the same cookies,
     request pacing, and challenge circuit. Returned batch results, never
     callbacks, are the source of download counters.
+
+    ``subscriptions`` is the cycle's subscription snapshot (defaults to
+    ``cfg.subscriptions``); the daemon loop passes a freshly re-read snapshot
+    each cycle so config-file edits take effect without restart. Every phase —
+    indexing, refresh claiming, download claiming — uses this exact snapshot.
+    ``config_failure_reason`` marks the cycle degraded when the loop had to
+    fall back to a stale snapshot.
     """
 
     from magsync.core.batch import download_batch, refresh_due_links
@@ -911,10 +1003,12 @@ async def _run_daemon_cycle(
     from magsync.core.urls import URLValidationError, normalize_limewire_share_url
 
     daemon_logger = logger or logging.getLogger("magsync")
-    report = CycleReport(source_total=len(cfg.subscriptions))
+    if subscriptions is None:
+        subscriptions = cfg.subscriptions
+    report = CycleReport(source_total=len(subscriptions))
     started = clock()
     cycle_at = now or datetime.now(timezone.utc)
-    source_expected = bool(cfg.subscriptions)
+    source_expected = bool(subscriptions)
     source_failed = False
     source_reason: str | None = None
     fatal_reason: str | None = None
@@ -922,12 +1016,22 @@ async def _run_daemon_cycle(
 
     factory = source_client_factory or FreemagazinesClient
     try:
+        # Provenance backfill with this cycle's snapshot: promotes legacy or
+        # newly subscribed titles so the scoped claims below can see them.
+        # Idempotent, title-only (matching.py). Runs for dry runs too so the
+        # preview matches what a real cycle would claim.
+        promoted = idx.promote_subscribed(subscriptions)
+        if promoted:
+            daemon_logger.info(
+                "Promoted %d cataloged row(s) to subscription provenance", promoted
+            )
+
         async with factory(scrape_delay=cfg.download.scrape_delay) as source_client:
             # Phase 1: subscription indexing. A challenge result opens the
             # client's circuit; no later subscription is even invoked.
-            for position, sub in enumerate(cfg.subscriptions):
+            for position, sub in enumerate(subscriptions):
                 if source_client.circuit_open:
-                    report.source_skipped += len(cfg.subscriptions) - position
+                    report.source_skipped += len(subscriptions) - position
                     source_failed = True
                     failure = source_client.circuit_failure
                     if source_reason is None and failure is not None:
@@ -971,7 +1075,11 @@ async def _run_daemon_cycle(
                     filtered = _filter_results(
                         source_result.items, sub.query, sub.exact
                     )
-                    new = _index_results(filtered, idx, cfg) if filtered else 0
+                    new = (
+                        _index_results(filtered, idx, cfg, subscription=sub)
+                        if filtered
+                        else 0
+                    )
                     if new:
                         daemon_logger.info("  %s: %d new issues indexed", sub.query, new)
 
@@ -984,13 +1092,13 @@ async def _run_daemon_cycle(
                             )
 
                 if blocked_result:
-                    report.source_skipped += len(cfg.subscriptions) - position - 1
+                    report.source_skipped += len(subscriptions) - position - 1
                     break
 
                 # A detail request can open the circuit while still preserving
                 # valid siblings, so check again after the structured result.
                 if source_client.circuit_open:
-                    remaining = len(cfg.subscriptions) - position - 1
+                    remaining = len(subscriptions) - position - 1
                     report.source_skipped += remaining
                     source_failed = True
                     failure = source_client.circuit_failure
@@ -1002,7 +1110,9 @@ async def _run_daemon_cycle(
             # path never invokes the known-dead stored LimeWire URL. A circuit
             # opened above is reused and short-circuits these source calls.
             if not dry_run:
-                due_refreshes = idx.claim_due_link_refreshes(now=cycle_at)
+                due_refreshes = idx.claim_due_link_refreshes(
+                    subscriptions, now=cycle_at
+                )
                 if due_refreshes:
                     source_expected = True
                     refresh_results = await refresh_due_links(
@@ -1020,16 +1130,19 @@ async def _run_daemon_cycle(
                             if source_reason is None:
                                 source_reason = "Unable to persist source refresh result"
 
-            # Phase 3: pending and due transient downloads are claimed every
-            # cycle, even if source indexing was blocked.
+            # Phase 3: wanted pending and due transient downloads are claimed
+            # every cycle, even if source indexing was blocked. The dry-run
+            # preview shares the claim's exact predicates so it can never show
+            # a set the real claim would not take (or hide one it would).
+            dry_run_due_refreshes = 0
             if dry_run:
-                claimed = [
-                    issue
-                    for issue in idx.get_issues(status=DownloadStatus.PENDING)
-                    if issue.get("limewire_url")
-                ]
+                claimed, dry_run_due_refreshes = idx.preview_claimable_downloads(
+                    subscriptions, now=cycle_at
+                )
             else:
-                claimed = idx.claim_pending_and_due_downloads(now=cycle_at)
+                claimed = idx.claim_pending_and_due_downloads(
+                    subscriptions, now=cycle_at
+                )
 
             report.downloads_queued = len(claimed)
             identities: set[str] = set()
@@ -1045,6 +1158,11 @@ async def _run_daemon_cycle(
             if dry_run:
                 if claimed:
                     daemon_logger.info("Dry run - would download %d issues", len(claimed))
+                if dry_run_due_refreshes:
+                    daemon_logger.info(
+                        "Dry run - %d due link refresh(es) would be attempted",
+                        dry_run_due_refreshes,
+                    )
             elif claimed:
                 daemon_logger.info(
                     "Downloading %d issues (%d unique URLs; max %d concurrent)...",
@@ -1096,13 +1214,20 @@ async def _run_daemon_cycle(
     if fatal_reason is not None:
         report.status = PipelineStatus.FAILED
         report.reason = fatal_reason or "Local daemon cycle failure"
-    elif source_failed or report.detail_failures or report.downloads_failed:
+    elif (
+        source_failed
+        or report.detail_failures
+        or report.downloads_failed
+        or config_failure_reason is not None
+    ):
         report.status = PipelineStatus.DEGRADED
         report.reason = source_reason
         if report.reason is None and report.detail_failures:
             report.reason = f"{report.detail_failures} detail request(s) failed"
         if report.reason is None and report.downloads_failed:
             report.reason = f"{report.downloads_failed} download(s) failed"
+        if report.reason is None and config_failure_reason is not None:
+            report.reason = config_failure_reason
     else:
         report.status = PipelineStatus.HEALTHY
 
@@ -1164,11 +1289,19 @@ def daemon(
 
     # Recover interrupted work only. Typed failure schedules and their UTC due
     # times survive restarts and are claimed by ordinary cycles when eligible.
+    # Then run the idempotent provenance backfill: legacy rows matching a
+    # subscription become wanted; never-subscribed rows park as cataloged
+    # (requested_by NULL) and are permanently invisible to automatic claims.
     startup_idx = MagazineIndex()
     stuck = startup_idx.reset_stuck_downloads()
+    promoted = startup_idx.promote_subscribed(cfg.subscriptions)
     startup_idx.close()
     if stuck:
         logger.info("Reset %d interrupted download(s) to pending", stuck)
+    if promoted:
+        logger.info(
+            "Promoted %d cataloged row(s) to subscription provenance", promoted
+        )
 
     logger.info(f"magsync v{__version__} daemon starting")
     logger.info(f"  Output directory: {cfg.output_dir}")
@@ -1195,9 +1328,23 @@ def daemon(
 
     # Daemon loop. Each cycle gets exactly one asyncio.run(), so the source
     # session, its circuit, due refreshes, and downloads share one event loop.
+    # Subscriptions are re-read every cycle so config-file edits (unsubscribe,
+    # since changes) take effect without a restart; a read failure falls back
+    # to the previous snapshot and degrades that cycle — never unscoped work.
+    subs_snapshot = cfg.subscriptions
     try:
         while not shutdown:
             logger.info("Starting cycle...")
+            config_failure_reason = None
+            try:
+                subs_snapshot = load_config().subscriptions
+            except Exception as exc:
+                config_failure_reason = (
+                    "Subscription config reload failed; previous snapshot in use"
+                )
+                logger.warning(
+                    "%s: %s", config_failure_reason, sanitize_external_error(exc)
+                )
             idx = MagazineIndex()
             try:
                 asyncio.run(
@@ -1206,6 +1353,8 @@ def daemon(
                         idx,
                         dry_run=dry_run,
                         logger=logger,
+                        subscriptions=subs_snapshot,
+                        config_failure_reason=config_failure_reason,
                     )
                 )
             finally:

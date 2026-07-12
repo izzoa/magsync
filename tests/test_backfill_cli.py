@@ -28,6 +28,8 @@ def test_backfill_urls_populates_missing(tmp_path, monkeypatch):
         mag,
         [{"title": "T", "page_url": "https://freemagazines.top/t-2026/", "limewire_url": None}],
     )
+    # Wanted row: default backfill-urls repairs requested rows only.
+    idx.mark_manual([issue["id"] for issue in idx.get_issues()])
     idx.close()
 
     async def fake_scrape(page_url, client=None):
@@ -61,6 +63,7 @@ def test_backfill_urls_filter_scopes_to_magazine(tmp_path, monkeypatch):
     b = idx.get_or_create_magazine("Beta", "beta")
     idx.add_issues(a, [{"title": "A", "page_url": "pa", "limewire_url": None}])
     idx.add_issues(b, [{"title": "B", "page_url": "pb", "limewire_url": None}])
+    idx.mark_manual([issue["id"] for issue in idx.get_issues()])
     idx.close()
 
     scraped: list[str] = []

@@ -93,3 +93,89 @@ def test_search_failure_preserves_prior_results(monkeypatch):
     assert fake.selected_issues == {7}
     assert "blocked" in fake.statuses[-1].casefold()
     assert "secret" not in fake.statuses[-1]
+
+
+def test_populate_table_renders_parked_rows_as_cataloged():
+    class FakeTable:
+        def __init__(self):
+            self.rows = []
+
+        def clear(self):
+            self.rows = []
+
+        def add_row(self, *cells, key=None):
+            self.rows.append(cells)
+
+    class FakeApp:
+        def __init__(self):
+            self.table = FakeTable()
+            self.statuses = []
+
+        def query_one(self, _selector, _type=None):
+            return self.table
+
+        def _update_status(self, text):
+            self.statuses.append(text)
+
+    fake = FakeApp()
+    issues = [
+        {"id": 1, "title": "Wanted", "download_status": "pending",
+         "requested_by": "subscription"},
+        {"id": 2, "title": "Stranger", "download_status": "pending",
+         "requested_by": None},
+        {"id": 3, "title": "NonPdf", "download_status": "unsupported",
+         "requested_by": "manual"},
+    ]
+    MagSyncApp._populate_table(fake, issues, new_count=0)
+
+    statuses = [row[5] for row in fake.table.rows]
+    assert statuses == ["pending", "cataloged", "⊘ non-PDF"]
+
+
+def test_do_download_marks_selection_manual(monkeypatch):
+    marked: list[list[int]] = []
+    attempted: list[int] = []
+
+    async def fake_download_batch(issues, cfg, idx, on_start=None,
+                                  on_complete=None, **_kw):
+        for issue in issues:
+            attempted.append(issue["id"])
+        return [{"issue": i, "success": True, "error": None} for i in issues]
+
+    monkeypatch.setattr("magsync.core.batch.download_batch", fake_download_batch)
+
+    class FakeIdx:
+        def mark_manual(self, ids):
+            marked.append(list(ids))
+            return len(ids)
+
+    class FakeApp:
+        cfg = SimpleNamespace(download=SimpleNamespace(max_concurrent=2))
+        idx = FakeIdx()
+        search_results = [
+            {"id": 5, "title": "Chosen", "download_status": "pending",
+             "limewire_url": "https://limewire.com/d/x#k"},
+            {"id": 6, "title": "Unselected", "download_status": "pending",
+             "limewire_url": "https://limewire.com/d/y#k"},
+        ]
+        selected_issues = {5}
+
+        def __init__(self):
+            self.statuses = []
+            self.app = SimpleNamespace(call_from_thread=lambda fn, *a: fn(*a))
+
+        def _update_status(self, text):
+            self.statuses.append(text)
+
+        def _update_download_log(self, text):
+            pass
+
+        def _refresh_library(self):
+            pass
+
+    fake = FakeApp()
+    MagSyncApp.__dict__["_do_download"].__wrapped__(fake)
+
+    # Explicit selection recorded as manual intent before the batch ran.
+    assert marked == [[5]]
+    assert attempted == [5]

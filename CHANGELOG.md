@@ -4,6 +4,31 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-07-12
+
+Fixes a 0.6.0 regression observed in production the day 0.6.0 shipped: the redesigned download claim selected **every** linked pending row and every due transient failure with no subscription scoping, so the daemon downloaded and attempted never-subscribed magazines (legacy side-effect rows from fuzzy site-search results). This is the third incident rooted in "indexed ⇒ enqueued"; 0.7.0 removes that root by recording download provenance.
+
+> **Upgrading:** back up `~/.magsync/index.db` before upgrading. **Rolling back to 0.6.x requires restoring that backup** — a 0.6.x daemon ignores the new provenance column and would immediately re-download every row 0.7.0 parks.
+
+### Added
+- **Download provenance** (`downloads.requested_by`): `subscription`, `manual`, or empty (a *cataloged* side-effect entry). Indexing still catalogs every scraped issue, but only rows a subscription matched or the user explicitly requested are ever automatic work. Promotion is one-way (`cataloged → subscription → manual`): explicit `fetch`/TUI downloads strengthen subscription rows to `manual`, so an explicit request survives a later unsubscribe; nothing is ever demoted automatically.
+- **Idempotent provenance backfill** at daemon startup, each cycle, and CLI entry points: existing rows whose titles match a current subscription are promoted (title-only, so tightening/loosening `since` later still works); everything else — including the legacy zombie rows from the June incident — is parked as `cataloged`, visibly, with its stale download/refresh actions left inert.
+- **`cataloged` status rendering** in `magsync search` and the TUI for parked non-complete rows; `get_download_stats` splits actionable `pending` from `cataloged`; the daemon summary's "refreshes pending" counts wanted actions only.
+- **`backfill-urls --all`**: default runs repair only wanted rows (skipped never-requested rows are counted); `--all` restores full-catalog repair.
+
+### Changed
+- **Daemon claims are intent-scoped** (downloads *and* link refreshes): only `manual` rows plus `subscription` rows matching a **current** subscription — normalized title honoring `exact`, plus the sub's `since` floor — evaluated at claim time. The daemon re-reads subscriptions from config **every cycle**, so unsubscribing or editing `since` in a mounted config file takes effect without a restart (a config read failure falls back to the previous snapshot and marks the cycle degraded — never unscoped work). **BREAKING (behavioral):** never-subscribed rows that 0.6.0 briefly made claimable stop downloading; removing a subscription now stops its queued work at the next cycle; `exact` now applies at claim time (0.5.0 applied it only when indexing).
+- **`magsync retry` narrows to wanted rows** — eligibility is provenance-only (an explicit retry still includes rows whose subscription lapsed) — and reports how many failed/unavailable rows were excluded as never requested, with the recovery path: `magsync fetch "<title>"` marks every matching non-complete row `manual` (and says so), after which `retry` picks the failures up.
+- **`--dry-run` previews through the claim's own predicates** (shared non-mutating preview), so it now includes due transient retries the old preview omitted and excludes everything the real claim would skip.
+- Subscription matching is one canonical matcher everywhere (indexing filter decisions, promotion, claims, retry): the issue's own normalized title, accent-insensitive, with curly/straight apostrophe and en/em-dash variants folded — fixing the known gap where `Cook's Illustrated` failed to match a curly-apostrophe title. Unknown `requested_by` values fail closed (never claimed, logged).
+
+### Fixed
+- **The daemon no longer downloads magazines that are not subscribed.** First 0.6.0 NAS cycle: 6 issues claimed while the source was blocked, 5 of them never-subscribed strangers, one of which (an 86 MB "Women's Golf Americas" PDF) downloaded, saved, and emailed. Under 0.7.0 those rows park as `cataloged`; a cycle claims only wanted work, and the parked shares' queued link refreshes stop consuming source requests.
+- Link rotation on a parked row still updates the catalog (fresh link, status reset) but can no longer resurrect it into automatic work.
+
+### Removed
+- Nothing removed; already-downloaded unwanted files are **not** deleted automatically. To clean up manually: delete the file, then optionally its rows (`DELETE FROM downloads WHERE issue_id = …; DELETE FROM issues WHERE id = …;`) — note the file's SHA-256 stays in the dedup index while its `complete` row remains.
+
 ## [0.6.0] - 2026-07-12
 
 ### Added

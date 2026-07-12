@@ -240,6 +240,7 @@ def _seed_failed_issue(tmp_path, monkeypatch):
     idx.add_issues(mag, [{"title": "Dead Issue - Jan 2026", "page_url": "p1",
                           "limewire_url": "https://limewire.com/d/x#k", "year": 2026, "month": 1}])
     issue_id = idx.get_issues()[0]["id"]
+    idx.mark_manual([issue_id])  # wanted: retry excludes never-requested rows
     idx.update_download_status(issue_id, DownloadStatus.FAILED)
     idx.close()
 

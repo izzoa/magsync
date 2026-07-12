@@ -16,6 +16,7 @@ from magsync.core.models import (
     RefreshOutcome,
     RefreshOutcomeKind,
     RetryAction,
+    Subscription,
 )
 
 LW_A = "https://limewire.com/d/aaaa#k1"
@@ -27,10 +28,16 @@ def _index(tmp_path) -> MagazineIndex:
 
 
 def _add_one(idx: MagazineIndex, url: str | None, **extra) -> int:
-    """Add/refresh the canonical test issue; returns its issue id."""
+    """Add/refresh the canonical test issue (manual provenance); returns its issue id.
+
+    Marked manual so claim/reset mechanics stay testable with an empty
+    subscription snapshot; provenance scoping has its own dedicated tests.
+    """
     mag = idx.get_or_create_magazine("Mag", "mag")
     idx.add_issues(mag, [{"title": "T", "page_url": "p1", "limewire_url": url, **extra}])
-    return idx.get_issues()[0]["id"]
+    issue_id = idx.get_issues()[0]["id"]
+    idx.mark_manual([issue_id])
+    return issue_id
 
 
 def test_backfill_fills_null_limewire_url(tmp_path):
@@ -221,11 +228,14 @@ def test_get_issues_missing_url_filtered_by_magazine(tmp_path):
 
 
 def _add_with_status(idx, mag, key, url, status=None):
-    """Add one issue; optionally move its download to `status`. Returns issue id."""
+    """Add one issue (manual provenance); optionally move its download to
+    `status`. Returns issue id. Manual marking keeps claim/reset mechanics
+    testable with an empty subscription snapshot."""
     idx.add_issues(mag, [{"title": key, "page_url": key, "limewire_url": url}])
     issue_id = idx.conn.execute(
         "SELECT id FROM issues WHERE page_url = ?", (key,)
     ).fetchone()[0]
+    idx.mark_manual([issue_id])
     if status is not None:
         idx.update_download_status(issue_id, status)
     return issue_id
@@ -429,7 +439,7 @@ def test_additive_migration_preserves_data_and_schedules_legacy_linked_failure(t
     columns = {row[1] for row in idx.conn.execute("PRAGMA table_info(downloads)")}
     assert {
         "last_error_kind", "last_error", "attempt_count", "last_attempt_at",
-        "next_action", "next_retry_at",
+        "next_action", "next_retry_at", "requested_by",
     } <= columns
 
     done = _download_row(idx, 11)
@@ -437,16 +447,31 @@ def test_additive_migration_preserves_data_and_schedules_legacy_linked_failure(t
         "complete", "/library/done.pdf", "2025-01-02T03:04:05+00:00",
     )
     assert (done["file_size_bytes"], done["sha256"]) == (1234, "abc")
+    # Migration defaults every legacy row to null provenance (parked).
+    assert done["requested_by"] is None
 
     linked = _download_row(idx, 12)
     linkless = _download_row(idx, 13)
     assert linked["last_error_kind"] is None
     assert linked["next_action"] == RetryAction.DOWNLOAD.value
     assert linked["next_retry_at"] is not None
+    assert linked["requested_by"] is None
     assert linkless["next_action"] is None
 
+    later = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+    # A migration-scheduled legacy action on a never-subscribed (parked) row
+    # stays inert: no snapshot makes it claimable without promotion.
+    assert idx.claim_pending_and_due_downloads(
+        [Subscription(query="Unrelated")], now=later
+    ) == []
+    assert _status_of(idx, 12) == "failed"
+
+    # The startup/cycle backfill promotes rows matching a current subscription
+    # (title only); the same due legacy action then becomes claimable work.
+    assert idx.promote_subscribed([Subscription(query="Linked failure")]) == 1
     claimed = idx.claim_pending_and_due_downloads(
-        now=datetime.now(timezone.utc) + timedelta(minutes=1)
+        [Subscription(query="Linked failure")], now=later
     )
     assert [row["id"] for row in claimed] == [12]
     assert _status_of(idx, 12) == "downloading"
@@ -532,7 +557,7 @@ def test_claim_selects_pending_and_due_transient_but_not_future_or_parked(tmp_pa
         unsupported, DownloadFailureKind.UNSUPPORTED, "zip"
     )
 
-    claimed = idx.claim_pending_and_due_downloads(now=now)
+    claimed = idx.claim_pending_and_due_downloads([], now=now)
     assert {row["id"] for row in claimed} == {pending, due}
     assert all(row["download_status"] == "downloading" for row in claimed)
     assert _status_of(idx, future) == "failed"
@@ -553,7 +578,7 @@ def test_claim_race_has_one_winner(tmp_path):
         idx = MagazineIndex(db_path=db)
         try:
             barrier.wait()
-            return [row["id"] for row in idx.claim_pending_and_due_downloads()]
+            return [row["id"] for row in idx.claim_pending_and_due_downloads([])]
         finally:
             idx.close()
 
@@ -574,8 +599,8 @@ def test_source_only_refresh_claim_reschedule_and_rotation(tmp_path):
     assert idx.schedule_link_refresh(issue_id, now - timedelta(seconds=1))
 
     # Download selection never turns the known-dead URL into work.
-    assert idx.claim_pending_and_due_downloads(now=now) == []
-    refreshes = idx.claim_due_link_refreshes(now=now)
+    assert idx.claim_pending_and_due_downloads([], now=now) == []
+    refreshes = idx.claim_due_link_refreshes([], now=now)
     assert [row["id"] for row in refreshes] == [issue_id]
     row = _download_row(idx, issue_id)
     assert row["status"] == "unavailable"
@@ -590,13 +615,13 @@ def test_source_only_refresh_claim_reschedule_and_rotation(tmp_path):
     # A restart before the due time preserves source-only timing.
     idx = MagazineIndex(db_path=db)
     assert idx.reset_stuck_downloads() == 0
-    assert idx.claim_due_link_refreshes(now=now) == []
+    assert idx.claim_due_link_refreshes([], now=now) == []
     assert idx.count_pending_link_refreshes() == 1
     row = _download_row(idx, issue_id)
     assert row["next_action"] == RetryAction.REFRESH_LINK.value
     assert row["next_retry_at"] == future.isoformat()
 
-    refreshes = idx.claim_due_link_refreshes(now=future + timedelta(seconds=1))
+    refreshes = idx.claim_due_link_refreshes([], now=future + timedelta(seconds=1))
     assert [row["id"] for row in refreshes] == [issue_id]
     assert idx.count_pending_link_refreshes() == 0
     rotated = RefreshOutcome(kind=RefreshOutcomeKind.ROTATED, url=LW_B)
@@ -634,9 +659,10 @@ def test_manual_retry_claim_bypasses_schedules_and_preserves_scope(tmp_path):
         unsupported, DownloadFailureKind.UNSUPPORTED, "zip"
     )
 
-    claimed, skipped = idx.claim_manual_retry_downloads()
+    claimed, skipped, excluded = idx.claim_manual_retry_downloads()
     assert {row["id"] for row in claimed} == {failed, unavailable}
     assert skipped == 1
+    assert excluded == 0
     for issue_id in (failed, unavailable):
         row = _download_row(idx, issue_id)
         assert row["status"] == "downloading"

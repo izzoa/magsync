@@ -64,6 +64,9 @@ async def test_combined_blocked_audio_and_orphan_cycle_is_degraded_and_secret_sa
             _issue("Getaway – April/May 2026", "getaway-b-2026", GETAWAY_URL),
         ],
     )
+    # Wanted (manual) provenance: this test exercises the cached-download and
+    # failure-classification pipeline, not intent scoping.
+    idx.mark_manual([issue["id"] for issue in idx.get_issues()])
 
     source_requests: list[str] = []
 

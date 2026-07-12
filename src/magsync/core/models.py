@@ -24,6 +24,20 @@ class DownloadStatus(str, Enum):
     UNSUPPORTED = "unsupported"  # Live share, non-PDF payload — never auto-retried; re-queued only on link rotation
 
 
+class RequestedBy(str, Enum):
+    """Download provenance: who wanted this row (``downloads.requested_by``).
+
+    A NULL column value means the row was cataloged as an indexing side effect
+    and is not work: never auto-claimed, never auto-refreshed, excluded from
+    manual retry.  Values form a monotonic ladder ``NULL < SUBSCRIPTION <
+    MANUAL``; promotion only moves up (explicit requests strengthen
+    ``SUBSCRIPTION`` to ``MANUAL``) and nothing is ever demoted automatically.
+    """
+
+    SUBSCRIPTION = "subscription"
+    MANUAL = "manual"
+
+
 class DownloadFailureKind(str, Enum):
     """Stable classifications for unsuccessful download attempts."""
 

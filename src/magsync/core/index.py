@@ -10,13 +10,18 @@ from typing import Any
 from urllib.parse import urlparse
 
 from magsync.config import get_db_path
-from magsync.core.models import DownloadStatus
+from magsync.core.matching import eligible_for_any, title_match
+from magsync.core.models import DownloadStatus, RequestedBy
 from magsync.core.urls import (
     is_valid_limewire_share_url,
     normalize_limewire_share_url,
 )
 
 logger = logging.getLogger("magsync")
+
+# The only provenance values that make a row wanted. Anything else non-null is
+# unrecognized (corruption/external writes) and MUST fail closed at claim time.
+_WANTED_PROVENANCE = (RequestedBy.MANUAL.value, RequestedBy.SUBSCRIPTION.value)
 
 
 def _enum_value(value: Any) -> Any:
@@ -92,7 +97,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_attempt_at TEXT,
     next_action TEXT,
-    next_retry_at TEXT
+    next_retry_at TEXT,
+    requested_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_state (
@@ -135,6 +141,9 @@ class MagazineIndex:
             "last_attempt_at": "TEXT",
             "next_action": "TEXT",
             "next_retry_at": "TEXT",
+            # Provenance ladder NULL < 'subscription' < 'manual'; NULL means
+            # side-effect catalog entry, which is never claimable work.
+            "requested_by": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -155,6 +164,10 @@ class MagazineIndex:
         self.conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_downloads_due_action
                ON downloads(next_action, next_retry_at, status)"""
+        )
+        self.conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_downloads_requested_by
+               ON downloads(requested_by, status)"""
         )
         self.conn.execute(
             """INSERT OR IGNORE INTO pipeline_state
@@ -202,7 +215,9 @@ class MagazineIndex:
         self.conn.commit()
         return cursor.lastrowid
 
-    def add_issues(self, magazine_id: int, issues: list[dict]) -> int:
+    def add_issues(
+        self, magazine_id: int, issues: list[dict], *, subscription: Any = None
+    ) -> int:
         """Upsert issues for a magazine. Returns count of *new* issues added.
 
         For a ``page_url`` that already exists, backfill any leaf metadata column
@@ -215,10 +230,20 @@ class MagazineIndex:
         ``title`` is intentionally excluded — it drives derived
         year/month/date_raw and magazine association and cannot be repaired in
         isolation.
+
+        When ``subscription`` is given (indexing under a subscription search),
+        rows whose issue title matches it — title only, no ``since`` — record
+        ``requested_by='subscription'``: new rows at insert, existing
+        null-provenance rows by promotion on re-encounter. Non-matching
+        (stranger) results stay null-provenance catalog entries, which no
+        automatic claim ever downloads.
         """
         added = 0
         backfill_columns = ("genre", "file_size", "cover_image_url")
         for issue in issues:
+            sub_wants = subscription is not None and title_match(
+                issue.get("title") or "", subscription
+            )
             existing = self.conn.execute(
                 "SELECT id, limewire_url, genre, file_size, cover_image_url "
                 "FROM issues WHERE page_url = ?",
@@ -291,6 +316,15 @@ class MagazineIndex:
                         f"Refreshed LimeWire link for {issue['page_url']}: "
                         f"{_sharing_id(existing['limewire_url'] or '')} → {_sharing_id(incoming_url)}"
                     )
+                if sub_wants:
+                    # Promotion on re-encounter: heals rows cataloged before
+                    # this subscription existed. Guarded to NULL so manual (or
+                    # any recorded) intent is never overwritten here.
+                    self.conn.execute(
+                        """UPDATE downloads SET requested_by = 'subscription'
+                           WHERE issue_id = ? AND requested_by IS NULL""",
+                        (existing["id"],),
+                    )
                 continue
 
             incoming_raw = issue.get("limewire_url")
@@ -317,10 +351,16 @@ class MagazineIndex:
                     issue.get("cover_image_url"),
                 ),
             )
-            # Create initial download record
+            # Create initial download record. Provenance is recorded only when
+            # the triggering subscription actually wants this title; stranger
+            # results are cataloged (requested_by NULL), not enqueued.
             self.conn.execute(
-                "INSERT INTO downloads (issue_id, status) VALUES (?, ?)",
-                (cursor.lastrowid, DownloadStatus.PENDING.value),
+                "INSERT INTO downloads (issue_id, status, requested_by) VALUES (?, ?, ?)",
+                (
+                    cursor.lastrowid,
+                    DownloadStatus.PENDING.value,
+                    RequestedBy.SUBSCRIPTION.value if sub_wants else None,
+                ),
             )
             added += 1
 
@@ -491,6 +531,7 @@ class MagazineIndex:
                    d.file_size_bytes AS downloaded_file_size_bytes, d.sha256,
                    d.last_error_kind, d.last_error, d.attempt_count,
                    d.last_attempt_at, d.next_action, d.next_retry_at,
+                   d.requested_by,
                    m.title as magazine_title, m.normalized_title
             FROM issues i
             JOIN magazines m ON i.magazine_id = m.id
@@ -520,16 +561,29 @@ class MagazineIndex:
         rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
-    def get_issues_missing_url(self, magazine_title: str | None = None) -> list[dict]:
-        """Return issues whose limewire_url is NULL/empty, optionally filtered by magazine."""
+    def get_issues_missing_url(
+        self,
+        magazine_title: str | None = None,
+        *,
+        wanted_only: bool = False,
+    ) -> list[dict]:
+        """Return issues whose limewire_url is NULL/empty, optionally filtered by magazine.
+
+        With ``wanted_only``, restrict to rows someone actually requested
+        (``manual``/``subscription`` provenance) — URL repair for
+        never-requested catalog entries is wasted source traffic.
+        """
         query = """
             SELECT i.id, i.page_url, i.title,
                    m.title as magazine_title, m.normalized_title
             FROM issues i
             JOIN magazines m ON i.magazine_id = m.id
+            LEFT JOIN downloads d ON d.issue_id = i.id
             WHERE (i.limewire_url IS NULL OR i.limewire_url = '')
         """
         params: list = []
+        if wanted_only:
+            query += " AND d.requested_by IN ('manual', 'subscription')"
         if magazine_title:
             query += " AND m.normalized_title LIKE ?"
             params.append(f"%{magazine_title}%")
@@ -556,17 +610,133 @@ class MagazineIndex:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def promote_subscribed(self, subscriptions: list[Any]) -> int:
+        """Idempotently promote null-provenance rows matching a subscription.
+
+        Title-only by design: eligibility applies each subscription's ``since``
+        floor at claim time; promotion must not, or loosening a floor later
+        could never revive rows left NULL under the tighter one. Safe to run
+        every startup and every cycle — repeat runs change nothing.
+        """
+        if not subscriptions:
+            return 0
+        rows = self.conn.execute(
+            """SELECT d.issue_id, i.title
+               FROM downloads d
+               JOIN issues i ON i.id = d.issue_id
+               WHERE d.requested_by IS NULL"""
+        ).fetchall()
+        promote_ids = [
+            row["issue_id"]
+            for row in rows
+            if any(title_match(row["title"] or "", sub) for sub in subscriptions)
+        ]
+        if not promote_ids:
+            return 0
+        self.conn.executemany(
+            """UPDATE downloads SET requested_by = 'subscription'
+               WHERE issue_id = ? AND requested_by IS NULL""",
+            [(issue_id,) for issue_id in promote_ids],
+        )
+        self.conn.commit()
+        return len(promote_ids)
+
+    def mark_manual(self, issue_ids: list[int]) -> int:
+        """Record explicit user intent: promote rows to ``manual``.
+
+        Strengthens ``subscription`` provenance too — an explicit request must
+        survive a later unsubscribe. Top of the ladder; never demoted.
+        """
+        if not issue_ids:
+            return 0
+        marked = 0
+        for start in range(0, len(issue_ids), _SQL_IN_CHUNK):
+            chunk = issue_ids[start : start + _SQL_IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self.conn.execute(
+                f"""UPDATE downloads SET requested_by = 'manual'
+                    WHERE issue_id IN ({placeholders})
+                      AND (requested_by IS NULL OR requested_by != 'manual')""",
+                chunk,
+            )
+            marked += cursor.rowcount
+        self.conn.commit()
+        return marked
+
+    def _eligible_download_candidates(
+        self, subscriptions: list[Any], now_text: str
+    ) -> list[sqlite3.Row]:
+        """Shared candidate selection for the download claim and its preview.
+
+        SQL narrows to wanted provenance and policy-eligible status/schedule;
+        Python applies claim-time subscription eligibility (title honoring
+        ``exact``, plus ``since``) for ``subscription`` rows. ``manual`` rows
+        are eligible unconditionally. Unknown non-null provenance fails closed
+        and is logged.
+        """
+        candidates = self.conn.execute(
+            """SELECT d.issue_id, d.status, d.last_error_kind, d.requested_by,
+                      d.next_action, d.next_retry_at, i.limewire_url,
+                      i.title, i.year, i.month
+               FROM downloads d
+               JOIN issues i ON i.id = d.issue_id
+               WHERE i.limewire_url IS NOT NULL
+                 AND i.limewire_url != ''
+                 AND d.requested_by IS NOT NULL
+                 AND (
+                     (d.status = 'pending' AND d.next_action IS NULL)
+                     OR
+                     (d.status = 'failed'
+                      AND d.next_action = 'DOWNLOAD'
+                      AND d.next_retry_at IS NOT NULL
+                      AND datetime(d.next_retry_at) <= datetime(?)
+                      AND (d.last_error_kind = 'transient'
+                           OR d.last_error_kind IS NULL))
+                 )
+               ORDER BY CASE WHEN d.status = 'pending' THEN 0 ELSE 1 END,
+                        datetime(d.next_retry_at), d.issue_id""",
+            (now_text,),
+        ).fetchall()
+
+        eligible: list[sqlite3.Row] = []
+        unknown = 0
+        for row in candidates:
+            provenance = row["requested_by"]
+            if provenance not in _WANTED_PROVENANCE:
+                unknown += 1
+                continue
+            if provenance == RequestedBy.SUBSCRIPTION.value and not eligible_for_any(
+                {"title": row["title"], "year": row["year"], "month": row["month"]},
+                subscriptions,
+            ):
+                continue
+            if not _plausible_limewire_url(row["limewire_url"]):
+                continue
+            eligible.append(row)
+        if unknown:
+            logger.warning(
+                "Ignoring %d download row(s) with unrecognized requested_by "
+                "values; they fail closed and are never claimed",
+                unknown,
+            )
+        return eligible
+
     def claim_pending_and_due_downloads(
         self,
+        subscriptions: list[Any],
         *,
         now: datetime | str | None = None,
         limit: int | None = None,
     ) -> list[dict]:
-        """Atomically claim pending and due policy-eligible download work.
+        """Atomically claim wanted pending and due policy-eligible downloads.
 
-        A due legacy row (null kind plus the one migration-created DOWNLOAD
-        action) is the only exception to typed transient selection. Claimed
-        rows move to ``downloading`` and their consumed schedule is cleared.
+        ``subscriptions`` is required (fail-closed): only ``manual`` rows and
+        ``subscription`` rows matching the caller's snapshot (title honoring
+        ``exact``, plus ``since``, evaluated now) are claimable. Null and
+        unrecognized provenance are never work. A due legacy row (null kind
+        plus the one migration-created DOWNLOAD action) is the only exception
+        to typed transient selection. Claimed rows move to ``downloading`` and
+        their consumed schedule is cleared.
         """
         now_text = _utc_timestamp(now)
         max_rows = None if limit is None else max(int(limit), 0)
@@ -575,39 +745,18 @@ class MagazineIndex:
 
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            candidates = self.conn.execute(
-                """SELECT d.issue_id, d.status, d.last_error_kind,
-                          d.next_action, d.next_retry_at, i.limewire_url
-                   FROM downloads d
-                   JOIN issues i ON i.id = d.issue_id
-                   WHERE i.limewire_url IS NOT NULL
-                     AND i.limewire_url != ''
-                     AND (
-                         (d.status = 'pending' AND d.next_action IS NULL)
-                         OR
-                         (d.status = 'failed'
-                          AND d.next_action = 'DOWNLOAD'
-                          AND d.next_retry_at IS NOT NULL
-                          AND datetime(d.next_retry_at) <= datetime(?)
-                          AND (d.last_error_kind = 'transient'
-                               OR d.last_error_kind IS NULL))
-                     )
-                   ORDER BY CASE WHEN d.status = 'pending' THEN 0 ELSE 1 END,
-                            datetime(d.next_retry_at), d.issue_id""",
-                (now_text,),
-            ).fetchall()
+            eligible = self._eligible_download_candidates(subscriptions, now_text)
 
             claimed_ids: list[int] = []
-            for row in candidates:
+            for row in eligible:
                 if max_rows is not None and len(claimed_ids) >= max_rows:
                     break
-                if not _plausible_limewire_url(row["limewire_url"]):
-                    continue
                 cursor = self.conn.execute(
                     """UPDATE downloads
                        SET status = 'downloading',
                            next_action = NULL, next_retry_at = NULL
                        WHERE issue_id = ?
+                         AND requested_by IN ('manual', 'subscription')
                          AND EXISTS (
                              SELECT 1 FROM issues i
                              WHERE i.id = downloads.issue_id
@@ -640,17 +789,83 @@ class MagazineIndex:
     # Concise alias for daemon/caller code.
     claim_download_work = claim_pending_and_due_downloads
 
+    def preview_claimable_downloads(
+        self,
+        subscriptions: list[Any],
+        *,
+        now: datetime | str | None = None,
+    ) -> tuple[list[dict], int]:
+        """Non-mutating preview sharing the claim's exact predicates.
+
+        Returns the issues the download claim would take right now, plus the
+        count of due wanted link-refresh actions, without claiming or changing
+        any row. Divergence from the claim under identical inputs is a defect.
+        """
+        now_text = _utc_timestamp(now)
+        eligible = self._eligible_download_candidates(subscriptions, now_text)
+        issues = self.get_issues_by_ids([row["issue_id"] for row in eligible])
+        due_refreshes = len(self._eligible_refresh_candidates(subscriptions, now_text))
+        return issues, due_refreshes
+
+    def _eligible_refresh_candidates(
+        self, subscriptions: list[Any], now_text: str
+    ) -> list[sqlite3.Row]:
+        """Shared candidate selection for the refresh claim and its preview.
+
+        Same provenance allowlist and claim-time eligibility as download
+        claiming: a refresh for a row nobody wants is wasted source traffic.
+        """
+        candidates = self.conn.execute(
+            """SELECT d.issue_id, d.next_retry_at, d.requested_by, i.page_url,
+                      COALESCE(i.limewire_url, '') AS limewire_url,
+                      i.title, i.year, i.month
+               FROM downloads d
+               JOIN issues i ON i.id = d.issue_id
+               WHERE d.status = 'unavailable'
+                 AND d.next_action = 'REFRESH_LINK'
+                 AND d.next_retry_at IS NOT NULL
+                 AND datetime(d.next_retry_at) <= datetime(?)
+                 AND d.requested_by IS NOT NULL
+                 AND i.page_url IS NOT NULL AND i.page_url != ''
+               ORDER BY datetime(d.next_retry_at), d.issue_id""",
+            (now_text,),
+        ).fetchall()
+
+        eligible: list[sqlite3.Row] = []
+        unknown = 0
+        for row in candidates:
+            provenance = row["requested_by"]
+            if provenance not in _WANTED_PROVENANCE:
+                unknown += 1
+                continue
+            if provenance == RequestedBy.SUBSCRIPTION.value and not eligible_for_any(
+                {"title": row["title"], "year": row["year"], "month": row["month"]},
+                subscriptions,
+            ):
+                continue
+            eligible.append(row)
+        if unknown:
+            logger.warning(
+                "Ignoring %d refresh action(s) with unrecognized requested_by "
+                "values; they fail closed and are never claimed",
+                unknown,
+            )
+        return eligible
+
     def claim_due_link_refreshes(
         self,
+        subscriptions: list[Any],
         *,
         now: datetime | str | None = None,
         limit: int | None = None,
     ) -> list[dict]:
-        """Reserve due source-only refreshes without queueing dead shares.
+        """Reserve due wanted source-only refreshes without queueing dead shares.
 
-        Reservation consumes the action/time while leaving status unavailable.
-        The caller must resolve it as clear, rescheduled, or rotated; ordinary
-        exceptions should reschedule through :meth:`schedule_link_refresh`.
+        ``subscriptions`` is required (fail-closed): null-provenance rows'
+        refresh actions stay persisted but are never claimed. Reservation
+        consumes the action/time while leaving status unavailable. The caller
+        must resolve it as clear, rescheduled, or rotated; ordinary exceptions
+        should reschedule through :meth:`schedule_link_refresh`.
         """
         now_text = _utc_timestamp(now)
         max_rows = None if limit is None else max(int(limit), 0)
@@ -659,19 +874,7 @@ class MagazineIndex:
 
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            candidates = self.conn.execute(
-                """SELECT d.issue_id, d.next_retry_at, i.page_url,
-                          COALESCE(i.limewire_url, '') AS limewire_url
-                   FROM downloads d
-                   JOIN issues i ON i.id = d.issue_id
-                   WHERE d.status = 'unavailable'
-                     AND d.next_action = 'REFRESH_LINK'
-                     AND d.next_retry_at IS NOT NULL
-                     AND datetime(d.next_retry_at) <= datetime(?)
-                     AND i.page_url IS NOT NULL AND i.page_url != ''
-                   ORDER BY datetime(d.next_retry_at), d.issue_id""",
-                (now_text,),
-            ).fetchall()
+            candidates = self._eligible_refresh_candidates(subscriptions, now_text)
 
             claimed_ids: list[int] = []
             for row in candidates:
@@ -685,6 +888,7 @@ class MagazineIndex:
                          AND next_action = 'REFRESH_LINK'
                          AND next_retry_at IS NOT NULL
                          AND datetime(next_retry_at) <= datetime(?)
+                         AND requested_by IN ('manual', 'subscription')
                          AND EXISTS (
                              SELECT 1 FROM issues i
                              WHERE i.id = downloads.issue_id
@@ -711,28 +915,37 @@ class MagazineIndex:
     claim_due_refreshes = claim_due_link_refreshes
 
     def count_pending_link_refreshes(self) -> int:
-        """Return the number of persisted source-only refresh actions.
+        """Return the number of persisted *wanted* source-only refresh actions.
 
         This is an observability count, so it includes both due and future
         ``REFRESH_LINK`` work without claiming or otherwise mutating rows.
+        Parked (null/unrecognized provenance) actions are excluded: the cycle
+        summary must not advertise refreshes that will never run.
         """
         row = self.conn.execute(
             """SELECT COUNT(*) AS count
                FROM downloads
-               WHERE next_action = 'REFRESH_LINK'"""
+               WHERE next_action = 'REFRESH_LINK'
+                 AND requested_by IN ('manual', 'subscription')"""
         ).fetchone()
         return int(row["count"] if row is not None else 0)
 
     def claim_manual_retry_downloads(
         self, magazine_title: str | None = None
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict], int, int]:
         """Atomically claim the invocation snapshot for explicit retry.
 
         This bypasses future DOWNLOAD/REFRESH_LINK timing, excludes pending and
         unsupported rows, and returns only rows moved to ``downloading``.
+
+        Eligibility is provenance-only: wanted rows are retried regardless of
+        current subscription membership or ``since`` (an explicit retry must
+        not skip rows whose subscription lapsed). Null/unrecognized provenance
+        is excluded and reported via the third return element so the caller
+        can name the recovery path.
         """
         query = """
-            SELECT i.id, i.limewire_url
+            SELECT i.id, i.limewire_url, d.requested_by
             FROM downloads d
             JOIN issues i ON d.issue_id = i.id
             JOIN magazines m ON i.magazine_id = m.id
@@ -746,8 +959,10 @@ class MagazineIndex:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self.conn.execute(query, params).fetchall()
-            linked = [row for row in rows if row["limewire_url"]]
-            skipped = len(rows) - len(linked)
+            wanted = [row for row in rows if row["requested_by"] in _WANTED_PROVENANCE]
+            excluded = len(rows) - len(wanted)
+            linked = [row for row in wanted if row["limewire_url"]]
+            skipped = len(wanted) - len(linked)
             claimed_ids: list[int] = []
             for row in linked:
                 if not _plausible_limewire_url(row["limewire_url"]):
@@ -762,6 +977,7 @@ class MagazineIndex:
                            next_action = NULL, next_retry_at = NULL
                        WHERE issue_id = ?
                          AND status IN ('failed', 'unavailable')
+                         AND requested_by IN ('manual', 'subscription')
                          AND EXISTS (
                              SELECT 1 FROM issues i
                              WHERE i.id = downloads.issue_id
@@ -775,7 +991,7 @@ class MagazineIndex:
                     claimed_ids.append(row["id"])
             claimed = self.get_issues_by_ids(claimed_ids)
             self.conn.commit()
-            return claimed, skipped
+            return claimed, skipped, excluded
         except BaseException:
             self.conn.rollback()
             raise
@@ -913,7 +1129,9 @@ class MagazineIndex:
         keep their status so they stay visible as failures and reachable by
         ``backfill-urls`` instead of being stranded as permanently-pending.
         'unsupported' rows are deliberately excluded: a non-PDF payload is
-        terminal until the share link rotates (see add_issues).
+        terminal until the share link rotates (see add_issues). Null-provenance
+        rows are likewise excluded — never-requested catalog entries must not
+        be flipped into (now claim-invisible) pending work by a manual reset.
 
         Runs as a single write transaction (``BEGIN IMMEDIATE``) and the
         UPDATE re-asserts the status guard, so a concurrent writer (the
@@ -928,6 +1146,7 @@ class MagazineIndex:
             JOIN issues i ON d.issue_id = i.id
             JOIN magazines m ON i.magazine_id = m.id
             WHERE d.status IN ('failed', 'unavailable')
+              AND d.requested_by IN ('manual', 'subscription')
         """
         params: list = []
         if magazine_title:
@@ -952,7 +1171,8 @@ class MagazineIndex:
                             attempt_count = 0, last_attempt_at = NULL,
                             next_action = NULL, next_retry_at = NULL
                         WHERE issue_id IN ({placeholders})
-                          AND status IN ('failed', 'unavailable')""",
+                          AND status IN ('failed', 'unavailable')
+                          AND requested_by IN ('manual', 'subscription')""",
                     chunk,
                 )
                 if cursor.rowcount == len(chunk):
@@ -999,6 +1219,7 @@ class MagazineIndex:
                            d.file_size_bytes AS downloaded_file_size_bytes, d.sha256,
                            d.last_error_kind, d.last_error, d.attempt_count,
                            d.last_attempt_at, d.next_action, d.next_retry_at,
+                           d.requested_by,
                            m.title as magazine_title, m.normalized_title
                     FROM issues i
                     JOIN magazines m ON i.magazine_id = m.id
@@ -1017,12 +1238,23 @@ class MagazineIndex:
         return results
 
     def get_download_stats(self) -> dict:
-        """Get overall download statistics."""
+        """Get overall download statistics.
+
+        ``pending`` counts actionable (wanted) queued work only; ``cataloged``
+        counts parked null/unrecognized-provenance pending rows, which no
+        automatic claim will ever download.
+        """
         row = self.conn.execute(
             """SELECT
                  COUNT(*) as total_issues,
                  SUM(CASE WHEN d.status = 'complete' THEN 1 ELSE 0 END) as downloaded,
-                 SUM(CASE WHEN d.status = 'pending' THEN 1 ELSE 0 END) as pending,
+                 SUM(CASE WHEN d.status = 'pending'
+                          AND d.requested_by IN ('manual', 'subscription')
+                     THEN 1 ELSE 0 END) as pending,
+                 SUM(CASE WHEN d.status = 'pending'
+                          AND (d.requested_by IS NULL
+                               OR d.requested_by NOT IN ('manual', 'subscription'))
+                     THEN 1 ELSE 0 END) as cataloged,
                  SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) as failed,
                  SUM(CASE WHEN d.status = 'unavailable' THEN 1 ELSE 0 END) as unavailable,
                  SUM(CASE WHEN d.status = 'unsupported' THEN 1 ELSE 0 END) as unsupported

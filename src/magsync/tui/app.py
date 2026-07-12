@@ -222,7 +222,14 @@ class MagSyncApp(App):
         table.clear()
         for issue in issues:
             status = issue.get("download_status", "pending")
-            if status == "unsupported":
+            # Never-requested rows are catalog entries, not queued work; they
+            # must not present as "pending". Selecting one for download marks
+            # it manual, at which point it renders normally.
+            if status not in ("complete", "downloading") and issue.get(
+                "requested_by"
+            ) not in ("manual", "subscription"):
+                status = "cataloged"
+            elif status == "unsupported":
                 status = "⊘ non-PDF"
             check = "☐"
             table.add_row(
@@ -285,6 +292,11 @@ class MagSyncApp(App):
         if not issues:
             self._update_status("No downloadable issues selected.")
             return
+
+        # Confirmed selection is explicit intent: promote to manual provenance
+        # (including strengthening 'subscription') so these rows survive a
+        # later unsubscribe and stay eligible for automatic and manual retry.
+        self.idx.mark_manual([i["id"] for i in issues])
 
         max_c = self.cfg.download.max_concurrent
         self._update_status(f"Downloading {len(issues)} issues (max {max_c} concurrent)...")

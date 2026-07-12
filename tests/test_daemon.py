@@ -93,9 +93,13 @@ def _add_issue(
             }
         ],
     )
-    return next(
+    issue_id = next(
         row["id"] for row in idx.get_issues() if row["page_url"] == page_url
     )
+    # Wanted (manual) provenance: cycle mechanics are exercised independently
+    # of subscription matching; intent scoping has dedicated tests.
+    idx.mark_manual([issue_id])
+    return issue_id
 
 
 def _blocked(message: str = "Source challenge blocked access") -> SourceResult:
@@ -407,7 +411,7 @@ async def test_local_cycle_failure_is_failed_and_reason_is_sanitized(
 ):
     idx = MagazineIndex(tmp_path / "index.db")
 
-    def broken_claim(**_kwargs):
+    def broken_claim(*_args, **_kwargs):
         raise RuntimeError(
             "database failed for https://storage.example/file?X-Amz-Signature=secret"
             "#fragment-secret"
