@@ -83,9 +83,18 @@ def test_on_complete_classifies_outcomes():
     console, buf = _capture_console()
     with _batch(console, 4) as out:
         out.on_complete({"title": "A"}, True, None)
-        out.on_complete({"title": "B"}, False, "LimeWire share link is unavailable (removed or expired)")
-        out.on_complete({"title": "C"}, False, "HTTP 500 transient")
-        out.on_complete({"title": "D"}, False, "Unsupported payload: The Economist Audio 06.6.2026.zip")
+        out.on_complete(
+            {"title": "B"}, False, "message claims transient",
+            DownloadFailureKind.SHARE_UNAVAILABLE,
+        )
+        out.on_complete(
+            {"title": "C"}, False, "message claims unavailable",
+            DownloadFailureKind.TRANSIENT,
+        )
+        out.on_complete(
+            {"title": "D"}, False, "generic display message",
+            DownloadFailureKind.UNSUPPORTED,
+        )
     assert out.counts == {"downloaded": 1, "unavailable": 1, "failed": 1, "unsupported": 1}
 
 
@@ -94,8 +103,8 @@ def test_summarize_reconciles_from_results_including_aborts():
     # download_batch's abort path returns failures WITHOUT firing callbacks.
     results = [
         {"issue": {}, "success": True},
-        {"issue": {}, "success": False, "error": "Encryption constants unavailable"},
-        {"issue": {}, "success": False, "error": "Encryption constants unavailable"},
+        {"issue": {}, "success": False, "failure_kind": DownloadFailureKind.CONFIGURATION},
+        {"issue": {}, "success": False, "failure_kind": DownloadFailureKind.INTERNAL},
     ]
     with _batch(console, 3) as out:
         pass  # no callbacks fired at all
@@ -108,10 +117,9 @@ def test_summarize_reconciles_from_results_including_aborts():
 def test_summary_and_labels_report_unsupported():
     console, buf = _capture_console()
     results = [
-        # Structured flag from batch results...
-        {"issue": {}, "success": False, "unsupported": True, "error": "Unsupported payload: a.zip"},
-        # ...and the error-text fallback for results without the flag.
-        {"issue": {}, "success": False, "error": "Unsupported payload: b.zip"},
+        {"issue": {}, "success": False, "failure_kind": DownloadFailureKind.UNSUPPORTED},
+        # The v0.5 structured boolean remains supported during migration.
+        {"issue": {}, "success": False, "unsupported": True},
         {"issue": {}, "success": True},
     ]
     with _batch(console, 3) as out:
@@ -123,11 +131,35 @@ def test_summary_and_labels_report_unsupported():
 
 def test_summary_reports_unavailable_count():
     console, buf = _capture_console()
-    results = [{"issue": {}, "success": False, "error": "share link is unavailable"} for _ in range(4)]
+    results = [
+        {
+            "issue": {},
+            "success": False,
+            "error": "message claims transient",
+            "failure_kind": DownloadFailureKind.SHARE_UNAVAILABLE,
+        }
+        for _ in range(4)
+    ]
     with _batch(console, 4) as out:
         pass
     out.summarize(results)
     assert "4 unavailable (dead links)" in buf.getvalue()
+
+
+def test_verbose_failure_output_redacts_external_credentials():
+    console, buf = _capture_console()
+    with _batch(console, 1, verbose=True) as out:
+        out.on_complete(
+            {"title": "Issue"},
+            False,
+            "GET https://storage.example/file?X-Amz-Credential=topsecret#rawkey",
+            DownloadFailureKind.TRANSIENT,
+        )
+
+    rendered = buf.getvalue()
+    assert "Issue" in rendered
+    assert "topsecret" not in rendered
+    assert "rawkey" not in rendered
 
 
 def test_non_tty_emits_throttled_lines_not_one_per_item():
@@ -191,7 +223,10 @@ def test_daemon_does_not_use_batch_output_helper():
 from typer.testing import CliRunner  # noqa: E402
 
 from magsync.core.index import MagazineIndex  # noqa: E402
-from magsync.core.models import DownloadResult, DownloadStatus  # noqa: E402
+from magsync.core.models import (  # noqa: E402
+    DownloadFailureKind,
+    DownloadStatus,
+)
 
 runner = CliRunner()
 
@@ -224,8 +259,18 @@ def test_retry_quiet_shows_summary_not_per_issue(tmp_path, monkeypatch):
         results = []
         for issue in issues:
             if on_complete:
-                on_complete(issue, False, "LimeWire share link is unavailable (removed or expired)")
-            results.append({"issue": issue, "success": False, "error": "share link is unavailable"})
+                on_complete(
+                    issue,
+                    False,
+                    "share unavailable",
+                    DownloadFailureKind.SHARE_UNAVAILABLE,
+                )
+            results.append({
+                "issue": issue,
+                "success": False,
+                "error": "share unavailable",
+                "failure_kind": DownloadFailureKind.SHARE_UNAVAILABLE,
+            })
         return results
 
     monkeypatch.setattr("magsync.core.batch.download_batch", fake_download_batch)
@@ -243,8 +288,18 @@ def test_retry_verbose_shows_per_issue(tmp_path, monkeypatch):
         results = []
         for issue in issues:
             if on_complete:
-                on_complete(issue, False, "LimeWire share link is unavailable (removed or expired)")
-            results.append({"issue": issue, "success": False, "error": "share link is unavailable"})
+                on_complete(
+                    issue,
+                    False,
+                    "share unavailable",
+                    DownloadFailureKind.SHARE_UNAVAILABLE,
+                )
+            results.append({
+                "issue": issue,
+                "success": False,
+                "error": "share unavailable",
+                "failure_kind": DownloadFailureKind.SHARE_UNAVAILABLE,
+            })
         return results
 
     monkeypatch.setattr("magsync.core.batch.download_batch", fake_download_batch)

@@ -4,6 +4,28 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-07-12
+
+### Added
+- Typed download and source failures now drive retry, refresh, persistence, summaries, CLI/TUI presentation, and daemon health without parsing human-readable error text.
+- Persisted due actions let the daemon retry exhausted transient downloads and source-only link refreshes in later cycles, including across restarts. `magsync retry` remains an atomic manual override scoped to the failed/unavailable rows present when the command starts.
+- A cycle-scoped freemagazines.top client reuses cookies and connections, globally paces search/detail/refresh requests, bounds detail concurrency, validates response origin/content, and opens a cycle circuit after a Cloudflare challenge.
+- Durable pipeline state records healthy, degraded, or failed cycles separately from the existing process-liveness heartbeat.
+
+### Changed
+- LimeWire SSR metadata is classified structurally as ready, removed, orphan-candidate, malformed, or undecodable. The narrow live-bucket/empty-content orphan signature receives exactly one fresh confirmation before it is parked as unavailable.
+- One orchestrator now owns each full LimeWire URL's bounded transient retry budget. Exact full URLs, including their fragments, are single-flighted within a batch; aliases retain independent database transitions and callbacks while sharing one physical result.
+- Link refresh returns explicit rotated, unchanged, no-link, source-blocked, or scrape-error outcomes. A blocked refresh remains scheduled as source-only work instead of re-requesting a known-dead share.
+- CLI and TUI searches distinguish validated empty results from blocked, transient, protocol, and partial-detail outcomes. Incomplete source operations exit nonzero in CLI commands, and the TUI preserves its previous results when the source fails.
+
+### Fixed
+- A LimeWire share with `ok:true`, a valid bucket, and an explicit empty `contentItemList` no longer burns repeated metadata-extraction retries for missing `content_item_id` and `ephemeral_public_key`.
+- One source-wide Cloudflare challenge no longer produces a request storm across every subscription or masquerades as an empty successful indexing cycle; cached due downloads continue and the cycle is reported degraded.
+- Unexpected organizer, database, scrape, and callback failures are isolated per issue so ordinary worker failures do not cancel unrelated downloads.
+
+### Security
+- External errors are sanitized and bounded before logging, callbacks, user output, or SQLite persistence. URL fragments and queries, authorization/cookie values, JWT/CSRF data, encryption keys, and presigned-storage credentials are redacted; daemon-mode `httpx`/`httpcore` request logging is suppressed.
+
 ## [0.5.0] - 2026-07-10
 
 Ends the permanent nightly failure loop on shares whose payload isn't a PDF (e.g. "The Economist Audio" ZIP editions), and hardens the resume path so a `.part` file can never again be corrupted by the server's own error responses. Diagnosed from a live NAS: two audio issues had been retried every cycle for days — each attempt appended a 633-byte storage-error body to an already-complete `.part` file (15–16 accumulated), re-ran constants self-healing (~30 LimeWire requests) twice, and re-decrypted 242 MB six times, for nothing.

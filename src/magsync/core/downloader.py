@@ -8,33 +8,59 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import logging
+import random
 import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from enum import Enum
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
-
-logger = logging.getLogger("magsync")
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives.keywrap import aes_key_unwrap
+from cryptography.hazmat.primitives.keywrap import InvalidUnwrap, aes_key_unwrap
 
 from magsync.config import LimeWireConstants, load_config, save_config
-from magsync.core.models import DownloadResult, LimeWireSession
+from magsync.core.diagnostics import sanitize_external_error
+from magsync.core.models import DownloadFailureKind, DownloadResult, LimeWireSession
+from magsync.core.policy import get_download_failure_policy
+from magsync.core.urls import URLValidationError, normalize_limewire_share_url
+
+logger = logging.getLogger("magsync")
 
 # Regex for finding UUIDs in SSR streaming data
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
-# Session establishment retries transient errors at least this many times even
-# when retry_attempts=0 — a transient SSR/infra hiccup is not a download failure.
-_MIN_SESSION_RETRIES = 2
-# Shared pause (seconds) when LimeWire signals a transient throttle.
-_SSR_THROTTLE_PAUSE = 20
+_DEFAULT_RETRY_AFTER_SECONDS = 30
+_MAX_RETRY_AFTER_SECONDS = 300
+
+
+class DownloadPipelineError(RuntimeError):
+    """Typed internal failure converted to :class:`DownloadResult` at the boundary."""
+
+    def __init__(
+        self,
+        kind: DownloadFailureKind,
+        message: str,
+        *,
+        retry_after: int | None = None,
+        immediate_retry: bool | None = None,
+    ) -> None:
+        self.kind = kind
+        self.retry_after = retry_after
+        # ``None`` delegates to the authoritative kind policy. ``False`` is
+        # reserved for a transient orphan-confirmation result: the one fresh
+        # confirmation is explicitly outside (and must not restart) the
+        # ordinary full-attempt retry budget.
+        self.immediate_retry = immediate_retry
+        super().__init__(sanitize_external_error(message))
 
 
 def _part_path_for(dest: Path, limewire_url: str) -> Path:
@@ -46,7 +72,8 @@ def _part_path_for(dest: Path, limewire_url: str) -> Path:
     masquerade as a stale-constants failure. Partials keyed to any other URL,
     and legacy un-fingerprinted ``<dest>.part`` files, are deleted here.
     """
-    fp = hashlib.sha256(limewire_url.encode("utf-8")).hexdigest()[:8]
+    identity = normalize_limewire_share_url(limewire_url)
+    fp = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
     part_path = dest.parent / f"{dest.name}.{fp}.part"
     if dest.parent.is_dir():
         for existing in dest.parent.iterdir():
@@ -68,7 +95,12 @@ def _cleanup_part(part_path: Path) -> None:
     try:
         part_path.unlink(missing_ok=True)
     except OSError as e:
-        logger.warning(f"Could not remove partial file {part_path}: {e}")
+        logger.warning(
+            "%s",
+            sanitize_external_error(
+                f"Could not remove partial file {part_path}: {e}"
+            ),
+        )
 
 
 # Share file-name extensions that can never be PDF payloads: skipped before any
@@ -129,11 +161,9 @@ def _content_range_total(value: str | None) -> int | None:
 
 def parse_limewire_url(url: str) -> tuple[str, str]:
     """Parse a LimeWire share URL into (sharing_id, fragment/passphrase)."""
-    parsed = urlparse(url)
-    sharing_id = parsed.path.split("/")[-1]
-    fragment = parsed.fragment
-    if not sharing_id or not fragment:
-        raise ValueError(f"Invalid LimeWire URL: {url}")
+    normalized = normalize_limewire_share_url(url)
+    path_and_fragment = normalized.removeprefix("https://limewire.com/d/")
+    sharing_id, fragment = path_and_fragment.split("#", 1)
     return sharing_id, fragment
 
 
@@ -256,48 +286,71 @@ def _find_key(obj, target):
     return None
 
 
+_MISSING = object()
+
+
+def _find_key_entry(obj, target) -> tuple[bool, object]:
+    """Return ``(present, value)`` without collapsing an explicit null to absent."""
+
+    if isinstance(obj, dict):
+        if target in obj:
+            return True, obj[target]
+        for value in obj.values():
+            present, found = _find_key_entry(value, target)
+            if present:
+                return True, found
+    elif isinstance(obj, list):
+        for value in obj:
+            present, found = _find_key_entry(value, target)
+            if present:
+                return True, found
+    return False, _MISSING
+
+
 # Sentinel distinguishing "share is removed" from "no decodable container".
 _REMOVED = object()
 
 
-def _extract_share_metadata(decoded):
-    """Pull share metadata from a decoded turbo-stream.
+class ShareMetadataState(str, Enum):
+    READY = "ready"
+    REMOVED = "removed"
+    ORPHAN_CANDIDATE = "orphan_candidate"
+    METADATA_INVALID = "metadata_invalid"
+    UNDECODABLE = "undecodable"
 
-    Returns a dict of metadata (``bucket_id`` from ``sharingBucket.id``,
-    ``content_item_id``/``ephemeral_public_key`` from ``contentItemList[0]``, the
-    passphrase-wrapped key from the ``fileEncryptionKeys`` entry matching the
-    content item's ``baseFileEncryptionKeyId``, plus file name/size), or
-    ``_REMOVED`` when the container is explicitly ``ok: false`` (a removed
-    share), or ``None`` when no usable container is found (absent or malformed —
-    never treated as removed, so a format drift can't misclassify a live share).
-    """
-    if decoded is None:
-        return None
-    container = _find_key(decoded, "sharingBucketContentData")
-    if not isinstance(container, dict) or "ok" not in container:
-        return None
-    if container["ok"] is False:
-        return _REMOVED
-    if container["ok"] is not True:
-        return None
-    value = container.get("value")
-    if not isinstance(value, dict):
-        return None
 
-    bucket = value.get("sharingBucket") or {}
-    items = value.get("contentItemList") or []
-    keys = value.get("fileEncryptionKeys") or []
-    item = items[0] if items else {}
+@dataclass(frozen=True)
+class ShareMetadataResult:
+    state: ShareMetadataState
+    metadata: dict | None = None
+    reason: str | None = None
 
+
+def _metadata_dict(
+    bucket: dict,
+    item: dict,
+    keys: list,
+    *,
+    require_key_match: bool = False,
+) -> dict:
     wrapped = None
-    if keys:
+    dict_keys = [key for key in keys if isinstance(key, dict)]
+    if dict_keys:
         base_key_id = item.get("baseFileEncryptionKeyId")
-        match = next((k for k in keys if k.get("id") == base_key_id), keys[0])
-        wrapped = match.get("passphraseWrappedPrivateKey")
+        match = None
+        if isinstance(base_key_id, str) and base_key_id:
+            match = next(
+                (key for key in dict_keys if key.get("id") == base_key_id),
+                None,
+            )
+        if match is None and not require_key_match:
+            match = dict_keys[0]
+        if match is not None:
+            wrapped = match.get("passphraseWrappedPrivateKey")
 
     size = bucket.get("totalFileSize")
     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
-        size = 0  # advisory only — a malformed SSR size must not drive decisions
+        size = 0
 
     return {
         "bucket_id": bucket.get("id"),
@@ -307,6 +360,100 @@ def _extract_share_metadata(decoded):
         "file_name": bucket.get("name") or "",
         "file_size": size,
     }
+
+
+def _extract_share_metadata_state(
+    decoded,
+    *,
+    sharing_id: str | None = None,
+) -> ShareMetadataResult:
+    """Classify and extract one decoded LimeWire share container by structure."""
+
+    if decoded is None:
+        return ShareMetadataResult(ShareMetadataState.UNDECODABLE, reason="no decoded stream")
+    present, container = _find_key_entry(decoded, "sharingBucketContentData")
+    if not present:
+        return ShareMetadataResult(ShareMetadataState.UNDECODABLE, reason="share container absent")
+    if not isinstance(container, dict) or "ok" not in container:
+        return ShareMetadataResult(ShareMetadataState.METADATA_INVALID, reason="share container malformed")
+    if container["ok"] is False:
+        return ShareMetadataResult(ShareMetadataState.REMOVED)
+    if container["ok"] is not True:
+        return ShareMetadataResult(ShareMetadataState.METADATA_INVALID, reason="invalid ok value")
+
+    value = container.get("value")
+    if not isinstance(value, dict):
+        return ShareMetadataResult(ShareMetadataState.METADATA_INVALID, reason="value is not an object")
+    bucket = value.get("sharingBucket")
+    if (
+        not isinstance(bucket, dict)
+        or not isinstance(bucket.get("id"), str)
+        or not bucket["id"]
+    ):
+        return ShareMetadataResult(ShareMetadataState.METADATA_INVALID, reason="sharing bucket is invalid")
+
+    if "contentItemList" not in value or not isinstance(value.get("contentItemList"), list):
+        return ShareMetadataResult(ShareMetadataState.METADATA_INVALID, reason="content item list is absent or invalid")
+    items = value["contentItemList"]
+    raw_keys = value.get("fileEncryptionKeys")
+    keys = raw_keys if isinstance(raw_keys, list) else []
+
+    if items == []:
+        return ShareMetadataResult(
+            ShareMetadataState.ORPHAN_CANDIDATE,
+            metadata=_metadata_dict(bucket, {}, keys),
+            reason="content item list is explicitly empty",
+        )
+
+    require_wrapped_key = sharing_id is not None and not _is_uuid(sharing_id)
+    item = None
+    metadata = None
+    for candidate in items:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = candidate.get("id")
+        ephemeral_key = candidate.get("ephemeralPublicKey")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            continue
+        if not isinstance(ephemeral_key, str) or not ephemeral_key:
+            continue
+        candidate_metadata = _metadata_dict(
+            bucket,
+            candidate,
+            keys,
+            require_key_match=require_wrapped_key,
+        )
+        wrapped_key = candidate_metadata.get("passphrase_wrapped_pk")
+        if require_wrapped_key and (
+            not isinstance(wrapped_key, str) or not wrapped_key
+        ):
+            continue
+        item = candidate
+        metadata = candidate_metadata
+        break
+
+    if item is None or metadata is None:
+        partial = next((candidate for candidate in items if isinstance(candidate, dict)), {})
+        return ShareMetadataResult(
+            ShareMetadataState.METADATA_INVALID,
+            metadata=_metadata_dict(bucket, partial, keys),
+            reason="no usable content item",
+        )
+    return ShareMetadataResult(
+        ShareMetadataState.READY,
+        metadata=metadata,
+    )
+
+
+def _extract_share_metadata(decoded):
+    """Compatibility wrapper around the discriminated structural extractor."""
+
+    result = _extract_share_metadata_state(decoded)
+    if result.state is ShareMetadataState.REMOVED:
+        return _REMOVED
+    if result.state is ShareMetadataState.UNDECODABLE:
+        return None
+    return result.metadata
 
 
 def _extract_ssr_metadata_regex(html: str, sharing_id: str) -> dict:
@@ -334,81 +481,164 @@ def _extract_ssr_metadata_regex(html: str, sharing_id: str) -> dict:
     }
 
 
+async def _fetch_share_page(
+    client: httpx.AsyncClient,
+    sharing_id: str,
+) -> tuple[str, ShareMetadataResult]:
+    """Fetch and structurally classify one physical LimeWire share response."""
+
+    try:
+        resp = await client.get(f"https://limewire.com/d/{sharing_id}")
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"LimeWire share request failed: {exc}",
+        ) from exc
+
+    if resp.status_code in (404, 410):
+        raise DownloadPipelineError(
+            DownloadFailureKind.SHARE_UNAVAILABLE,
+            "LimeWire share link is unavailable (removed or expired)",
+        )
+    if resp.status_code in (408, 425, 429) or resp.status_code >= 500:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"LimeWire share request returned HTTP {resp.status_code}",
+            retry_after=_parse_retry_after(resp) if resp.status_code == 429 else None,
+        )
+    if resp.status_code in (401, 403):
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"LimeWire share access returned HTTP {resp.status_code}",
+        )
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise DownloadPipelineError(
+            DownloadFailureKind.INTERNAL,
+            f"LimeWire share request returned HTTP {resp.status_code}",
+        ) from exc
+
+    html = resp.text
+    logger.debug(
+        "LimeWire page response: %s, %s bytes, sharing_id=%s",
+        resp.status_code,
+        len(html),
+        sharing_id,
+    )
+    state = _extract_share_metadata_state(
+        _decode_react_stream(html),
+        sharing_id=sharing_id,
+    )
+    if _is_removed_share(html) or state.state is ShareMetadataState.REMOVED:
+        logger.info(
+            "LimeWire SSR: removed/sanitized share "
+            "(sharing_id=%s, %s bytes) — link is dead",
+            sharing_id,
+            len(html),
+        )
+        raise DownloadPipelineError(
+            DownloadFailureKind.SHARE_UNAVAILABLE,
+            "LimeWire share link is unavailable (removed or expired)",
+        )
+    if "Unexpected Server Error" in html:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            "LimeWire SSR returned transient server error",
+        )
+    return html, state
+
+
 async def establish_session(
     limewire_url: str,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> LimeWireSession:
-    """Establish a LimeWire session by visiting a share page.
+    """Establish one typed LimeWire session, with one orphan confirmation only."""
 
-    Extracts JWT, CSRF token, and SSR metadata from the page response.
-    """
     sharing_id, _ = parse_limewire_url(limewire_url)
-
     should_close = client is None
     if client is None:
-        client = httpx.AsyncClient(follow_redirects=True, timeout=60.0, headers={"User-Agent": "Mozilla/5.0"})
+        client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=60.0,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
 
     try:
-        resp = await client.get(f"https://limewire.com/d/{sharing_id}")
-        resp.raise_for_status()
-        html = resp.text
-        logger.debug(f"LimeWire page response: {resp.status_code}, {len(html)} bytes, sharing_id={sharing_id}")
+        html, state = await _fetch_share_page(client, sharing_id)
 
-        # Classify SSR errors BEFORE extracting JWT/CSRF, so a removed page that
-        # omits the auth cookie is still classified correctly. Order matters:
-        #   Permanent: a removed/sanitized share, caught two ways — the raw-HTML
-        #     fast path, then a structural backstop (decoded container ok:false)
-        #     for markers that fall outside the raw detector's window. Removed
-        #     must take precedence over the generic transient message.
-        #   Transient: "Unexpected Server Error" with no removed marker — SSR
-        #     backend hiccup (rate limit, bot challenge, datacenter IP). Retry.
-        decoded = _decode_react_stream(html)
-        meta = _extract_share_metadata(decoded)
-        if _is_removed_share(html) or meta is _REMOVED:
-            # INFO, not ERROR: a removed share is an expected outcome during bulk
-            # retries (the raise below carries the failure). Interactive commands
-            # hide INFO by default; the daemon (INFO) still logs it.
-            logger.info(
-                f"LimeWire SSR: removed/sanitized share "
-                f"(sharing_id={sharing_id}, {len(html)} bytes) — link is dead"
+        if state.state is ShareMetadataState.ORPHAN_CANDIDATE:
+            try:
+                confirm_html, confirmed = await _fetch_share_page(client, sharing_id)
+            except DownloadPipelineError as exc:
+                if exc.kind is not DownloadFailureKind.TRANSIENT:
+                    raise
+                raise DownloadPipelineError(
+                    DownloadFailureKind.TRANSIENT,
+                    "LimeWire orphan confirmation failed transiently",
+                    retry_after=exc.retry_after,
+                    immediate_retry=False,
+                ) from exc
+            if confirmed.state is ShareMetadataState.ORPHAN_CANDIDATE:
+                raise DownloadPipelineError(
+                    DownloadFailureKind.SHARE_UNAVAILABLE,
+                    "LimeWire share content is unavailable (orphaned content item)",
+                )
+            if confirmed.state is not ShareMetadataState.READY:
+                raise DownloadPipelineError(
+                    DownloadFailureKind.METADATA_INVALID,
+                    "LimeWire orphan confirmation returned malformed metadata",
+                )
+            html, state = confirm_html, confirmed
+        elif state.state is ShareMetadataState.METADATA_INVALID:
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                f"Invalid LimeWire SSR metadata: {state.reason or 'unknown structure'}",
             )
-            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
-        if "Unexpected Server Error" in html:
-            logger.warning(
-                f"LimeWire SSR: transient 'Unexpected Server Error' "
-                f"(sharing_id={sharing_id}, {len(html)} bytes)"
+
+        if state.state is ShareMetadataState.UNDECODABLE:
+            meta = _extract_ssr_metadata_regex(html, sharing_id)
+        elif state.state is ShareMetadataState.READY:
+            meta = state.metadata or {}
+        else:  # removed is raised in _fetch_share_page; orphan handled above
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                f"Unexpected LimeWire SSR state: {state.state.value}",
             )
-            raise RuntimeError("LimeWire SSR returned transient server error")
 
         jwt_token = client.cookies.get("production_access_token")
         if not jwt_token:
-            raise RuntimeError("Failed to obtain JWT from LimeWire")
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                "Failed to obtain LimeWire session token",
+            )
+        try:
+            payload_b64 = jwt_token.split(".")[1] + "==="
+            jwt_payload = json.loads(base64.b64decode(payload_b64))
+            csrf_token = jwt_payload["csrfToken"]
+        except (IndexError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "Invalid LimeWire session token metadata",
+            ) from exc
 
-        # Decode JWT payload to get CSRF token
-        payload_b64 = jwt_token.split(".")[1] + "==="
-        jwt_payload = json.loads(base64.b64decode(payload_b64))
-        csrf_token = jwt_payload["csrfToken"]
-
-        # Structural extraction from the turbo-stream. Fall back to the legacy
-        # regex path ONLY when no container decoded (whole SSR format changed) —
-        # never let it substitute ids for a present-but-incomplete stream, since
-        # the regex path matches the wrong (decoy) UUIDs on the current format.
-        if meta is None:
-            meta = _extract_ssr_metadata_regex(html, sharing_id)
-
-        # UUID-format shares keep sharing_id as the bucket (current behavior);
-        # short-ID shares use the decoded sharingBucket.id.
         if _is_uuid(sharing_id):
             meta["bucket_id"] = sharing_id
 
-        # Required ids; the passphrase-wrapped key is required only on the
-        # short-ID (passphrase) path — UUID shares derive from the raw fragment.
-        missing = [f for f in ("bucket_id", "content_item_id", "ephemeral_public_key") if not meta.get(f)]
+        missing = [
+            field
+            for field in ("bucket_id", "content_item_id", "ephemeral_public_key")
+            if not meta.get(field)
+        ]
         if not _is_uuid(sharing_id) and not meta.get("passphrase_wrapped_pk"):
             missing.append("passphrase_wrapped_pk")
         if missing:
-            raise RuntimeError(f"Failed to extract SSR metadata from LimeWire page (missing: {', '.join(missing)})")
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "Failed to extract LimeWire SSR metadata "
+                f"(missing: {', '.join(missing)})",
+            )
 
         return LimeWireSession(
             jwt_token=jwt_token,
@@ -491,25 +721,64 @@ async def get_download_url(
         client = httpx.AsyncClient(follow_redirects=True, timeout=60.0, headers={"User-Agent": "Mozilla/5.0"})
 
     try:
-        resp = await client.post(
-            f"https://api.limewire.com/sharing/download/{session.bucket_id}",
-            headers={
-                "X-CSRF-Token": session.csrf_token,
-                "Authorization": f"Bearer {session.jwt_token}",
-                "Content-Type": "application/json",
-            },
-            json={"contentItems": [{"id": session.content_item_id}]},
-        )
-        # A 404 here means the bucket no longer exists → the share is gone.
-        # Treat as permanent (UNAVAILABLE) rather than a retryable HTTP error.
-        if resp.status_code == 404:
-            raise RuntimeError("LimeWire share link is unavailable (removed or expired)")
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = await client.post(
+                f"https://api.limewire.com/sharing/download/{session.bucket_id}",
+                headers={
+                    "X-CSRF-Token": session.csrf_token,
+                    "Authorization": f"Bearer {session.jwt_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"contentItems": [{"id": session.content_item_id}]},
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                f"LimeWire download API request failed: {exc}",
+            ) from exc
+        if resp.status_code in (404, 410):
+            raise DownloadPipelineError(
+                DownloadFailureKind.SHARE_UNAVAILABLE,
+                "LimeWire share link is unavailable (removed or expired)",
+            )
+        if resp.status_code in (401, 403, 408, 425, 429) or resp.status_code >= 500:
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                f"LimeWire download API returned HTTP {resp.status_code}",
+                retry_after=_parse_retry_after(resp) if resp.status_code == 429 else None,
+            )
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except (httpx.HTTPStatusError, ValueError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.INTERNAL,
+                f"Invalid LimeWire download API response (HTTP {resp.status_code})",
+            ) from exc
+        if not isinstance(data, dict):
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "Malformed LimeWire download API response",
+            )
         items = data.get("contentItems", [])
-        if not items:
-            raise RuntimeError("No download URLs returned from LimeWire API")
-        return items[0]["downloadUrl"]
+        if not isinstance(items, list) or not items:
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "No download URLs returned from LimeWire API",
+            )
+        try:
+            download_url = items[0]["downloadUrl"]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "Malformed LimeWire download URL response",
+            ) from exc
+        if not isinstance(download_url, str) or not download_url:
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "Malformed LimeWire download URL response",
+            )
+        return download_url
     finally:
         if should_close:
             await client.aclose()
@@ -526,36 +795,40 @@ def decrypt_file(encrypted_data: bytes, aes_key: bytes, constants: LimeWireConst
     return decryptor.update(encrypted_data) + decryptor.finalize()
 
 
-# Errors that should not be retried (permanent failures).
-# Keep this limited to genuinely dead/removed links; decryption problems can be
-# caused by stale LimeWire constants or other transient app-side issues.
-_PERMANENT_ERRORS = (
-    "share link is unavailable",
-)
+def _validate_crypto_constants(constants: LimeWireConstants) -> None:
+    """Reject malformed configured constants before entering opaque crypto code."""
 
-
-def _is_permanent_error(error: str) -> bool:
-    return any(msg in error for msg in _PERMANENT_ERRORS)
+    if (
+        isinstance(constants.pbkdf2_iterations, bool)
+        or not isinstance(constants.pbkdf2_iterations, int)
+        or constants.pbkdf2_iterations <= 0
+    ):
+        raise DownloadPipelineError(
+            DownloadFailureKind.CONFIGURATION,
+            "LimeWire PBKDF2 iteration configuration is invalid",
+        )
+    for label, value in (
+        ("sharing salt", constants.sharing_salt_b64),
+        ("file IV", constants.file_iv_b64),
+    ):
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, TypeError, ValueError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.CONFIGURATION,
+                f"LimeWire {label} configuration is invalid",
+            ) from exc
+        if not decoded or (label == "file IV" and len(decoded) > 16):
+            raise DownloadPipelineError(
+                DownloadFailureKind.CONFIGURATION,
+                f"LimeWire {label} configuration is invalid",
+            )
 
 
 # Deterministic decryption failure: the attempt already re-tried the same bytes
-# with freshly-extracted constants, so in-process retries cannot change it.
-# Status stays FAILED — the next daily cycle re-attempts cheaply (one ranged
-# probe + a local decrypt, since the .part is kept).
+# with freshly-extracted constants, so in-process retries cannot change it. The
+# typed failure policy parks it until manual retry or validated link rotation.
 _DECRYPT_FAILED_MSG = "Decryption failed even after refreshing constants. See UPDATE_KEYS.md."
-
-
-def _is_no_retry_error(error: str) -> bool:
-    return "Decryption failed even after refreshing constants" in error
-
-
-def _is_unsupported_error(error: str) -> bool:
-    """True when the error text marks a live-but-non-PDF payload.
-
-    Display layers (output.py, daemon logs) only see the error string; control
-    flow uses ``DownloadResult.unsupported``.
-    """
-    return "Unsupported payload" in error
 
 
 async def _establish_session_with_retry(
@@ -564,31 +837,10 @@ async def _establish_session_with_retry(
     retries: int = 2,
     rate_gate: "RateLimitGate | None" = None,
 ) -> LimeWireSession:
-    """Establish a LimeWire session, retrying transient errors.
+    """Compatibility shim; the outer typed orchestrator owns all retries."""
 
-    Transient errors (SSR throttle, 429/5xx) are retried at least
-    ``_MIN_SESSION_RETRIES`` times even when ``retries`` is 0 — a transient
-    session/infra hiccup is not a download failure, so download-level
-    ``retry_attempts`` semantics do not apply here. When a shared rate-limit
-    gate is provided, a transient failure pauses all concurrent downloads
-    before retrying instead of sleeping per-worker.
-    """
-    total = max(retries, _MIN_SESSION_RETRIES) + 1
-    for attempt in range(1, total + 1):
-        try:
-            return await establish_session(limewire_url, client=client)
-        except (RuntimeError, httpx.HTTPStatusError) as e:
-            is_transient = (
-                (isinstance(e, RuntimeError) and "transient" in str(e))
-                or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 500, 502, 503, 504))
-            )
-            if not is_transient or attempt == total:
-                raise
-            logger.info(f"Session attempt {attempt}/{total} failed ({e}); pausing then retrying...")
-            if rate_gate is not None:
-                await rate_gate.trigger(_SSR_THROTTLE_PAUSE, reason="LimeWire throttle (transient SSR)")
-            else:
-                await asyncio.sleep(5 * attempt)  # 5s, 10s
+    del retries, rate_gate
+    return await establish_session(limewire_url, client=client)
 
 
 class RateLimitGate:
@@ -616,15 +868,24 @@ class RateLimitGate:
         pause rather than being ignored, and the gate always reopens even if
         this task is cancelled mid-pause.
         """
+        bounded_retry_after = min(
+            max(int(retry_after), 1),
+            _MAX_RETRY_AFTER_SECONDS,
+        )
         now = asyncio.get_running_loop().time()
-        self._deadline = max(self._deadline, now + max(retry_after, 1))
+        self._deadline = max(self._deadline, now + bounded_retry_after)
         if self._lock.locked():
             # Another task is already pausing; the deadline was extended above.
             await self._ready.wait()
             return
         async with self._lock:
             self._ready.clear()
-            logger.warning(f"{reason}. Pausing all downloads...")
+            logger.warning(
+                "%s",
+                sanitize_external_error(
+                    f"{reason}. Pausing all downloads..."
+                ),
+            )
             try:
                 while True:
                     remaining = self._deadline - asyncio.get_running_loop().time()
@@ -649,12 +910,22 @@ def get_rate_limit_gate() -> RateLimitGate:
 
 
 def _parse_retry_after(response: httpx.Response) -> int:
-    """Parse Retry-After header, defaulting to 30 seconds."""
-    header = response.headers.get("retry-after", "")
+    """Parse and bound Retry-After seconds or HTTP-date values."""
+
+    header = response.headers.get("retry-after", "").strip()
     try:
-        return max(int(header), 1)
+        seconds = int(header)
     except (ValueError, TypeError):
-        return 30
+        try:
+            retry_at = parsedate_to_datetime(header)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            seconds = int(
+                (retry_at - datetime.now(timezone.utc)).total_seconds()
+            )
+        except (TypeError, ValueError, OverflowError):
+            seconds = _DEFAULT_RETRY_AFTER_SECONDS
+    return min(max(seconds, 1), _MAX_RETRY_AFTER_SECONDS)
 
 
 async def download_and_decrypt(
@@ -674,65 +945,85 @@ async def download_and_decrypt(
 
     Returns a DownloadResult with success status and file path.
     """
+    try:
+        normalized_url = normalize_limewire_share_url(limewire_url)
+    except (TypeError, URLValidationError) as exc:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.CONFIGURATION,
+            error=sanitize_external_error(f"Invalid LimeWire share URL: {exc}"),
+        )
+
     if constants is None:
-        cfg = load_config()
+        try:
+            cfg = load_config()
+        except (OSError, TypeError, ValueError) as exc:
+            return DownloadResult(
+                success=False,
+                failure_kind=DownloadFailureKind.CONFIGURATION,
+                error=sanitize_external_error(f"Could not load download configuration: {exc}"),
+            )
         constants = cfg.limewire
         if retry_attempts is None:
             retry_attempts = cfg.download.retry_attempts
     if retry_attempts is None:
         retry_attempts = 2
+    if isinstance(retry_attempts, bool) or not isinstance(retry_attempts, int):
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.CONFIGURATION,
+            error="download retry_attempts must be an integer",
+        )
     if rate_gate is None:
         rate_gate = get_rate_limit_gate()
 
-    total = retry_attempts + 1  # 1 initial attempt + retry_attempts retries
-    last_error = ""
+    total = max(retry_attempts, 0) + 1
+    last_result: DownloadResult | None = None
     for attempt in range(1, total + 1):
-        # Wait if a 429 pause is active
         await rate_gate.wait()
 
         result = await _download_and_decrypt_once(
-            limewire_url, dest, constants=constants, on_progress=on_progress,
+            normalized_url, dest, constants=constants, on_progress=on_progress,
             rate_gate=rate_gate, retry_attempts=retry_attempts,
         )
+        result.attempt_count = attempt
         if result.success:
             return result
-
-        last_error = result.error or "Unknown error"
-
-        if result.unsupported:
-            # Terminal by policy: a live share with a non-PDF payload. No retry
-            # (and no constants refresh) can change what the payload is.
-            logger.info(f"Unsupported payload (no retry): {last_error}")
+        last_result = result
+        policy = get_download_failure_policy(
+            result.failure_kind or DownloadFailureKind.INTERNAL
+        )
+        immediate_retry = policy.immediate_retry and getattr(
+            result,
+            "_immediate_retry_allowed",
+            True,
+        )
+        if not immediate_retry or attempt >= total:
+            logger.log(
+                policy.log_level,
+                "%s after %s attempt(s): %s",
+                (result.failure_kind or DownloadFailureKind.INTERNAL).value,
+                attempt,
+                result.error or "Unknown error",
+            )
             return result
 
-        if _is_no_retry_error(last_error):
-            # Deterministic for this run: the attempt already re-tried the same
-            # bytes with freshly-extracted constants.
-            logger.error(f"Giving up without retry: {last_error}")
-            return result
+        delay = (2 ** attempt) + random.uniform(0.0, 0.25)
+        logger.warning(
+            "Attempt %s/%s failed (%s): %s. Retrying in %.2fs...",
+            attempt,
+            total,
+            result.failure_kind.value,
+            result.error or "Unknown error",
+            delay,
+        )
+        await asyncio.sleep(delay)
 
-        if _is_permanent_error(last_error):
-            # INFO: safe only while _PERMANENT_ERRORS is dead-link-only (a dead
-            # link during bulk work is expected, not exceptional). If a new
-            # permanent-error string is added, re-check whether it should log
-            # louder here.
-            logger.info(f"Permanent error (no retry): {last_error}")
-            return result
-
-        # 429 is handled inside _download_and_decrypt_once via the gate,
-        # but we still retry the attempt
-        if "429" in last_error or "rate limit" in last_error.lower():
-            logger.info(f"Retrying after rate limit (attempt {attempt}/{total})...")
-            continue
-
-        if attempt < total:
-            delay = 2 ** attempt  # 2s, 4s, 8s, ...
-            logger.warning(f"Attempt {attempt}/{total} failed: {last_error}. Retrying in {delay}s...")
-            await asyncio.sleep(delay)
-        else:
-            logger.error(f"All {total} attempts failed: {last_error}")
-
-    return DownloadResult(success=False, error=f"Failed after {total} attempts: {last_error}")
+    return last_result or DownloadResult(
+        success=False,
+        failure_kind=DownloadFailureKind.INTERNAL,
+        error="Download attempt produced no result",
+    )
 
 
 async def _download_and_decrypt_once(
@@ -749,15 +1040,70 @@ async def _download_and_decrypt_once(
         return await _do_download(limewire_url, dest, constants=constants,
                                   on_progress=on_progress, rate_gate=rate_gate,
                                   retry_attempts=retry_attempts)
+    except DownloadPipelineError as e:
+        if e.kind is DownloadFailureKind.TRANSIENT and e.retry_after and rate_gate:
+            await rate_gate.trigger(e.retry_after, reason="LimeWire transient throttle")
+        result = DownloadResult(
+            success=False,
+            failure_kind=e.kind,
+            error=sanitize_external_error(str(e)),
+        )
+        if e.immediate_retry is not None:
+            result._immediate_retry_allowed = e.immediate_retry
+        return result
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
+        status = e.response.status_code
+        if status == 429:
             retry_after = _parse_retry_after(e.response)
             if rate_gate:
                 await rate_gate.trigger(retry_after)
-            return DownloadResult(success=False, error=f"429 rate limited (retry-after: {retry_after}s)")
-        return DownloadResult(success=False, error=f"HTTP {e.response.status_code}: {e}")
+            return DownloadResult(
+                success=False,
+                failure_kind=DownloadFailureKind.TRANSIENT,
+                error=f"HTTP 429 rate limited (retry-after: {retry_after}s)",
+            )
+        # At this boundary an unhandled HTTP status originates from object
+        # storage. Its 404/410 and auth statuses describe an expiring presigned
+        # request, not the LimeWire share lifecycle; a fresh full attempt may
+        # obtain a new URL. Share/API 404/410 are classified earlier.
+        kind = (
+            DownloadFailureKind.TRANSIENT
+            if status in (401, 403, 404, 408, 410, 425) or status >= 500
+            else DownloadFailureKind.INTERNAL
+        )
+        return DownloadResult(
+            success=False,
+            failure_kind=kind,
+            error=sanitize_external_error(
+                f"HTTP {status} from storage"
+            ),
+        )
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.TRANSIENT,
+            error=sanitize_external_error(f"External transport failure: {e}"),
+        )
+    except URLValidationError as e:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.CONFIGURATION,
+            error=sanitize_external_error(f"Invalid LimeWire share URL: {e}"),
+        )
     except RuntimeError as e:
-        return DownloadResult(success=False, error=str(e))
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error=sanitize_external_error(str(e)),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error=sanitize_external_error(f"Unexpected download failure: {e}"),
+        )
 
 
 async def _do_download(
@@ -785,16 +1131,25 @@ async def _do_download(
                     cfg.limewire = constants
                     save_config(cfg)
                     logger.info("Encryption constants saved to config")
-                except OSError:
+                except (OSError, TypeError, ValueError):
                     logger.info("Config is read-only — constants will be used in memory only")
             else:
                 return DownloadResult(
                     success=False,
+                    failure_kind=DownloadFailureKind.CONFIGURATION,
                     error="No encryption constants configured and auto-extraction failed. See UPDATE_KEYS.md.",
                 )
+        _validate_crypto_constants(constants)
 
-        # Establish session (retry transient SSR errors with backoff)
-        session = await _establish_session_with_retry(limewire_url, client, retries=retry_attempts, rate_gate=rate_gate)
+        # The outer typed orchestrator owns the one retry budget. Session
+        # establishment itself performs one physical attempt (plus the one
+        # narrowly-scoped orphan confirmation when applicable).
+        session = await _establish_session_with_retry(
+            limewire_url,
+            client,
+            retries=retry_attempts,
+            rate_gate=rate_gate,
+        )
 
         # Payload gate: a share whose file name has a known non-PDF extension
         # is skipped before key derivation, .part preparation, and the
@@ -804,21 +1159,31 @@ async def _do_download(
         suffix = Path(session.file_name).suffix.lower() if session.file_name else ""
         if suffix in _NON_PDF_EXTENSIONS:
             _cleanup_part(_part_path_for(dest, limewire_url))
-            logger.info(f"Unsupported payload (non-PDF): {session.file_name} — skipping")
+            error = sanitize_external_error(
+                f"Unsupported payload: {session.file_name}"
+            )
+            logger.info("%s — skipping", error)
             return DownloadResult(
                 success=False,
+                failure_kind=DownloadFailureKind.UNSUPPORTED,
                 unsupported=True,
-                error=f"Unsupported payload: {session.file_name}",
+                error=error,
             )
 
         # Derive key
-        aes_key = derive_aes_key(
-            sharing_id,
-            fragment,
-            session.passphrase_wrapped_pk,
-            session.ephemeral_public_key,
-            constants,
-        )
+        try:
+            aes_key = derive_aes_key(
+                sharing_id,
+                fragment,
+                session.passphrase_wrapped_pk,
+                session.ephemeral_public_key,
+                constants,
+            )
+        except (binascii.Error, InvalidUnwrap, TypeError, ValueError, OverflowError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.DECRYPTION_FAILED,
+                "Could not derive the LimeWire decryption key",
+            ) from exc
 
         # Prepare .part file for resumable download (keyed to this URL; stale
         # partials from a different/rotated link are removed)
@@ -857,6 +1222,7 @@ async def _do_download(
                 else:
                     return DownloadResult(
                         success=False,
+                        failure_kind=DownloadFailureKind.TRANSIENT,
                         error=(
                             f"HTTP 416 but completeness unverifiable (local "
                             f"{existing_bytes:,} bytes, Content-Range total "
@@ -871,7 +1237,8 @@ async def _do_download(
                         # would splice ciphertext into garbage.
                         return DownloadResult(
                             success=False,
-                            error=(
+                            failure_kind=DownloadFailureKind.TRANSIENT,
+                            error=sanitize_external_error(
                                 f"Resume offset mismatch (requested {existing_bytes}, "
                                 f"Content-Range {stream.headers.get('content-range')!r})"
                             ),
@@ -894,8 +1261,20 @@ async def _do_download(
                             on_progress(total_downloaded, effective_total or session.file_size)
             else:
                 # Error bodies must never reach the .part file.
-                stream.raise_for_status()
-                return DownloadResult(success=False, error=f"Unexpected HTTP {status} from storage")
+                if status in (401, 403, 404, 408, 410, 425, 429) or status >= 500:
+                    raise DownloadPipelineError(
+                        DownloadFailureKind.TRANSIENT,
+                        f"Storage request returned HTTP {status}",
+                        retry_after=(
+                            _parse_retry_after(stream)
+                            if status == 429
+                            else None
+                        ),
+                    )
+                raise DownloadPipelineError(
+                    DownloadFailureKind.INTERNAL,
+                    f"Storage request returned HTTP {status}",
+                )
 
         part_size = part_path.stat().st_size if part_path.exists() else 0
         if effective_total <= 0:
@@ -913,6 +1292,7 @@ async def _do_download(
             # so validation and self-healing must not run.
             return DownloadResult(
                 success=False,
+                failure_kind=DownloadFailureKind.TRANSIENT,
                 error=f"incomplete download ({part_size:,} of {effective_total:,} bytes)",
             )
         if not streamed and on_progress:
@@ -921,7 +1301,13 @@ async def _do_download(
         # Read exactly the object's bytes and decrypt (anything beyond
         # effective_total can never reach the output or the dedup hash)
         encrypted_data = part_path.read_bytes()[:effective_total]
-        decrypted = decrypt_file(encrypted_data, aes_key, constants)
+        try:
+            decrypted = decrypt_file(encrypted_data, aes_key, constants)
+        except (binascii.Error, TypeError, ValueError, OverflowError) as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.DECRYPTION_FAILED,
+                "Could not decrypt the LimeWire payload",
+            ) from exc
 
         # Classify: a known non-PDF signature means decryption WORKED but the
         # payload is unwanted — terminal, self-healing cannot change it. Only
@@ -933,22 +1319,36 @@ async def _do_download(
             if not new_constants:
                 return DownloadResult(
                     success=False,
+                    failure_kind=DownloadFailureKind.DECRYPTION_FAILED,
                     error="Decryption produced invalid output and could not auto-extract new constants.",
                 )
-            aes_key = derive_aes_key(
-                sharing_id,
-                fragment,
-                session.passphrase_wrapped_pk,
-                session.ephemeral_public_key,
-                new_constants,
-            )
-            decrypted = decrypt_file(encrypted_data, aes_key, new_constants)
+            try:
+                _validate_crypto_constants(new_constants)
+                aes_key = derive_aes_key(
+                    sharing_id,
+                    fragment,
+                    session.passphrase_wrapped_pk,
+                    session.ephemeral_public_key,
+                    new_constants,
+                )
+                decrypted = decrypt_file(encrypted_data, aes_key, new_constants)
+            except DownloadPipelineError:
+                raise
+            except (binascii.Error, InvalidUnwrap, TypeError, ValueError, OverflowError) as exc:
+                raise DownloadPipelineError(
+                    DownloadFailureKind.DECRYPTION_FAILED,
+                    "Could not decrypt with refreshed LimeWire constants",
+                ) from exc
             verdict = _classify_payload(decrypted[:16])
             if verdict == "unknown":
                 # Keep the .part: it is size-consistent (junk-free up to
                 # effective_total), so the next attempt costs one ranged probe
                 # plus a local decrypt — not a full re-download.
-                return DownloadResult(success=False, error=_DECRYPT_FAILED_MSG)
+                return DownloadResult(
+                    success=False,
+                    failure_kind=DownloadFailureKind.DECRYPTION_FAILED,
+                    error=_DECRYPT_FAILED_MSG,
+                )
             if verdict == "pdf":
                 logger.info("Self-healing successful — decryption now valid")
                 try:
@@ -956,7 +1356,7 @@ async def _do_download(
                     cfg.limewire = new_constants
                     save_config(cfg)
                     logger.info("Updated constants saved to config")
-                except OSError:
+                except (OSError, TypeError, ValueError):
                     # Config may be read-only (e.g., Docker :ro mount).
                     # Keep new constants in memory — they'll be used for
                     # remaining downloads this session but won't survive restart.
@@ -964,11 +1364,13 @@ async def _do_download(
         if verdict == "unsupported":
             _cleanup_part(part_path)
             name = session.file_name or dest.name
-            logger.info(f"Unsupported payload (non-PDF content): {name} — skipping")
+            error = sanitize_external_error(f"Unsupported payload: {name}")
+            logger.info("%s — skipping", error)
             return DownloadResult(
                 success=False,
+                failure_kind=DownloadFailureKind.UNSUPPORTED,
                 unsupported=True,
-                error=f"Unsupported payload: {name}",
+                error=error,
             )
 
         # Compute content hash for deduplication
@@ -1036,7 +1438,7 @@ async def auto_extract_constants(
         if not file_iv:
             logger.error("  Failed to extract file IV from service worker")
             return None
-        logger.info(f"  Extracted file IVs from service worker")
+        logger.info("  Extracted file IVs from service worker")
 
         # Step 2: Get the main page to find chunk URLs
         logger.info("  Fetching LimeWire homepage for JS chunks...")
@@ -1071,11 +1473,22 @@ async def auto_extract_constants(
                     if extracted_salt:
                         salt_b64 = extracted_salt
                         sharing_iv = _extract_js_string(chunk_text, "ivBase64")
-                        logger.info(f"  Found salt in chunk {chunks_searched}/{len(chunk_urls)}: {chunk_path}")
+                        logger.info(
+                            "  %s",
+                            sanitize_external_error(
+                                "Found salt in chunk "
+                                f"{chunks_searched}/{len(chunk_urls)}: {chunk_path}"
+                            ),
+                        )
                         break
                     # Chunk contains saltBase64 as a reference, not a value — keep searching
             except httpx.HTTPError as e:
-                logger.debug(f"  Chunk fetch failed: {chunk_path}: {e}")
+                logger.debug(
+                    "  %s",
+                    sanitize_external_error(
+                        f"Chunk fetch failed: {chunk_path}: {e}"
+                    ),
+                )
                 continue
 
         if not salt_b64:
@@ -1097,7 +1510,10 @@ async def auto_extract_constants(
         return constants
 
     except Exception as e:
-        logger.error(f"  Auto-extraction failed: {e}")
+        logger.error(
+            "  %s",
+            sanitize_external_error(f"Auto-extraction failed: {e}"),
+        )
         return None
     finally:
         if should_close:

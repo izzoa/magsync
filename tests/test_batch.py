@@ -9,7 +9,11 @@ from magsync.config import Config, load_config
 from magsync.core.batch import _download_one, download_batch
 from magsync.core.downloader import RateLimitGate
 from magsync.core.index import MagazineIndex
-from magsync.core.models import DownloadResult, DownloadStatus
+from magsync.core.models import (
+    DownloadFailureKind,
+    DownloadResult,
+    DownloadStatus,
+)
 from magsync.core.scraper import ScrapedIssue
 
 OLD = "https://limewire.com/d/OldId#oldkey"
@@ -117,7 +121,11 @@ async def test_permanent_error_maps_to_unavailable(tmp_path, monkeypatch):
     cfg, idx, issue = _setup(tmp_path)
 
     async def fake_dl(lw_url, dest, **kwargs):
-        raise RuntimeError(PERM_ERR)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.SHARE_UNAVAILABLE,
+            error=PERM_ERR,
+        )
 
     monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_dl)
     monkeypatch.setattr(batch_mod, "scrape_detail_page", _fake_scrape(OLD))
@@ -137,7 +145,11 @@ async def test_dead_link_refresh_retries_and_completes(tmp_path, monkeypatch):
     async def fake_dl(lw_url, dest, **kwargs):
         attempts.append(lw_url)
         if lw_url == OLD:
-            return DownloadResult(success=False, error=PERM_ERR)
+            return DownloadResult(
+                success=False,
+                failure_kind=DownloadFailureKind.SHARE_UNAVAILABLE,
+                error=PERM_ERR,
+            )
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"%PDF fake")
         return DownloadResult(success=True, file_path=dest, file_size_bytes=9, sha256="h")
@@ -166,7 +178,11 @@ async def test_dead_link_same_url_parks_without_retry(tmp_path, monkeypatch):
 
     async def fake_dl(lw_url, dest, **kwargs):
         attempts.append(lw_url)
-        return DownloadResult(success=False, error=PERM_ERR)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.SHARE_UNAVAILABLE,
+            error=PERM_ERR,
+        )
 
     monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_dl)
     monkeypatch.setattr(batch_mod, "scrape_detail_page", _fake_scrape(OLD))
@@ -188,7 +204,11 @@ async def test_dead_link_scrape_error_parks_unavailable(tmp_path, monkeypatch):
 
     async def fake_dl(lw_url, dest, **kwargs):
         attempts.append(lw_url)
-        return DownloadResult(success=False, error=PERM_ERR)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.SHARE_UNAVAILABLE,
+            error=PERM_ERR,
+        )
 
     async def broken_scrape(page_url, **kwargs):
         raise RuntimeError("404 post deleted")
@@ -210,7 +230,11 @@ async def test_refresh_retry_permanent_parks_without_second_scrape(tmp_path, mon
 
     async def fake_dl(lw_url, dest, **kwargs):
         attempts.append(lw_url)
-        return DownloadResult(success=False, error=PERM_ERR)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.SHARE_UNAVAILABLE,
+            error=PERM_ERR,
+        )
 
     monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_dl)
     monkeypatch.setattr(batch_mod, "scrape_detail_page", _fake_scrape(FRESH, scrapes))
@@ -229,8 +253,16 @@ async def test_refresh_retry_transient_marks_failed(tmp_path, monkeypatch):
 
     async def fake_dl(lw_url, dest, **kwargs):
         if lw_url == OLD:
-            return DownloadResult(success=False, error=PERM_ERR)
-        return DownloadResult(success=False, error="HTTP 500: transient blip")
+            return DownloadResult(
+                success=False,
+                failure_kind=DownloadFailureKind.SHARE_UNAVAILABLE,
+                error=PERM_ERR,
+            )
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.TRANSIENT,
+            error="HTTP 500: transient blip",
+        )
 
     monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_dl)
     monkeypatch.setattr(batch_mod, "scrape_detail_page", _fake_scrape(FRESH))
@@ -241,6 +273,8 @@ async def test_refresh_retry_transient_marks_failed(tmp_path, monkeypatch):
 
     assert rows[0]["download_status"] == "failed"    # transient → failed, not unavailable
     assert rows[0]["limewire_url"] == FRESH          # fresh link persisted for next pass
+    assert rows[0]["next_action"] == "DOWNLOAD"
+    assert rows[0]["next_retry_at"] is not None
 
 
 async def test_transient_failure_never_rescrapes(tmp_path, monkeypatch):
@@ -248,7 +282,11 @@ async def test_transient_failure_never_rescrapes(tmp_path, monkeypatch):
     scrapes = []
 
     async def fake_dl(lw_url, dest, **kwargs):
-        return DownloadResult(success=False, error="429 rate limited (retry-after: 30s)")
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.TRANSIENT,
+            error="429 rate limited (retry-after: 30s)",
+        )
 
     monkeypatch.setattr(batch_mod, "download_and_decrypt", fake_dl)
     monkeypatch.setattr(batch_mod, "scrape_detail_page", _fake_scrape(FRESH, scrapes))
@@ -259,6 +297,8 @@ async def test_transient_failure_never_rescrapes(tmp_path, monkeypatch):
 
     assert scrapes == []                             # transient errors never re-scrape
     assert rows[0]["download_status"] == "failed"
+    assert rows[0]["next_action"] == "DOWNLOAD"
+    assert rows[0]["next_retry_at"] is not None
 
 
 async def test_batch_dedupes_duplicate_issue_ids(tmp_path, monkeypatch):

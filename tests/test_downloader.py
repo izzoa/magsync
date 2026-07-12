@@ -15,10 +15,11 @@ import pytest
 import magsync.core.downloader as dl
 from magsync.config import LimeWireConstants
 from magsync.core.downloader import RateLimitGate, _establish_session_with_retry
-from magsync.core.models import DownloadResult, LimeWireSession
+from magsync.core.models import DownloadFailureKind, DownloadResult, LimeWireSession
 
 URL = "https://limewire.com/d/x#k"
 FIXTURES = Path(__file__).parent / "fixtures"
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 # --- SSR fixtures (current escaped streaming format + legacy JSON shape) ---
 # Dead share: removed-share error tuple in its bucket result (also carries the
@@ -50,16 +51,14 @@ def _mock_client(html: str) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-async def test_session_retry_floor_with_retries_zero(monkeypatch):
-    # Even with retries=0, transient errors are retried up to the floor (>=2),
-    # and the shared gate is engaged between attempts.
+async def test_session_helper_never_owns_retries(monkeypatch):
+    # The full download orchestrator owns the only retry budget. This
+    # compatibility helper performs exactly one physical session attempt.
     calls = {"n": 0}
 
     async def fake_establish(url, client=None):
         calls["n"] += 1
-        if calls["n"] < 3:
-            raise RuntimeError("LimeWire SSR returned transient server error")
-        return "SESSION"
+        raise RuntimeError("LimeWire SSR returned transient server error")
 
     monkeypatch.setattr(dl, "establish_session", fake_establish)
 
@@ -71,10 +70,10 @@ async def test_session_retry_floor_with_retries_zero(monkeypatch):
 
     monkeypatch.setattr(gate, "trigger", fake_trigger)
 
-    result = await _establish_session_with_retry(URL, client=None, retries=0, rate_gate=gate)
-    assert result == "SESSION"
-    assert calls["n"] == 3        # floored to >=2 retries despite retries=0
-    assert triggered["n"] == 2    # shared pause engaged before each retry
+    with pytest.raises(RuntimeError):
+        await _establish_session_with_retry(URL, client=None, retries=9, rate_gate=gate)
+    assert calls["n"] == 1
+    assert triggered["n"] == 0
 
 
 async def test_session_retry_non_transient_raises_immediately(monkeypatch):
@@ -91,7 +90,7 @@ async def test_session_retry_non_transient_raises_immediately(monkeypatch):
     assert calls["n"] == 1  # no retry on a non-transient error
 
 
-async def test_retry_log_only_when_retrying(monkeypatch, caplog):
+async def test_session_helper_does_not_claim_retry(monkeypatch, caplog):
     async def always_transient(url, client=None):
         raise RuntimeError("LimeWire SSR returned transient server error")
 
@@ -108,9 +107,7 @@ async def test_retry_log_only_when_retrying(monkeypatch, caplog):
             await _establish_session_with_retry(URL, client=None, retries=0, rate_gate=gate)
 
     msgs = [r.getMessage() for r in caplog.records]
-    # 3 attempts (floor) → 2 retries logged, final attempt raises with no retry claim
-    assert sum("pausing then retrying" in m for m in msgs) == 2
-    assert not any("will retry" in m for m in msgs)
+    assert not any("retry" in m.lower() for m in msgs)
 
 
 async def test_rate_gate_cancellation_reopens():
@@ -157,7 +154,7 @@ async def test_dead_share_current_format_is_permanent():
         with pytest.raises(RuntimeError) as ei:
             await dl.establish_session("https://limewire.com/d/XOmKo#k", client=c)
     assert "unavailable" in str(ei.value)          # permanent, not transient
-    assert dl._is_permanent_error(str(ei.value))
+    assert ei.value.kind is DownloadFailureKind.SHARE_UNAVAILABLE
 
 
 async def test_removed_marker_takes_precedence_over_unexpected_error():
@@ -182,7 +179,7 @@ async def test_transient_without_removed_marker():
         with pytest.raises(RuntimeError) as ei:
             await dl.establish_session("https://limewire.com/d/Zzz#k", client=c)
     assert "transient" in str(ei.value)
-    assert not dl._is_permanent_error(str(ei.value))
+    assert ei.value.kind is DownloadFailureKind.TRANSIENT
 
 
 async def test_live_share_not_misclassified():
@@ -272,6 +269,10 @@ def _load_live() -> str:
 
 def _load_removed() -> str:
     return (FIXTURES / "limewire_share_removed.html").read_text()
+
+
+def _load_orphaned() -> str:
+    return (FIXTURES / "limewire_share_orphaned.html").read_text()
 
 
 def _wrap_stream(flat: list) -> str:
@@ -390,13 +391,67 @@ def test_extract_binds_key_by_base_file_encryption_key_id():
     assert meta["passphrase_wrapped_pk"] == "WRAP_B"
 
 
+@pytest.mark.parametrize(
+    ("base_key_id", "available_key_id"),
+    [("missing-key", "decoy-key"), (None, None)],
+)
+def test_structural_ready_never_substitutes_unmatched_wrapped_key(
+    base_key_id,
+    available_key_id,
+):
+    root = _decoded_value({
+        "sharingBucket": {"id": "bucket-uuid", "name": "f.pdf"},
+        "contentItemList": [{
+            "id": "the-item",
+            "ephemeralPublicKey": "EPHEM",
+            "baseFileEncryptionKeyId": base_key_id,
+        }],
+        "fileEncryptionKeys": [{
+            "id": available_key_id,
+            "passphraseWrappedPrivateKey": "DECOY_WRAP",
+        }],
+    })
+    result = dl._extract_share_metadata_state(root, sharing_id="short")
+    assert result.state is dl.ShareMetadataState.METADATA_INVALID
+
+
 def test_extract_removed_and_malformed():
     assert dl._extract_share_metadata(dl._decode_react_stream(_load_removed())) is dl._REMOVED
-    # Container present but no `ok` field (format drift) → None, NOT removed.
+    # Compatibility extraction stays None, while the discriminated state keeps
+    # present malformed/null containers distinct from an absent container.
     assert dl._extract_share_metadata(_decoded_container({"value": {}})) is None
-    # Absent container → None.
+    assert dl._extract_share_metadata_state(
+        _decoded_container({"value": {}})
+    ).state is dl.ShareMetadataState.METADATA_INVALID
+    assert dl._extract_share_metadata_state(
+        {"sharingBucketContentData": None}
+    ).state is dl.ShareMetadataState.METADATA_INVALID
     assert dl._extract_share_metadata({"unrelated": 1}) is None
-    assert dl._extract_share_metadata(None) is None
+    assert dl._extract_share_metadata_state(
+        {"unrelated": 1}
+    ).state is dl.ShareMetadataState.UNDECODABLE
+    assert dl._extract_share_metadata_state(None).state is dl.ShareMetadataState.UNDECODABLE
+
+
+def test_extract_explicit_empty_list_is_narrow_orphan_candidate():
+    result = dl._extract_share_metadata_state(
+        dl._decode_react_stream(_load_orphaned()),
+        sharing_id="xTsja",
+    )
+    assert result.state is dl.ShareMetadataState.ORPHAN_CANDIDATE
+    assert result.metadata["bucket_id"] == "11111111-2222-4333-8444-555555555555"
+
+
+@pytest.mark.parametrize("content_items", [None, {}, "", 0])
+def test_extract_non_list_content_items_is_metadata_invalid(content_items):
+    root = _decoded_value({
+        "sharingBucket": {"id": REAL_BUCKET},
+        "contentItemList": content_items,
+    })
+    assert dl._extract_share_metadata_state(
+        root,
+        sharing_id="short",
+    ).state is dl.ShareMetadataState.METADATA_INVALID
 
 
 # --- establish_session end-to-end against fixtures ---
@@ -414,6 +469,27 @@ def _session_client(html: str, *, set_cookie: bool = True) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
+def _session_sequence_client(*steps) -> tuple[httpx.AsyncClient, list[httpx.Request]]:
+    """Build a session client whose consecutive GETs consume response steps."""
+
+    requests: list[httpx.Request] = []
+    remaining = list(steps)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        step = remaining.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        if isinstance(step, tuple):
+            status, html = step
+        else:
+            status, html = 200, step
+        headers = {"Set-Cookie": f"production_access_token={_jwt()}; Path=/"}
+        return httpx.Response(status, text=html, headers=headers)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), requests
+
+
 async def test_establish_session_extracts_corrected_ids_short_id():
     async with _session_client(_load_live()) as c:
         s = await dl.establish_session("https://limewire.com/d/PKQbo#s8mzZLKRe7", client=c)
@@ -422,6 +498,85 @@ async def test_establish_session_extracts_corrected_ids_short_id():
     assert s.bucket_id != DECOY_KEY_ID
     assert s.file_size == 6903693              # totalFileSize, not 0
     assert s.passphrase_wrapped_pk and s.ephemeral_public_key
+
+
+async def test_orphan_empty_then_empty_is_unavailable_after_two_gets():
+    client, requests = _session_sequence_client(_load_orphaned(), _load_orphaned())
+    async with client:
+        with pytest.raises(dl.DownloadPipelineError) as ei:
+            await dl.establish_session("https://limewire.com/d/xTsja#key", client=client)
+    assert ei.value.kind is DownloadFailureKind.SHARE_UNAVAILABLE
+    assert len(requests) == 2
+
+
+async def test_orphan_empty_then_ready_recovers_after_two_gets():
+    client, requests = _session_sequence_client(_load_orphaned(), _load_live())
+    async with client:
+        session = await dl.establish_session(
+            "https://limewire.com/d/xTsja#key",
+            client=client,
+        )
+    assert session.bucket_id == REAL_BUCKET
+    assert session.content_item_id == REAL_ITEM
+    assert len(requests) == 2
+
+
+async def test_orphan_empty_then_removed_is_unavailable_after_two_gets():
+    client, requests = _session_sequence_client(_load_orphaned(), _load_removed())
+    async with client:
+        with pytest.raises(dl.DownloadPipelineError) as ei:
+            await dl.establish_session("https://limewire.com/d/xTsja#key", client=client)
+    assert ei.value.kind is DownloadFailureKind.SHARE_UNAVAILABLE
+    assert len(requests) == 2
+
+
+async def test_orphan_empty_then_malformed_is_metadata_invalid_after_two_gets():
+    malformed = _wrap_stream_decoded(_decoded_value({
+        "sharingBucket": {"id": REAL_BUCKET},
+        "contentItemList": None,
+    }))
+    client, requests = _session_sequence_client(_load_orphaned(), malformed)
+    async with client:
+        with pytest.raises(dl.DownloadPipelineError) as ei:
+            await dl.establish_session("https://limewire.com/d/xTsja#key", client=client)
+    assert ei.value.kind is DownloadFailureKind.METADATA_INVALID
+    assert len(requests) == 2
+
+
+async def test_orphan_empty_then_transient_stops_after_confirmation():
+    client, requests = _session_sequence_client(_load_orphaned(), (503, "busy"))
+    async with client:
+        with pytest.raises(dl.DownloadPipelineError) as ei:
+            await dl.establish_session("https://limewire.com/d/xTsja#key", client=client)
+    assert ei.value.kind is DownloadFailureKind.TRANSIENT
+    assert ei.value.immediate_retry is False
+    assert len(requests) == 2
+
+
+async def test_decoded_incomplete_item_never_uses_regex_fallback(monkeypatch):
+    root = _decoded_value({
+        "sharingBucket": {"id": REAL_BUCKET},
+        "contentItemList": [{"id": REAL_ITEM}],
+        "fileEncryptionKeys": [{"passphraseWrappedPrivateKey": "WRAP"}],
+    })
+    regex_calls = 0
+
+    def forbidden_regex(*args, **kwargs):
+        nonlocal regex_calls
+        regex_calls += 1
+        return {
+            "bucket_id": "fabricated",
+            "content_item_id": "fabricated",
+            "ephemeral_public_key": "fabricated",
+            "passphrase_wrapped_pk": "fabricated",
+        }
+
+    monkeypatch.setattr(dl, "_extract_ssr_metadata_regex", forbidden_regex)
+    async with _session_client(_wrap_stream_decoded(root)) as client:
+        with pytest.raises(dl.DownloadPipelineError) as ei:
+            await dl.establish_session("https://limewire.com/d/short#key", client=client)
+    assert ei.value.kind is DownloadFailureKind.METADATA_INVALID
+    assert regex_calls == 0
 
 
 async def test_establish_session_structural_removed_backstop():
@@ -461,7 +616,8 @@ async def test_establish_session_short_id_missing_wrapped_key_fails():
     async with _session_client(html) as c:
         with pytest.raises(RuntimeError) as ei:
             await dl.establish_session("https://limewire.com/d/short#k", client=c)
-    assert "passphrase_wrapped_pk" in str(ei.value)
+    assert ei.value.kind is DownloadFailureKind.METADATA_INVALID
+    assert "no usable content item" in str(ei.value)
 
 
 async def test_establish_session_uuid_share_keeps_sharing_id_as_bucket():
@@ -525,13 +681,6 @@ def test_classify_payload_units():
     assert dl._classify_payload(b"") == "unknown"
 
 
-def test_error_string_predicates():
-    assert dl._is_unsupported_error("Unsupported payload: x.zip")
-    assert not dl._is_unsupported_error("HTTP 500")
-    assert dl._is_no_retry_error(dl._DECRYPT_FAILED_MSG)
-    assert not dl._is_no_retry_error("incomplete download (1 of 2 bytes)")
-
-
 def test_content_range_parsing():
     assert dl._content_range_parts("bytes */242901023") == (None, 242901023)
     assert dl._content_range_parts("bytes 100-999/1000") == (100, 1000)
@@ -539,6 +688,12 @@ def test_content_range_parsing():
     assert dl._content_range_parts(None) == (None, None)
     assert dl._content_range_parts("garbage") == (None, None)
     assert dl._content_range_total("bytes */7") == 7
+
+
+def test_retry_after_is_bounded():
+    assert dl._parse_retry_after(httpx.Response(429)) == 30
+    assert dl._parse_retry_after(httpx.Response(429, headers={"Retry-After": "0"})) == 1
+    assert dl._parse_retry_after(httpx.Response(429, headers={"Retry-After": "99999"})) == 300
 
 
 class _StubIdx:
@@ -743,8 +898,12 @@ async def test_http_error_body_never_written(tmp_path, monkeypatch):
     dest, calls = _pipeline(monkeypatch, tmp_path, handler=handler)
     part = _part_for(dest)
     part.write_bytes(BLOB[:100])
-    with pytest.raises(httpx.HTTPStatusError):
-        await dl._do_download(DL_URL, dest, constants=CONSTS)
+    result = await dl._download_and_decrypt_once(
+        DL_URL,
+        dest,
+        constants=CONSTS,
+    )
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
     assert part.read_bytes() == BLOB[:100]
 
 
@@ -832,9 +991,353 @@ async def test_download_and_decrypt_no_retry_on_deterministic_decrypt_failure(mo
 
     async def fake_once(url, dest, *, constants, on_progress=None, rate_gate=None, retry_attempts=2):
         calls["n"] += 1
-        return DownloadResult(success=False, error=dl._DECRYPT_FAILED_MSG)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.DECRYPTION_FAILED,
+            error=dl._DECRYPT_FAILED_MSG,
+        )
 
     monkeypatch.setattr(dl, "_download_and_decrypt_once", fake_once)
     result = await dl.download_and_decrypt(DL_URL, tmp_path / "x.pdf", constants=CONSTS, retry_attempts=3)
     assert calls["n"] == 1             # deterministic within one run — retrying repeats the same decrypt
     assert result.error == dl._DECRYPT_FAILED_MSG
+
+
+# --- exact physical request counts for typed retry ownership ---
+
+
+class _NoopGate:
+    def __init__(self):
+        self.triggers: list[int] = []
+
+    async def wait(self):
+        return None
+
+    async def trigger(self, retry_after=30, *, reason="Rate limited (429)"):
+        self.triggers.append(retry_after)
+
+
+def _install_transport(monkeypatch, handler):
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return _REAL_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(dl.httpx, "AsyncClient", client_factory)
+
+
+def _cookie_headers() -> dict[str, str]:
+    return {"Set-Cookie": f"production_access_token={_jwt()}; Path=/"}
+
+
+async def _disable_backoff(monkeypatch) -> list[float]:
+    sleeps: list[float] = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(dl.asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(dl.random, "uniform", lambda low, high: 0.125)
+    return sleeps
+
+
+async def test_removed_share_uses_one_physical_get_with_large_retry_budget(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, text=DEAD_CURRENT)
+
+    _install_transport(monkeypatch, handler)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/Dead#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=9,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.SHARE_UNAVAILABLE
+    assert result.attempt_count == 1
+    assert len(requests) == 1
+
+
+async def test_orphan_confirmation_transient_is_not_multiplied_by_retry_budget(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(200, text=_load_orphaned(), headers=_cookie_headers())
+        return httpx.Response(503, text="busy")
+
+    _install_transport(monkeypatch, handler)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/xTsja#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=9,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert result.attempt_count == 1
+    assert len(requests) == 2
+
+
+async def test_transient_share_5xx_uses_one_configured_retry_budget(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503, text="busy")
+
+    _install_transport(monkeypatch, handler)
+    sleeps = await _disable_backoff(monkeypatch)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/Busy#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=2,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert result.attempt_count == 3
+    assert len(requests) == 3
+    assert sleeps == [2.125, 4.125]
+
+
+async def test_share_429_uses_bounded_gate_and_exact_request_budget(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "99999"})
+
+    _install_transport(monkeypatch, handler)
+    await _disable_backoff(monkeypatch)
+    gate = _NoopGate()
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/Busy#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=2,
+        rate_gate=gate,
+    )
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert result.attempt_count == 3
+    assert len(requests) == 3
+    assert gate.triggers == [300, 300, 300]
+
+
+async def test_metadata_invalid_page_gets_no_retry(tmp_path, monkeypatch):
+    malformed = _wrap_stream_decoded(_decoded_value({
+        "sharingBucket": {"id": REAL_BUCKET},
+        "contentItemList": None,
+    }))
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, text=malformed, headers=_cookie_headers())
+
+    _install_transport(monkeypatch, handler)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/Bad#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=9,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+    assert result.attempt_count == 1
+    assert len(requests) == 1
+
+
+async def test_invalid_crypto_configuration_gets_no_retry_or_request(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(500)
+
+    _install_transport(monkeypatch, handler)
+    invalid = LimeWireConstants(
+        sharing_salt_b64="not-base64!",
+        file_iv_b64="eA==",
+    )
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/BadConfig#key",
+        tmp_path / "x.pdf",
+        constants=invalid,
+        retry_attempts=9,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.CONFIGURATION
+    assert result.attempt_count == 1
+    assert requests == []
+
+
+async def test_known_unsupported_extension_stops_after_share_get(tmp_path, monkeypatch):
+    root = _decoded_value({
+        "sharingBucket": {
+            "id": REAL_BUCKET,
+            "name": "The Economist Audio.zip",
+            "totalFileSize": 10,
+        },
+        "contentItemList": [{
+            "id": REAL_ITEM,
+            "ephemeralPublicKey": "EPK",
+            "baseFileEncryptionKeyId": "key-1",
+        }],
+        "fileEncryptionKeys": [{
+            "id": "key-1",
+            "passphraseWrappedPrivateKey": "WRAP",
+        }],
+    })
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text=_wrap_stream_decoded(root),
+            headers=_cookie_headers(),
+        )
+
+    _install_transport(monkeypatch, handler)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/Audio#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=9,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.UNSUPPORTED
+    assert result.attempt_count == 1
+    assert len(requests) == 1
+
+
+async def test_deterministic_decrypt_failure_makes_one_full_external_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+    garbage = b"not-a-pdf-or-known-container" + bytes(100)
+
+    def handler(request):
+        requests.append(request)
+        if request.url.host == "limewire.com":
+            return httpx.Response(200, text=_load_live(), headers=_cookie_headers())
+        if request.url.host == "api.limewire.com":
+            return httpx.Response(200, json={
+                "contentItems": [{"downloadUrl": "https://storage.test/blob?secret=value"}],
+            })
+        return httpx.Response(200, content=garbage)
+
+    async def same_constants(client=None):
+        return CONSTS
+
+    _install_transport(monkeypatch, handler)
+    monkeypatch.setattr(dl, "derive_aes_key", lambda *args, **kwargs: bytes(32))
+    monkeypatch.setattr(dl, "decrypt_file", lambda data, key, constants: bytes(data))
+    monkeypatch.setattr(dl, "auto_extract_constants", same_constants)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/PKQbo#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=9,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.DECRYPTION_FAILED
+    assert result.attempt_count == 1
+    assert [request.url.host for request in requests] == [
+        "limewire.com",
+        "api.limewire.com",
+        "storage.test",
+    ]
+
+
+async def test_api_404_is_share_unavailable_but_storage_404_is_transient(
+    tmp_path,
+    monkeypatch,
+):
+    api_requests: list[httpx.Request] = []
+
+    def api_404_handler(request):
+        api_requests.append(request)
+        if request.url.host == "limewire.com":
+            return httpx.Response(200, text=_load_live(), headers=_cookie_headers())
+        return httpx.Response(404)
+
+    _install_transport(monkeypatch, api_404_handler)
+    monkeypatch.setattr(dl, "derive_aes_key", lambda *args, **kwargs: bytes(32))
+    api_result = await dl.download_and_decrypt(
+        "https://limewire.com/d/PKQbo#key",
+        tmp_path / "api.pdf",
+        constants=CONSTS,
+        retry_attempts=3,
+        rate_gate=_NoopGate(),
+    )
+    assert api_result.failure_kind is DownloadFailureKind.SHARE_UNAVAILABLE
+    assert len(api_requests) == 2
+
+    storage_requests: list[httpx.Request] = []
+
+    def storage_404_handler(request):
+        storage_requests.append(request)
+        if request.url.host == "limewire.com":
+            return httpx.Response(200, text=_load_live(), headers=_cookie_headers())
+        if request.url.host == "api.limewire.com":
+            return httpx.Response(200, json={
+                "contentItems": [{"downloadUrl": "https://storage.test/blob"}],
+            })
+        return httpx.Response(404)
+
+    _install_transport(monkeypatch, storage_404_handler)
+    await _disable_backoff(monkeypatch)
+    storage_result = await dl.download_and_decrypt(
+        "https://limewire.com/d/PKQbo#key",
+        tmp_path / "storage.pdf",
+        constants=CONSTS,
+        retry_attempts=1,
+        rate_gate=_NoopGate(),
+    )
+    assert storage_result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert storage_result.attempt_count == 2
+    assert len(storage_requests) == 6
+
+
+async def test_rotated_transient_contract_is_one_immediate_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    _install_transport(monkeypatch, handler)
+    result = await dl.download_and_decrypt(
+        "https://limewire.com/d/Rotated#key",
+        tmp_path / "x.pdf",
+        constants=CONSTS,
+        retry_attempts=0,
+        rate_gate=_NoopGate(),
+    )
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert result.attempt_count == 1
+    assert len(requests) == 1

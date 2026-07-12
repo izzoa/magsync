@@ -20,6 +20,10 @@ import sys
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
+from magsync.core.diagnostics import sanitize_external_error
+from magsync.core.models import DownloadFailureKind
+from magsync.core.policy import get_download_failure_policy
+
 LOGGER_NAME = "magsync"
 
 
@@ -163,26 +167,33 @@ class BatchOutput:
     def on_start(self, issue: dict) -> None:  # kept for the download_batch contract
         pass
 
-    def on_complete(self, issue: dict, success: bool, error: str | None) -> None:
-        label = "downloaded" if success else self._failure_label(error)
+    def on_complete(
+        self,
+        issue: dict,
+        success: bool,
+        error: str | None,
+        failure_kind: DownloadFailureKind | str | None = None,
+    ) -> None:
+        label = "downloaded" if success else self._failure_label(failure_kind)
         if self.verbose:
             title = (issue.get("title") or "")[:50]
             if success:
                 self.console.print(f"  [green]✓[/green] {title}", highlight=False)
             else:
-                self.console.print(f"  [red]✗[/red] {title}: {error}", highlight=False)
+                safe_error = sanitize_external_error(error or "Download failed")
+                self.console.print(
+                    f"  [red]✗[/red] {title}: {safe_error}", highlight=False
+                )
         self.record(label)
 
     @staticmethod
-    def _failure_label(error: str | None) -> str:
-        from magsync.core.downloader import _is_permanent_error, _is_unsupported_error
-
-        err = error or ""
-        if _is_permanent_error(err):
-            return "unavailable"
-        if _is_unsupported_error(err):
-            return "unsupported"
-        return "failed"
+    def _failure_label(
+        failure_kind: DownloadFailureKind | str | None,
+    ) -> str:
+        """Classify a display bucket solely from structured failure state."""
+        if failure_kind is None:
+            return "failed"
+        return get_download_failure_policy(failure_kind).summary_bucket.value
 
     # -- summary ---------------------------------------------------------
     def summarize(self, results: list[dict]) -> dict[str, int]:
@@ -192,10 +203,13 @@ class BatchOutput:
         for r in results:
             if r.get("success"):
                 counts["downloaded"] += 1
-            elif r.get("unsupported"):
-                counts["unsupported"] += 1
             else:
-                counts[self._failure_label(r.get("error"))] += 1
+                failure_kind = r.get("failure_kind")
+                if failure_kind is None and r.get("unsupported"):
+                    # Compatibility with v0.5 dictionaries: this is an
+                    # explicit structured flag, never display-text parsing.
+                    failure_kind = DownloadFailureKind.UNSUPPORTED
+                counts[self._failure_label(failure_kind)] += 1
         self.console.print(
             f"\n[green]Done![/green] {counts['downloaded']} downloaded, "
             f"{counts['unavailable']} unavailable (dead links), "

@@ -7,14 +7,12 @@ import asyncio
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
     Input,
     Label,
-    ProgressBar,
     Static,
     TabbedContent,
     TabPane,
@@ -22,10 +20,16 @@ from textual.widgets import (
 )
 
 from magsync.config import load_config
+from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.index import MagazineIndex
-from magsync.core.models import DownloadStatus
-from magsync.core.organizer import normalize_title, parse_date, organize_path
-from magsync.core.scraper import search_with_details
+from magsync.core.models import (
+    DownloadFailureKind,
+    SourceFailure,
+    SourceFailureKind,
+)
+from magsync.core.organizer import normalize_title, parse_date
+from magsync.core.policy import get_download_failure_policy
+from magsync.core.scraper import search_with_details_result
 
 
 def _is_queueable(issue: dict, selected: set[int]) -> bool:
@@ -39,6 +43,32 @@ def _is_queueable(issue: dict, selected: set[int]) -> bool:
         and issue.get("download_status") not in ("complete", "unsupported")
         and bool(issue.get("limewire_url"))
     )
+
+
+def _source_failure_status(failure: SourceFailure) -> str:
+    """Return concise, secret-safe TUI guidance for a typed source failure."""
+    prefixes = {
+        SourceFailureKind.ACCESS_BLOCKED: "Source access is blocked; retry later",
+        SourceFailureKind.TRANSIENT: "Source is temporarily unavailable; retry later",
+        SourceFailureKind.PROTOCOL: "Source response format was not recognized",
+    }
+    prefix = prefixes[failure.kind]
+    detail = sanitize_external_error(failure.message).strip()
+    if detail and detail.casefold() not in prefix.casefold():
+        return f"{prefix}: {detail}"
+    return prefix
+
+
+def _download_outcome_label(
+    success: bool,
+    failure_kind: DownloadFailureKind | str | None,
+) -> str:
+    """Map one structured terminal result to its TUI label."""
+    if success:
+        return "downloaded"
+    if failure_kind is None:
+        return "failed"
+    return get_download_failure_policy(failure_kind).summary_bucket.value
 
 
 class MagSyncApp(App):
@@ -127,12 +157,24 @@ class MagSyncApp(App):
     @work(thread=True)
     def _do_search(self, query: str) -> None:
         self._update_status(f"Searching for '{query}'...")
-        results = asyncio.run(
-            search_with_details(query, scrape_delay=self.cfg.download.scrape_delay)
+        source_result = asyncio.run(
+            search_with_details_result(
+                query,
+                scrape_delay=self.cfg.download.scrape_delay,
+            )
         )
 
-        if not results:
-            self._update_status(f"No results for '{query}'")
+        if source_result.failure is not None:
+            # A source failure is not an empty result. Keep the prior table and
+            # selection intact so a blocked search cannot erase useful state.
+            self._update_status(_source_failure_status(source_result.failure))
+            return
+
+        results = source_result.items
+        if source_result.validated_empty:
+            self.search_results = []
+            self.selected_issues.clear()
+            self.app.call_from_thread(self._populate_empty_results, query)
             return
 
         # Index results
@@ -159,9 +201,23 @@ class MagSyncApp(App):
         self.search_results = all_issues
         self.selected_issues.clear()
 
-        self.app.call_from_thread(self._populate_table, all_issues, new_count)
+        self.app.call_from_thread(
+            self._populate_table,
+            all_issues,
+            new_count,
+            len(source_result.failures),
+        )
 
-    def _populate_table(self, issues: list[dict], new_count: int) -> None:
+    def _populate_empty_results(self, query: str) -> None:
+        self.query_one("#results-table", DataTable).clear()
+        self._update_status(f"No results for '{query}'")
+
+    def _populate_table(
+        self,
+        issues: list[dict],
+        new_count: int,
+        omitted_details: int = 0,
+    ) -> None:
         table = self.query_one("#results-table", DataTable)
         table.clear()
         for issue in issues:
@@ -178,7 +234,10 @@ class MagSyncApp(App):
                 status,
                 key=str(issue["id"]),
             )
-        self._update_status(f"Found {len(issues)} issues ({new_count} new)")
+        status = f"Found {len(issues)} issues ({new_count} new)"
+        if omitted_details:
+            status += f"; {omitted_details} detail page(s) omitted"
+        self._update_status(status)
 
     @on(DataTable.RowSelected, "#results-table")
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -235,16 +294,24 @@ class MagSyncApp(App):
         def on_start(issue):
             pass
 
-        def on_complete(issue, success, error):
+        def on_complete(issue, success, error, failure_kind=None):
             completed[0] += 1
+            outcome = _download_outcome_label(success, failure_kind)
+            marker = {
+                "downloaded": "✓",
+                "unavailable": "○",
+                "unsupported": "⊘",
+                "failed": "✗",
+            }[outcome]
             if success:
-                log_lines.append(f"✓ {issue['title']}")
+                log_lines.append(f"{marker} {issue['title']}")
             else:
-                log_lines.append(f"✗ {issue['title']}: {error}")
+                safe_error = sanitize_external_error(error or "Download failed")
+                log_lines.append(f"{marker} {issue['title']}: {safe_error}")
             self.app.call_from_thread(
                 self._update_download_log, "\n".join(log_lines)
             )
-            self._update_status(f"Downloaded {completed[0]}/{len(issues)}...")
+            self._update_status(f"Processed {completed[0]}/{len(issues)}...")
 
         asyncio.run(download_batch(issues, self.cfg, self.idx, on_start, on_complete))
 

@@ -9,19 +9,30 @@ import re
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from magsync.config import load_config, save_config, set_config_value
+from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.index import MagazineIndex
-from magsync.core.models import DownloadStatus, Subscription
-from magsync.core.organizer import normalize_title, parse_date, organize_path, strip_accents
-from magsync.core.scraper import DEFAULT_HEADERS, scrape_detail_page, search_with_details
+from magsync.core.models import (
+    DownloadStatus,
+    SourceError,
+    SourceFailure,
+    SourceFailureKind,
+    Subscription,
+)
+from magsync.core.organizer import normalize_title, parse_date, strip_accents
+from magsync.core.scraper import (
+    FreemagazinesClient,
+    scrape_detail_page,
+    search_with_details_result,
+)
 from magsync.output import BatchOutput, resolve_mode
 
 app = typer.Typer(
@@ -102,6 +113,45 @@ def _index_results(results, idx: MagazineIndex, cfg) -> int:
     return total_new
 
 
+def _cli_source_failure_message(failure: SourceFailure) -> str:
+    """Render concise, secret-safe CLI guidance from typed source state."""
+    prefix = {
+        SourceFailureKind.ACCESS_BLOCKED: "Source access is blocked; retry later",
+        SourceFailureKind.TRANSIENT: "Source is temporarily unavailable; retry later",
+        SourceFailureKind.PROTOCOL: "Source response could not be validated",
+    }[failure.kind]
+    context: list[str] = []
+    if failure.message and failure.message.casefold() not in prefix.casefold():
+        context.append(failure.message)
+    if failure.status_code is not None:
+        context.append(f"status={failure.status_code}")
+    if failure.host:
+        context.append(f"host={failure.host}")
+    if failure.cf_ray:
+        context.append(f"cf_ray={failure.cf_ray}")
+    detail = sanitize_external_error("; ".join(context))
+    return f"{prefix}: {detail}" if detail else prefix
+
+
+def _print_source_failure(failure: SourceFailure) -> None:
+    console.print(
+        _cli_source_failure_message(failure),
+        style="red",
+        markup=False,
+        highlight=False,
+    )
+
+
+def _print_partial_details(count: int) -> None:
+    if count:
+        console.print(
+            f"Source results are incomplete: {count} detail page(s) were omitted.",
+            style="yellow",
+            markup=False,
+            highlight=False,
+        )
+
+
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Magazine title to search for"),
@@ -109,14 +159,33 @@ def search(
     """Search for magazines and display results."""
     cfg = load_config()
 
-    with console.status(f"Searching for '{query}'..."):
-        results = asyncio.run(
-            search_with_details(query, scrape_delay=cfg.download.scrape_delay)
-        )
+    async def _search():
+        async with FreemagazinesClient(
+            scrape_delay=cfg.download.scrape_delay
+        ) as source_client:
+            return await search_with_details_result(query, client=source_client)
 
-    if not results:
+    with console.status(f"Searching for '{query}'..."):
+        source_result = asyncio.run(_search())
+
+    if source_result.failure is not None:
+        _print_source_failure(source_result.failure)
+        raise typer.Exit(1)
+    if source_result.validated_empty:
         console.print(f"[yellow]No results found for '{query}'[/yellow]")
         raise typer.Exit()
+    if not source_result.items:
+        console.print(
+            "Source response could not be validated: no issues were returned "
+            "without a recognized no-results marker.",
+            style="red",
+            markup=False,
+        )
+        raise typer.Exit(1)
+
+    results = source_result.items
+    detail_failures = len(source_result.failures)
+    _print_partial_details(detail_failures)
 
     # Index the results (grouped by normalized title)
     idx = MagazineIndex()
@@ -157,6 +226,8 @@ def search(
         console.print(table)
     finally:
         idx.close()
+    if detail_failures:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -172,7 +243,8 @@ def fetch(
     """Search, index, and download magazines."""
     _reject_conflicting_flags(verbose, quiet)
     cfg = load_config()
-    output_dir = output or cfg.output_dir
+    if output:
+        cfg.output_dir = output
 
     # Parse --since
     since_year = since_month = None
@@ -181,70 +253,108 @@ def fetch(
         since_year = int(parts[0])
         since_month = int(parts[1]) if len(parts) > 1 else None
 
-    # Search and index
-    with console.status(f"Searching for '{query}'..."):
-        results = asyncio.run(
-            search_with_details(query, scrape_delay=cfg.download.scrape_delay)
-        )
-
-    if not results:
-        console.print(f"[yellow]No results found for '{query}'[/yellow]")
-        raise typer.Exit()
-
     idx = MagazineIndex()
     try:
-        _index_results(results, idx, cfg)
+        async def _run_fetch() -> int:
+            from magsync.core.batch import download_batch
 
-        # Get pending issues matching date filter
-        norm = strip_accents(query).lower()
-        pending = idx.get_issues(
-            magazine_title=norm,
-            since_year=since_year,
-            since_month=since_month,
-            status=DownloadStatus.PENDING,
-        )
+            async with FreemagazinesClient(
+                scrape_delay=cfg.download.scrape_delay
+            ) as source_client:
+                with console.status(f"Searching for '{query}'..."):
+                    source_result = await search_with_details_result(
+                        query,
+                        client=source_client,
+                    )
 
-        if not pending:
-            console.print("[green]All matching issues already downloaded![/green]")
-            raise typer.Exit()
+                if source_result.failure is not None:
+                    _print_source_failure(source_result.failure)
+                    return 1
+                if source_result.validated_empty:
+                    console.print(f"[yellow]No results found for '{query}'[/yellow]")
+                    return 0
+                if not source_result.items:
+                    console.print(
+                        "Source response could not be validated: no issues were "
+                        "returned without a recognized no-results marker.",
+                        style="red",
+                        markup=False,
+                    )
+                    return 1
 
-        if dry_run:
-            table = Table(title=f"Would download {len(pending)} issues")
-            table.add_column("#", style="dim", width=4)
-            table.add_column("Title", style="cyan", max_width=55)
-            table.add_column("Year", width=6)
-            table.add_column("Month", width=6)
-            table.add_column("Size", width=8)
-            total_size = 0
-            for i, issue in enumerate(pending, 1):
-                table.add_row(
-                    str(i),
-                    issue["title"][:55],
-                    str(issue.get("year") or "?"),
-                    str(issue.get("month") or "?"),
-                    issue.get("file_size") or "?",
+                detail_failures = len(source_result.failures)
+                _print_partial_details(detail_failures)
+                _index_results(source_result.items, idx, cfg)
+
+                norm = strip_accents(query).lower()
+                pending = idx.get_issues(
+                    magazine_title=norm,
+                    since_year=since_year,
+                    since_month=since_month,
+                    status=DownloadStatus.PENDING,
                 )
-                size_str = issue.get("file_size") or ""
-                if "MB" in size_str:
-                    try:
-                        total_size += int("".join(c for c in size_str if c.isdigit()))
-                    except ValueError:
-                        pass
-            console.print(table)
-            if total_size:
-                console.print(f"\n[dim]Estimated total: ~{total_size} MB[/dim]")
-            console.print("\n[yellow]Dry run — no files downloaded.[/yellow]")
-            raise typer.Exit()
 
-        console.print(f"[cyan]Downloading {len(pending)} issues (max {cfg.download.max_concurrent} concurrent)...[/cyan]")
+                if not pending:
+                    console.print(
+                        "[green]All matching issues already downloaded![/green]"
+                    )
+                    return 1 if detail_failures else 0
 
-        from magsync.core.batch import download_batch
+                if dry_run:
+                    table = Table(title=f"Would download {len(pending)} issues")
+                    table.add_column("#", style="dim", width=4)
+                    table.add_column("Title", style="cyan", max_width=55)
+                    table.add_column("Year", width=6)
+                    table.add_column("Month", width=6)
+                    table.add_column("Size", width=8)
+                    total_size = 0
+                    for i, issue in enumerate(pending, 1):
+                        table.add_row(
+                            str(i),
+                            issue["title"][:55],
+                            str(issue.get("year") or "?"),
+                            str(issue.get("month") or "?"),
+                            issue.get("file_size") or "?",
+                        )
+                        size_str = issue.get("file_size") or ""
+                        if "MB" in size_str:
+                            try:
+                                total_size += int(
+                                    "".join(c for c in size_str if c.isdigit())
+                                )
+                            except ValueError:
+                                pass
+                    console.print(table)
+                    if total_size:
+                        console.print(
+                            f"\n[dim]Estimated total: ~{total_size} MB[/dim]"
+                        )
+                    console.print("\n[yellow]Dry run — no files downloaded.[/yellow]")
+                    return 1 if detail_failures else 0
 
-        with _batch_output(len(pending), "Downloading", verbose, quiet, no_progress) as out:
-            results = asyncio.run(download_batch(pending, cfg, idx, out.on_start, out.on_complete))
-        out.summarize(results)
+                console.print(
+                    f"[cyan]Downloading {len(pending)} issues "
+                    f"(max {cfg.download.max_concurrent} concurrent)...[/cyan]"
+                )
+                with _batch_output(
+                    len(pending), "Downloading", verbose, quiet, no_progress
+                ) as out:
+                    batch_results = await download_batch(
+                        pending,
+                        cfg,
+                        idx,
+                        out.on_start,
+                        out.on_complete,
+                        source_client=source_client,
+                    )
+                out.summarize(batch_results)
+                return 1 if detail_failures else 0
+
+        exit_code = asyncio.run(_run_fetch())
     finally:
         idx.close()
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 @app.command()
@@ -259,24 +369,73 @@ def update():
             console.print("[yellow]No tracked magazines. Run 'magsync search' first.[/yellow]")
             raise typer.Exit()
 
-        total_new = 0
-        for mag in magazines:
-            with console.status(f"Updating '{mag['title']}'..."):
-                results = asyncio.run(
-                    search_with_details(
-                        mag["title"], scrape_delay=cfg.download.scrape_delay
-                    )
-                )
-                new = _index_results(results, idx, cfg)
-                total_new += new
-                if new:
-                    console.print(f"  [cyan]{mag['title']}[/cyan]: {new} new issues")
-                else:
-                    console.print(f"  [dim]{mag['title']}: up to date[/dim]")
+        async def _run_update() -> int:
+            total_new = 0
+            incomplete = 0
+            skipped = 0
+            async with FreemagazinesClient(
+                scrape_delay=cfg.download.scrape_delay
+            ) as source_client:
+                for position, mag in enumerate(magazines):
+                    with console.status(f"Updating '{mag['title']}'..."):
+                        source_result = await search_with_details_result(
+                            mag["title"],
+                            client=source_client,
+                        )
 
-        console.print(f"\n[green]Update complete.[/green] {total_new} new issues found.")
+                    if source_result.failure is not None:
+                        incomplete += 1
+                        console.print(
+                            f"Update for '{mag['title']}' failed:",
+                            style="red",
+                            markup=False,
+                        )
+                        _print_source_failure(source_result.failure)
+                        if (
+                            source_result.failure.kind
+                            is SourceFailureKind.ACCESS_BLOCKED
+                        ):
+                            skipped = len(magazines) - position - 1
+                            break
+                        continue
+
+                    detail_failures = len(source_result.failures)
+                    new = _index_results(source_result.items, idx, cfg)
+                    total_new += new
+                    if detail_failures:
+                        incomplete += 1
+                        console.print(
+                            f"  {mag['title']}: {new} new issues; "
+                            f"{detail_failures} detail page(s) omitted",
+                            style="yellow",
+                            markup=False,
+                        )
+                    elif new:
+                        console.print(
+                            f"  [cyan]{mag['title']}[/cyan]: {new} new issues"
+                        )
+                    else:
+                        console.print(f"  [dim]{mag['title']}: up to date[/dim]")
+
+            if incomplete or skipped:
+                console.print(
+                    f"\nUpdate incomplete: {total_new} new issues; "
+                    f"{incomplete} source operation(s) incomplete; "
+                    f"{skipped} skipped after source blocking.",
+                    style="yellow",
+                    markup=False,
+                )
+                return 1
+            console.print(
+                f"\n[green]Update complete.[/green] {total_new} new issues found."
+            )
+            return 0
+
+        exit_code = asyncio.run(_run_update())
     finally:
         idx.close()
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 @app.command()
@@ -409,11 +568,10 @@ def retry(
     idx = MagazineIndex()
 
     try:
-        # Retry exactly what was failed/unavailable at invocation — never the
-        # pending backlog (indexing marks every discovered issue pending, so
-        # the backlog includes issues the user never queued).
-        reset_ids, skipped = idx.reset_failed_downloads(magazine_title=query)
-        if not reset_ids and not skipped:
+        # Atomically claim exactly the failed/unavailable invocation snapshot,
+        # bypassing persisted schedules without touching the pending backlog.
+        claimed, skipped = idx.claim_manual_retry_downloads(magazine_title=query)
+        if not claimed and not skipped:
             console.print("[green]No failed downloads to retry.[/green]")
             raise typer.Exit()
 
@@ -422,18 +580,29 @@ def retry(
             f"skipped: no download link (run 'magsync backfill-urls' to repair).[/yellow]"
             if skipped else None
         )
-        if not reset_ids:
+        if not claimed:
             console.print(skipped_msg)
             raise typer.Exit()
 
-        console.print(f"[cyan]Retrying {len(reset_ids)} failed download{'s' if len(reset_ids) != 1 else ''}...[/cyan]")
-
-        pending = idx.get_issues_by_ids(reset_ids)
+        console.print(
+            f"[cyan]Retrying {len(claimed)} failed download"
+            f"{'s' if len(claimed) != 1 else ''}...[/cyan]"
+        )
 
         from magsync.core.batch import download_batch
 
-        with _batch_output(len(pending), "Retrying", verbose, quiet, no_progress) as out:
-            results = asyncio.run(download_batch(pending, cfg, idx, out.on_start, out.on_complete))
+        with _batch_output(
+            len(claimed), "Retrying", verbose, quiet, no_progress
+        ) as out:
+            results = asyncio.run(
+                download_batch(
+                    claimed,
+                    cfg,
+                    idx,
+                    out.on_start,
+                    out.on_complete,
+                )
+            )
         out.summarize(results)
         if skipped_msg:
             console.print(skipped_msg)
@@ -469,41 +638,94 @@ def backfill_urls(
             f"{'s' if len(missing) != 1 else ''} missing a download URL...[/cyan]"
         )
 
-        async def _backfill(out: BatchOutput) -> None:
-            async with httpx.AsyncClient(
-                follow_redirects=True, timeout=30.0, headers=DEFAULT_HEADERS
-            ) as client:
-                for i, row in enumerate(missing):
-                    title = (row["title"] or row["page_url"])[:50]
-                    detail = None
-                    try:
-                        detail = await scrape_detail_page(row["page_url"], client=client)
-                    except Exception as e:
+        async def _backfill(out: BatchOutput) -> int:
+            failures = 0
+            async with FreemagazinesClient(
+                scrape_delay=cfg.download.scrape_delay
+            ) as source_client:
+                for row in missing:
+                    title = sanitize_external_error(
+                        (row["title"] or row["page_url"])[:50]
+                    )
+                    if source_client.circuit_open:
+                        failures += 1
                         if out.verbose:
-                            console.print(f"  [red]✗[/red] {title}: {e}")
-                        out.record("error")
-                    else:
-                        if detail and detail.limewire_url:
+                            console.print(
+                                f"  – {title}: skipped after source blocking",
+                                style="yellow",
+                                markup=False,
+                                highlight=False,
+                            )
+                        out.record("skipped")
+                        continue
+                    try:
+                        detail = await scrape_detail_page(
+                            row["page_url"], client=source_client
+                        )
+                        if detail.limewire_url:
                             idx.set_limewire_url(row["id"], detail.limewire_url)
                             if out.verbose:
                                 console.print(f"  [green]✓[/green] {title}")
                             out.record("repaired")
                         else:
                             if out.verbose:
-                                console.print(f"  [dim]–[/dim] {title}: still no URL")
+                                console.print(
+                                    f"  [dim]–[/dim] {title}: still no URL"
+                                )
                             out.record("missing")
-                    if i < len(missing) - 1:
-                        await asyncio.sleep(cfg.download.scrape_delay)
+                    except asyncio.CancelledError:
+                        raise
+                    except SourceError as exc:
+                        failures += 1
+                        label = {
+                            SourceFailureKind.ACCESS_BLOCKED: "blocked",
+                            SourceFailureKind.TRANSIENT: "transient",
+                            SourceFailureKind.PROTOCOL: "protocol",
+                        }[exc.kind]
+                        if out.verbose:
+                            console.print(
+                                f"  ✗ {title}: "
+                                f"{_cli_source_failure_message(exc.failure)}",
+                                style="red",
+                                markup=False,
+                                highlight=False,
+                            )
+                        out.record(label)
+                    except Exception:
+                        failures += 1
+                        if out.verbose:
+                            console.print(
+                                f"  ✗ {title}: unable to process source detail",
+                                style="red",
+                                markup=False,
+                                highlight=False,
+                            )
+                        out.record("error")
+            return failures
 
         with _batch_output(len(missing), "Backfilling", verbose, quiet, no_progress) as out:
-            asyncio.run(_backfill(out))
+            failure_count = asyncio.run(_backfill(out))
         repaired = out.counts.get("repaired", 0)
-        console.print(
-            f"\n[green]Backfill complete.[/green] {repaired} repaired, "
-            f"{len(missing) - repaired} still missing a URL."
-        )
+        checked_missing = out.counts.get("missing", 0)
+        blocked = out.counts.get("blocked", 0)
+        skipped = out.counts.get("skipped", 0)
+        if failure_count:
+            console.print(
+                f"\nBackfill incomplete. {repaired} repaired, "
+                f"{checked_missing} checked with no URL, {blocked} blocked, "
+                f"{skipped} skipped, {failure_count - blocked - skipped} failed.",
+                style="yellow",
+                markup=False,
+            )
+        else:
+            console.print(
+                f"\n[green]Backfill complete.[/green] {repaired} repaired, "
+                f"{checked_missing} still missing a URL."
+            )
     finally:
         idx.close()
+    if failure_count:
+        raise typer.Exit(1)
 
 
 def _parse_interval(interval: str) -> int:
@@ -516,6 +738,400 @@ def _parse_interval(interval: str) -> int:
     return value * multipliers[unit]
 
 
+class _DaemonRedactionFilter(logging.Filter):
+    """Sanitize a fully-rendered daemon log record before it reaches a sink."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from magsync.core.diagnostics import sanitize_external_error
+
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = "Unable to render log message safely"
+        record.msg = sanitize_external_error(rendered, max_length=2_000)
+        record.args = ()
+        # Exception repr/traceback text can contain a presigned URL or key. All
+        # daemon error paths log the sanitized operation context explicitly.
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+def _configure_daemon_external_logging() -> None:
+    """Keep third-party request URLs and raw exception text out of daemon logs."""
+
+    for name in ("httpx", "httpcore"):
+        external_logger = logging.getLogger(name)
+        external_logger.setLevel(logging.CRITICAL + 1)
+        external_logger.propagate = False
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if not any(isinstance(item, _DaemonRedactionFilter) for item in handler.filters):
+            handler.addFilter(_DaemonRedactionFilter())
+
+
+def _source_failure_reason(failure: Any) -> str:
+    """Render only the safe fields carried by a structured source failure."""
+
+    from magsync.core.diagnostics import sanitize_external_error
+
+    parts = [getattr(getattr(failure, "kind", None), "value", "source_failure")]
+    message = getattr(failure, "message", None)
+    if message:
+        parts.append(str(message))
+    status_code = getattr(failure, "status_code", None)
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+    host = getattr(failure, "host", None)
+    if host:
+        parts.append(f"host={host}")
+    cf_ray = getattr(failure, "cf_ray", None)
+    if cf_ray:
+        parts.append(f"cf_ray={cf_ray}")
+    return sanitize_external_error("; ".join(parts))
+
+
+def _batch_failure_kind(result: dict):
+    """Read a batch result's typed kind without consulting display text."""
+
+    from magsync.core.models import DownloadFailureKind
+
+    value = result.get("failure_kind")
+    if value is None:
+        nested = result.get("result")
+        value = getattr(nested, "failure_kind", None)
+    try:
+        return DownloadFailureKind(value) if value is not None else DownloadFailureKind.INTERNAL
+    except (TypeError, ValueError):
+        return DownloadFailureKind.INTERNAL
+
+
+def _reconcile_download_results(
+    report,
+    results: list[dict],
+    logger: logging.Logger,
+) -> list[dict]:
+    """Update a cycle report solely from returned typed batch results."""
+
+    from magsync.core.diagnostics import sanitize_external_error
+    from magsync.core.models import DownloadSummaryBucket
+    from magsync.core.policy import get_download_failure_policy
+
+    downloaded: list[dict] = []
+    for result in results:
+        issue = result.get("issue") or {}
+        title = sanitize_external_error(issue.get("title") or "Unknown issue", 120)
+        if result.get("success"):
+            report.downloads_complete += 1
+            downloaded.append(issue)
+            logger.info("  Done: %s", title)
+            continue
+
+        kind = _batch_failure_kind(result)
+        policy = get_download_failure_policy(kind)
+        if policy.summary_bucket is DownloadSummaryBucket.UNAVAILABLE:
+            report.downloads_unavailable += 1
+            label = "Unavailable"
+        elif policy.summary_bucket is DownloadSummaryBucket.UNSUPPORTED:
+            report.downloads_unsupported += 1
+            label = "Skipped (unsupported)"
+        else:
+            report.downloads_failed += 1
+            label = "Failed"
+
+        detail = sanitize_external_error(result.get("error") or kind.value)
+        logger.log(policy.log_level, "  %s: %s: %s", label, title, detail)
+    return downloaded
+
+
+def _log_cycle_report(report, logger: logging.Logger) -> None:
+    """Emit one reconciled, secret-safe phase summary."""
+
+    from magsync.core.models import PipelineStatus
+
+    level = {
+        PipelineStatus.HEALTHY: logging.INFO,
+        PipelineStatus.DEGRADED: logging.WARNING,
+        PipelineStatus.FAILED: logging.ERROR,
+    }[report.status]
+    reason = f"; reason={report.reason}" if report.reason else ""
+    logger.log(
+        level,
+        (
+            "Cycle %s in %.1fs: source %d/%d completed "
+            "(%d attempted, %d empty, %d failed, %d skipped, %d detail failures); "
+            "downloads %d queued/%d unique "
+            "(%d complete, %d unavailable, %d unsupported, %d failed); "
+            "%d refreshes pending%s"
+        ),
+        report.status.value,
+        report.elapsed_seconds,
+        report.source_completed,
+        report.source_total,
+        report.source_attempted,
+        report.source_empty,
+        report.source_failed,
+        report.source_skipped,
+        report.detail_failures,
+        report.downloads_queued,
+        report.downloads_unique,
+        report.downloads_complete,
+        report.downloads_unavailable,
+        report.downloads_unsupported,
+        report.downloads_failed,
+        report.pending_refreshes,
+        reason,
+    )
+
+
+async def _run_daemon_cycle(
+    cfg,
+    idx: MagazineIndex,
+    *,
+    dry_run: bool = False,
+    logger: logging.Logger | None = None,
+    now: datetime | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    source_client_factory: Callable[..., Any] | None = None,
+) -> Any:
+    """Run one complete daemon cycle in one event loop and source session.
+
+    Subscription indexing, due source-only refreshes, and cached downloads all
+    share the same ``FreemagazinesClient`` and therefore the same cookies,
+    request pacing, and challenge circuit. Returned batch results, never
+    callbacks, are the source of download counters.
+    """
+
+    from magsync.core.batch import download_batch, refresh_due_links
+    from magsync.core.diagnostics import sanitize_external_error
+    from magsync.core.models import CycleReport, PipelineStatus, SourceFailureKind
+    from magsync.core.notify import send_download_summary
+    from magsync.core.scraper import FreemagazinesClient
+    from magsync.core.urls import URLValidationError, normalize_limewire_share_url
+
+    daemon_logger = logger or logging.getLogger("magsync")
+    report = CycleReport(source_total=len(cfg.subscriptions))
+    started = clock()
+    cycle_at = now or datetime.now(timezone.utc)
+    source_expected = bool(cfg.subscriptions)
+    source_failed = False
+    source_reason: str | None = None
+    fatal_reason: str | None = None
+    downloaded_issues: list[dict] = []
+
+    factory = source_client_factory or FreemagazinesClient
+    try:
+        async with factory(scrape_delay=cfg.download.scrape_delay) as source_client:
+            # Phase 1: subscription indexing. A challenge result opens the
+            # client's circuit; no later subscription is even invoked.
+            for position, sub in enumerate(cfg.subscriptions):
+                if source_client.circuit_open:
+                    report.source_skipped += len(cfg.subscriptions) - position
+                    source_failed = True
+                    failure = source_client.circuit_failure
+                    if source_reason is None and failure is not None:
+                        source_reason = _source_failure_reason(failure)
+                    break
+
+                daemon_logger.info("Searching: %s", sub.query)
+                report.source_attempted += 1
+                source_result = await source_client.search_with_details(sub.query)
+                report.detail_failures += len(source_result.failures)
+                if (
+                    source_result.failure is not None
+                    and source_result.failure.operation == "detail"
+                ):
+                    # When every advertised detail fails, the scraper promotes
+                    # one detail failure to the operation-level failure and
+                    # retains the remaining siblings in ``failures``.
+                    report.detail_failures += 1
+                blocked_result = False
+
+                if source_result.failure is not None:
+                    report.source_failed += 1
+                    source_failed = True
+                    blocked_result = (
+                        source_result.failure.kind
+                        is SourceFailureKind.ACCESS_BLOCKED
+                    )
+                    if source_reason is None:
+                        source_reason = _source_failure_reason(source_result.failure)
+                    daemon_logger.warning(
+                        "Search failed for %s: %s",
+                        sanitize_external_error(sub.query, 120),
+                        _source_failure_reason(source_result.failure),
+                    )
+                else:
+                    if source_result.validated_empty:
+                        report.source_empty += 1
+                    else:
+                        report.source_succeeded += 1
+
+                    filtered = _filter_results(
+                        source_result.items, sub.query, sub.exact
+                    )
+                    new = _index_results(filtered, idx, cfg) if filtered else 0
+                    if new:
+                        daemon_logger.info("  %s: %d new issues indexed", sub.query, new)
+
+                    if source_result.failures:
+                        source_failed = True
+                        if source_reason is None:
+                            source_reason = (
+                                f"{len(source_result.failures)} source detail "
+                                "request(s) failed"
+                            )
+
+                if blocked_result:
+                    report.source_skipped += len(cfg.subscriptions) - position - 1
+                    break
+
+                # A detail request can open the circuit while still preserving
+                # valid siblings, so check again after the structured result.
+                if source_client.circuit_open:
+                    remaining = len(cfg.subscriptions) - position - 1
+                    report.source_skipped += remaining
+                    source_failed = True
+                    failure = source_client.circuit_failure
+                    if source_reason is None and failure is not None:
+                        source_reason = _source_failure_reason(failure)
+                    break
+
+            # Phase 2: claim source-only refresh actions before downloads. This
+            # path never invokes the known-dead stored LimeWire URL. A circuit
+            # opened above is reused and short-circuits these source calls.
+            if not dry_run:
+                due_refreshes = idx.claim_due_link_refreshes(now=cycle_at)
+                if due_refreshes:
+                    source_expected = True
+                    refresh_results = await refresh_due_links(
+                        due_refreshes, idx, source_client
+                    )
+                    for refresh_result in refresh_results:
+                        outcome = refresh_result.get("outcome")
+                        failure = getattr(outcome, "failure", None)
+                        if failure is not None:
+                            source_failed = True
+                            if source_reason is None:
+                                source_reason = _source_failure_reason(failure)
+                        if refresh_result.get("failure_kind") is not None:
+                            source_failed = True
+                            if source_reason is None:
+                                source_reason = "Unable to persist source refresh result"
+
+            # Phase 3: pending and due transient downloads are claimed every
+            # cycle, even if source indexing was blocked.
+            if dry_run:
+                claimed = [
+                    issue
+                    for issue in idx.get_issues(status=DownloadStatus.PENDING)
+                    if issue.get("limewire_url")
+                ]
+            else:
+                claimed = idx.claim_pending_and_due_downloads(now=cycle_at)
+
+            report.downloads_queued = len(claimed)
+            identities: set[str] = set()
+            for issue in claimed:
+                try:
+                    identities.add(
+                        normalize_limewire_share_url(issue.get("limewire_url") or "")
+                    )
+                except URLValidationError:
+                    identities.add(f"invalid-issue:{issue.get('id')}")
+            report.downloads_unique = len(identities)
+
+            if dry_run:
+                if claimed:
+                    daemon_logger.info("Dry run - would download %d issues", len(claimed))
+            elif claimed:
+                daemon_logger.info(
+                    "Downloading %d issues (%d unique URLs; max %d concurrent)...",
+                    len(claimed),
+                    report.downloads_unique,
+                    cfg.download.max_concurrent,
+                )
+
+                def on_start(issue: dict) -> None:
+                    title = sanitize_external_error(
+                        issue.get("title") or "Unknown issue", 120
+                    )
+                    daemon_logger.info("  Downloading: %s", title)
+
+                results = await download_batch(
+                    claimed,
+                    cfg,
+                    idx,
+                    on_start=on_start,
+                    source_client=source_client,
+                )
+                downloaded_issues = _reconcile_download_results(
+                    report, results, daemon_logger
+                )
+                missing_results = max(0, len(claimed) - len(results))
+                if missing_results:
+                    report.downloads_failed += missing_results
+                    source_reason = source_reason or (
+                        f"Batch omitted {missing_results} claimed result(s)"
+                    )
+
+            # An immediate dead-link refresh inside the batch may be the first
+            # operation to encounter a host-wide source challenge.
+            if source_client.circuit_open:
+                source_expected = True
+                source_failed = True
+                failure = source_client.circuit_failure
+                if source_reason is None and failure is not None:
+                    source_reason = _source_failure_reason(failure)
+
+        if downloaded_issues:
+            send_download_summary(downloaded_issues, cfg.notifications)
+        report.pending_refreshes = idx.count_pending_link_refreshes()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        fatal_reason = sanitize_external_error(exc)
+
+    if fatal_reason is not None:
+        report.status = PipelineStatus.FAILED
+        report.reason = fatal_reason or "Local daemon cycle failure"
+    elif source_failed or report.detail_failures or report.downloads_failed:
+        report.status = PipelineStatus.DEGRADED
+        report.reason = source_reason
+        if report.reason is None and report.detail_failures:
+            report.reason = f"{report.detail_failures} detail request(s) failed"
+        if report.reason is None and report.downloads_failed:
+            report.reason = f"{report.downloads_failed} download(s) failed"
+    else:
+        report.status = PipelineStatus.HEALTHY
+
+    report.reason = sanitize_external_error(report.reason) if report.reason else None
+    report.elapsed_seconds = max(0.0, clock() - started)
+
+    source_validated: bool | None
+    if not source_expected:
+        source_validated = None
+    else:
+        source_validated = not source_failed and report.detail_failures == 0
+
+    try:
+        idx.update_pipeline_state(
+            report.status,
+            cycle_at=cycle_at,
+            source_validated=source_validated,
+            source_check_at=cycle_at,
+            degraded_reason=report.reason,
+        )
+    except Exception as exc:
+        report.status = PipelineStatus.FAILED
+        report.reason = sanitize_external_error(exc) or "Unable to persist pipeline state"
+        daemon_logger.error("Unable to persist pipeline state: %s", report.reason)
+
+    _log_cycle_report(report, daemon_logger)
+    return report
+
+
 @app.command()
 def daemon(
     interval: str = typer.Option(
@@ -526,8 +1142,6 @@ def daemon(
 ):
     """Run magsync as a daemon, periodically fetching subscribed magazines."""
     from magsync import __version__
-    from magsync.core.downloader import download_and_decrypt
-    from magsync.core.notify import send_download_summary
 
     # Resolve interval: CLI arg > env var > default
     interval_str = interval or os.environ.get("MAGSYNC_INTERVAL", "6h")
@@ -542,18 +1156,19 @@ def daemon(
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
     )
+    _configure_daemon_external_logging()
     logger = logging.getLogger("magsync")
 
     # Start background heartbeat for Docker health check
     stop_heartbeat = _start_heartbeat(interval=30)
 
-    # Reset stuck and failed downloads so they get retried this cycle
-    # (link-less failures keep their status — see reset_stuck_downloads)
+    # Recover interrupted work only. Typed failure schedules and their UTC due
+    # times survive restarts and are claimed by ordinary cycles when eligible.
     startup_idx = MagazineIndex()
     stuck = startup_idx.reset_stuck_downloads()
     startup_idx.close()
     if stuck:
-        logger.info(f"Reset {stuck} interrupted/failed download(s) to pending")
+        logger.info("Reset %d interrupted download(s) to pending", stuck)
 
     logger.info(f"magsync v{__version__} daemon starting")
     logger.info(f"  Output directory: {cfg.output_dir}")
@@ -578,118 +1193,33 @@ def daemon(
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    # Daemon loop
-    while not shutdown:
-        cycle_start = time.time()
-        logger.info("Starting cycle...")
-
-        idx = MagazineIndex()
-        downloaded_issues: list[dict] = []
-        unsupported_count = 0
-        total_new_indexed = 0
-
-        try:
-            # Phase 1: Update index for each subscription
-            for sub in cfg.subscriptions:
-                if shutdown:
-                    break
-                logger.info(f"Searching: {sub.query}")
-                try:
-                    results = asyncio.run(
-                        search_with_details(sub.query, scrape_delay=cfg.download.scrape_delay)
+    # Daemon loop. Each cycle gets exactly one asyncio.run(), so the source
+    # session, its circuit, due refreshes, and downloads share one event loop.
+    try:
+        while not shutdown:
+            logger.info("Starting cycle...")
+            idx = MagazineIndex()
+            try:
+                asyncio.run(
+                    _run_daemon_cycle(
+                        cfg,
+                        idx,
+                        dry_run=dry_run,
+                        logger=logger,
                     )
-                except Exception as e:
-                    logger.error(f"Search failed for '{sub.query}': {e}")
-                    continue
-
-                if not results:
-                    continue
-
-                results = _filter_results(results, sub.query, sub.exact)
-                if not results:
-                    logger.info(f"  {sub.query}: no exact matches found")
-                    continue
-
-                new = _index_results(results, idx, cfg)
-                total_new_indexed += new
-                if new:
-                    logger.info(f"  {sub.query}: {new} new issues indexed")
-
-            # Phase 2: Collect all pending issues across subscriptions, then download concurrently
-            all_pending: list[dict] = []
-            for sub in cfg.subscriptions:
-                if shutdown:
-                    break
-
-                since_year = since_month = None
-                if sub.since:
-                    parts = sub.since.split("-")
-                    since_year = int(parts[0])
-                    since_month = int(parts[1]) if len(parts) > 1 else None
-
-                norm = strip_accents(sub.query).lower()
-                pending = idx.get_issues(
-                    magazine_title=norm,
-                    since_year=since_year,
-                    since_month=since_month,
-                    status=DownloadStatus.PENDING,
                 )
-                all_pending.extend(p for p in pending if p.get("limewire_url"))
+            finally:
+                idx.close()
 
-            if all_pending and not shutdown:
-                if dry_run:
-                    logger.info(f"Dry run — would download {len(all_pending)} issues:")
-                    for issue in all_pending:
-                        logger.info(f"  - {issue['title']} ({issue.get('file_size') or '?'})")
-                else:
-                    from magsync.core.batch import download_batch
-                    from magsync.core.downloader import _is_unsupported_error
+            if shutdown or dry_run:
+                break
 
-                    logger.info(f"Downloading {len(all_pending)} issues (max {cfg.download.max_concurrent} concurrent)...")
-
-                    def on_start(issue):
-                        logger.info(f"  Downloading: {issue['title'][:60]}")
-
-                    def on_complete(issue, success, error):
-                        if success:
-                            downloaded_issues.append(issue)
-                            logger.info(f"  Done: {issue['title'][:60]}")
-                        elif _is_unsupported_error(error or ""):
-                            # Terminal by policy, not a failure — INFO keeps it
-                            # out of error-level alerting.
-                            logger.info(f"  Skipped (non-PDF): {issue['title'][:60]}")
-                        else:
-                            logger.error(f"  Failed: {issue['title'][:60]}: {error}")
-
-                    results = asyncio.run(download_batch(all_pending, cfg, idx, on_start, on_complete))
-                    unsupported_count += sum(1 for r in results if r.get("unsupported"))
-
-            # Phase 3: Notify
-            if downloaded_issues:
-                send_download_summary(downloaded_issues, cfg.notifications)
-
-            # Phase 4: Summary
-            elapsed = int(time.time() - cycle_start)
-            logger.info(
-                f"Cycle complete in {elapsed}s: "
-                f"{total_new_indexed} new indexed, "
-                f"{len(downloaded_issues)} downloaded"
-                + (f", {unsupported_count} unsupported (non-PDF)" if unsupported_count else "")
-            )
-
-        except Exception as e:
-            logger.error(f"Cycle error: {e}")
-        finally:
-            idx.close()
-
-        if shutdown or dry_run:
-            break
-
-        # Sleep with interrupt support
-        logger.info(f"Sleeping {interval_str} until next cycle...")
-        sleep_end = time.time() + interval_secs
-        while time.time() < sleep_end and not shutdown:
-            time.sleep(min(5, sleep_end - time.time()))
-
-    stop_heartbeat()
-    logger.info("magsync daemon stopped.")
+            # Sleep with interrupt support. The heartbeat's daemon thread keeps
+            # process liveness current regardless of pipeline health.
+            logger.info("Sleeping %s until next cycle...", interval_str)
+            sleep_end = time.time() + interval_secs
+            while time.time() < sleep_end and not shutdown:
+                time.sleep(min(5, sleep_end - time.time()))
+    finally:
+        stop_heartbeat()
+        logger.info("magsync daemon stopped.")

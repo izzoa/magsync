@@ -136,9 +136,13 @@ magsync config
 magsync config output_dir ~/MyMagazines
 ```
 
-**Batch output.** `fetch`, `retry`, and `backfill-urls` show one progress bar with live outcome counters (downloaded / unavailable / failed) on an interactive terminal, and fall back to periodic textual progress lines when output is piped or run under `docker exec` without a TTY. The end-of-run summary reports how many links were dead (`unavailable`). Expected per-issue dead-link messages are hidden by default; use `-v/--verbose` to see them, `-q/--quiet` for the summary only, and `--no-progress` (or `MAGSYNC_NO_PROGRESS=1`) to disable the live bar in scripts. The `daemon` is unaffected — it keeps its structured, timestamped logs.
+**Batch output.** `fetch`, `retry`, and `backfill-urls` show one progress bar with live outcome counters (`downloaded`, `unavailable`, `unsupported`, and `failed`) on an interactive terminal, and fall back to periodic textual progress lines when output is piped or run under `docker exec` without a TTY. Expected per-issue unavailable/unsupported messages are hidden by default; use `-v/--verbose` to see them, `-q/--quiet` for the summary only, and `--no-progress` (or `MAGSYNC_NO_PROGRESS=1`) to disable the live bar in scripts. The `daemon` is unaffected — it keeps its structured, timestamped logs.
 
-**Retry scope.** `magsync retry` re-attempts exactly the downloads that were in a failed/unavailable state when it ran; issues that are merely indexed-but-not-downloaded are left alone. Failed issues with no stored download link are skipped and counted in the summary (also under `-q`) — run `magsync backfill-urls` to repair them first.
+**Retry scope.** The daemon automatically schedules exhausted transient downloads and source-blocked dead-link refreshes for a later due cycle; those UTC schedules survive restarts. `magsync retry` is an explicit override: it atomically claims exactly the linked `failed`/`unavailable` rows in its invocation snapshot, bypasses their current schedule, and never drains unrelated pending or `unsupported` work. Link-less failures are skipped and counted (also under `-q`) — run `magsync backfill-urls` to repair them first.
+
+**Status meanings.** `pending` is queued work, `complete` is a stored PDF, `unavailable` is a confirmed dead/orphaned share that may recover only through a refreshed source link or manual retry, `unsupported` is a live non-PDF payload, and `failed` covers a typed transient or deterministic processing failure. Only typed transient failures are automatically scheduled for another download attempt.
+
+**Source access.** A validated freemagazines.top “no results” page is a normal empty result. A Cloudflare challenge, transient outage, or unrecognized page format is reported as a source failure instead; CLI operations exit nonzero, and the TUI keeps its previous results. During a daemon cycle, the first detected challenge stops later source requests while already-cached download work continues. magsync does not provide browser automation, clearance-cookie acquisition, TLS impersonation, proxy rotation, or any other challenge bypass.
 
 ## Subscriptions
 
@@ -174,6 +178,8 @@ exact = true
 ## Docker
 
 Run magsync as an unattended daemon in Docker. Automatically fetches new issues on a schedule.
+
+Each daemon cycle reports separate pipeline health: `healthy` when attempted phases produced validated outcomes, `degraded` when useful work continued alongside source/worker failures, and `failed` when a local/configuration/database problem prevented all intended work. This state is persisted for diagnostics. Docker's `/tmp/magsync-healthy` check remains only a process-liveness heartbeat: external degradation does not trigger a restart loop, while a stalled daemon still becomes unhealthy at the existing threshold.
 
 ### Quick Start
 
@@ -308,9 +314,9 @@ Downloads go through [LimeWire](https://limewire.com), a file-sharing service th
 4. Fetch the presigned S3 download URL via LimeWire's API
 5. Download the encrypted blob and decrypt with AES-256-CTR
 
-No browser, Playwright, or Selenium required.
+No browser, Playwright, or Selenium is required or used. Direct source access may still be blocked by an upstream challenge; magsync detects and reports that state but does not attempt to bypass it.
 
-Downloads are resilient to LimeWire throttling: a transient server error pauses all concurrent downloads briefly (shared backoff) and retries, and issues that resolve to the same file are fetched once. Keep `download.retry_attempts` ≥ 1 so transient errors are retried. Shares LimeWire reports as removed are detected and marked unavailable (skipped, not retried every cycle); `magsync retry` re-attempts them if a working link returns.
+Downloads are resilient to LimeWire throttling: a transient server error pauses all concurrent downloads briefly through a shared gate and consumes one bounded exponential-backoff budget. Issues with the same exact full share URL share one in-flight operation, while URLs with different key fragments remain distinct. Shares LimeWire reports as removed—or confirms twice as a live bucket with an empty content list—are marked unavailable instead of burning ordinary retries.
 
 freemagazines.top rotates a post's LimeWire link when the old share is taken down, so magsync treats the stored link as self-healing: re-scraping an issue refreshes its link if the site now serves a different one (re-queuing any issue previously parked as unavailable), and a download that fails on a dead link re-scrapes the page once and retries immediately with the fresh link before giving up.
 

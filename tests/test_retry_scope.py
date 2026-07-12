@@ -136,3 +136,42 @@ def test_retry_leaves_unsupported_untouched(tmp_path, monkeypatch):
     ).fetchone()[0]
     idx.close()
     assert status == "unsupported"
+
+
+def test_retry_bypasses_and_clears_persisted_future_schedule(tmp_path, monkeypatch):
+    idx = _open_index(tmp_path, monkeypatch)
+    failed_id = _add_issue(idx, "scheduled", LW.format("future"), DownloadStatus.FAILED)
+    idx.conn.execute(
+        """UPDATE downloads
+           SET last_error_kind = 'transient', last_error = 'temporary',
+               attempt_count = 4, last_attempt_at = '2026-07-11T00:00:00+00:00',
+               next_action = 'DOWNLOAD', next_retry_at = '2099-01-01T00:00:00+00:00'
+           WHERE issue_id = ?""",
+        (failed_id,),
+    )
+    idx.conn.commit()
+    idx.close()
+
+    attempted: list[int] = []
+    monkeypatch.setattr("magsync.core.batch.download_batch", _fake_batch(attempted))
+
+    result = runner.invoke(cli.app, ["retry"])
+    assert result.exit_code == 0
+    assert attempted == [failed_id]
+
+    idx = _open_index(tmp_path, monkeypatch)
+    row = idx.conn.execute(
+        """SELECT last_error_kind, last_error, attempt_count, last_attempt_at,
+                  next_action, next_retry_at
+           FROM downloads WHERE issue_id = ?""",
+        (failed_id,),
+    ).fetchone()
+    idx.close()
+    assert dict(row) == {
+        "last_error_kind": None,
+        "last_error": None,
+        "attempt_count": 0,
+        "last_attempt_at": None,
+        "next_action": None,
+        "next_retry_at": None,
+    }
