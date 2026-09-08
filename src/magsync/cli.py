@@ -127,18 +127,37 @@ def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> Index
     return IndexOutcome(added=total_new, linkless=total_linkless)
 
 
-async def _resolve_links_for_indexing(items, idx: MagazineIndex, source_client):
+async def _resolve_links_for_indexing(
+    items, idx: MagazineIndex, source_client, *, subscription=None
+):
     """Resolve masked download links only for the issues that still need one.
 
-    Issues already carrying a usable stored URL cost no source request, so in
-    steady state only genuinely new issues are resolved. That gate is what
-    keeps link discovery from roughly doubling detail-request volume against a
-    challenge-protected source.
+    Two gates, both about not spending source requests pointlessly:
+
+    * Issues already carrying a usable stored URL, or already parked with a
+      pending re-probe, are skipped - so in steady state only genuinely new
+      issues are resolved.
+    * When the search was driven by a subscription, issues whose title does
+      not match it are skipped too. A fuzzy-search stranger is cataloged with
+      no provenance and can never be claimed, so resolving its link is wasted
+      traffic - the same reason ``backfill-urls`` repairs only wanted rows.
+      Nothing is lost permanently: subscribing later promotes the row, and
+      ``backfill-urls`` then repairs its URL.
     """
+    from magsync.core.matching import title_match
+
     needed = idx.page_urls_missing_link([item.page_url for item in items])
-    return await resolve_masked_links(
-        items, source_client, needs_link=lambda issue: issue.page_url in needed
-    )
+
+    def needs_link(issue) -> bool:
+        if issue.page_url not in needed:
+            return False
+        if subscription is not None and not title_match(
+            issue.title or "", subscription
+        ):
+            return False
+        return True
+
+    return await resolve_masked_links(items, source_client, needs_link=needs_link)
 
 
 def _park_link_dispositions(batch, idx: MagazineIndex) -> tuple[int, int]:
@@ -1182,7 +1201,7 @@ async def _run_daemon_cycle(
                         # Masked links are resolved before indexing, and only
                         # for issues that actually need one.
                         resolution = await _resolve_links_for_indexing(
-                            filtered, idx, source_client
+                            filtered, idx, source_client, subscription=sub
                         )
                         if resolution.failures:
                             report.link_resolution_failures += len(

@@ -335,7 +335,7 @@ class MagazineIndex:
                         (existing["id"],),
                     )
                     logger.info(
-                        f"Refreshed LimeWire link for {issue['page_url']}: "
+                        f"Refreshed download link for {issue['page_url']}: "
                         f"{_sharing_id(existing['limewire_url'] or '')} → {_sharing_id(incoming_url)}"
                     )
                 # An absent incoming URL is "no information", never a

@@ -23,9 +23,17 @@ LIMEWIRE_HOSTS = frozenset({"limewire.com", "www.limewire.com"})
 VK_HOSTS = frozenset({"vk.com", "www.vk.com"})
 SOURCE_HOSTS = frozenset({"freemagazines.top", "www.freemagazines.top"})
 
-# A VK document path names exactly one document: /doc<owner>_<id>. Owner ids
-# are negative for community-owned documents.
+# VK names a document two ways, and the source's endpoint returns both:
+#   /doc<owner>_<id>            - canonical; owner ids are negative for
+#                                 community-owned documents
+#   /s/v<n>/doc/<token>         - a signed viewer link (the majority for
+#                                 older posts)
+# Both are *viewer pages* carrying the real file URL, so both are retrievable
+# by the same backend. The signed form may expire; that is safe to store
+# because a stale link fails as an unavailable share and the existing link
+# refresh re-resolves the source's masked key for a fresh one.
 _VK_DOC_PATH_RE = re.compile(r"^/doc(-?\d{1,20})_(\d{1,20})$")
+_VK_SIGNED_DOC_PATH_RE = re.compile(r"^/s/v\d{1,3}/doc/[A-Za-z0-9_-]{16,128}$")
 # The only query parameter a VK document URL may carry. Its value is an access
 # token and is treated as secret material.
 _VK_ALLOWED_QUERY_KEYS = frozenset({"hash"})
@@ -142,17 +150,23 @@ def limewire_sharing_id(url: str) -> str:
 def normalize_vk_document_url(url: str) -> str:
     """Validate and return the canonical VK document URL.
 
-    Strict form: HTTPS, exact ``vk.com``/``www.vk.com`` host, an exact
-    ``/doc<owner>_<id>`` path naming one document, and no query beyond an
-    optional ``hash`` access token.  Any fragment is dropped: it is not part of
-    a document's identity, and rejecting one would risk misclassifying an
+    Strict form: HTTPS, exact ``vk.com``/``www.vk.com`` host, a path naming
+    exactly one document - either ``/doc<owner>_<id>`` or a signed
+    ``/s/v<n>/doc/<token>`` viewer link - and no query beyond an optional
+    ``hash`` access token.  Any fragment is dropped: it is not part of a
+    document's identity, and rejecting one would risk misclassifying an
     otherwise valid link as an unsupported host.
     """
 
     parsed = _split_https_url(url, allowed_hosts=VK_HOSTS)
 
-    if not _VK_DOC_PATH_RE.match(parsed.path):
-        raise URLValidationError("VK document path must be /doc<owner>_<id>")
+    if not (
+        _VK_DOC_PATH_RE.match(parsed.path)
+        or _VK_SIGNED_DOC_PATH_RE.match(parsed.path)
+    ):
+        raise URLValidationError(
+            "VK document path must be /doc<owner>_<id> or /s/v<n>/doc/<token>"
+        )
 
     query = parsed.query
     if query:

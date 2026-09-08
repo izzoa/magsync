@@ -138,6 +138,9 @@ def test_source_origin_rejects_unsafe_forms(candidate):
 # ---------------------------------------------------------------------------
 
 VK_DOC = "https://vk.com/doc711807114_676564963"
+# The source's endpoint returns this signed viewer form for most older posts;
+# rejecting it made every such issue look like a broken source contract.
+VK_SIGNED = "https://vk.com/s/v1/doc/IYhNWdakfNcTozOeCSozNjjRzWNjANjlupNRyVggSMiEbTNcNaN"
 
 
 @pytest.mark.parametrize(
@@ -155,6 +158,10 @@ VK_DOC = "https://vk.com/doc711807114_676564963"
         ),
         # A fragment is not part of document identity and is dropped.
         ("https://vk.com/doc711807114_676564963#frag", VK_DOC),
+        # Both signed-viewer shapes name exactly one document.
+        (VK_SIGNED, VK_SIGNED),
+        ("https://www.vk.com/s/v2/doc/hENiSnBiNVGcayUVNk-tNmiDwUHNPyKNnWxEUuYndOcODbo",
+         "https://vk.com/s/v2/doc/hENiSnBiNVGcayUVNk-tNmiDwUHNPyKNnWxEUuYndOcODbo"),
     ),
 )
 def test_vk_normalization_accepts_only_canonical_forms(candidate, normalized):
@@ -181,6 +188,14 @@ def test_vk_normalization_accepts_only_canonical_forms(candidate, normalized):
         "https://vk.com/doc1_2_3",
         "https://vk.com/doc1_2/extra",
         "https://vk.com/docabc_def",
+        # Signed form, but malformed: too short, wrong segment, unsafe chars.
+        "https://vk.com/s/v1/doc/short",
+        "https://vk.com/s/v1/doc/",
+        "https://vk.com/s/doc/abcdefghijklmnopqrst",
+        "https://vk.com/s/v1/docs/abcdefghijklmnopqrst",
+        "https://vk.com/s/v1/doc/abcdefghijklmnopqrst?dl=1",
+        # The signed CDN *file* path (/d/) is not a viewer page identity.
+        "https://vk.com/s/v1/d/abcdefghijklmnopqrst/File.pdf",
         # The signed CDN URL is never a storable identity.
         "https://psv4.userapi.com/s/v1/d/abc/File.pdf",
         " https://vk.com/doc1_2",
@@ -247,3 +262,10 @@ def test_vk_validation_error_does_not_echo_access_hash():
     with pytest.raises(URLValidationError) as caught:
         normalize_vk_document_url(f"https://evil.test/doc1_2?hash={access_hash}")
     assert access_hash not in str(caught.value)
+
+
+def test_both_vk_document_forms_route_to_the_vk_backend():
+    # Both are viewer pages carrying the real file URL, so one backend serves
+    # both; only the path shape differs.
+    assert download_host_of(VK_DOC) is DownloadHost.VK
+    assert download_host_of(VK_SIGNED) is DownloadHost.VK

@@ -67,7 +67,7 @@ def test_rotated_link_refreshes_stored_url(tmp_path, caplog):
 
     rows = idx.get_issues()
     assert rows[0]["limewire_url"] == LW_B
-    swap_logs = [r.getMessage() for r in caplog.records if "Refreshed LimeWire link" in r.getMessage()]
+    swap_logs = [r.getMessage() for r in caplog.records if "Refreshed download link" in r.getMessage()]
     assert len(swap_logs) == 1
     assert "aaaa" in swap_logs[0] and "bbbb" in swap_logs[0]  # sharing IDs logged
     # Fragments are decryption keys — they must never reach logs.
@@ -100,7 +100,7 @@ def test_identical_link_is_noop(tmp_path, caplog):
     assert added.linkless == 0
     assert idx.get_issues()[0]["limewire_url"] == LW_A
     assert idx.get_issues()[0]["download_status"] == "pending"
-    assert not any("Refreshed LimeWire link" in r.getMessage() for r in caplog.records)
+    assert not any("Refreshed download link" in r.getMessage() for r in caplog.records)
     idx.close()
 
 

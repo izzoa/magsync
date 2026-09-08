@@ -3,6 +3,17 @@
 All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.8.1] - 2026-09-08
+
+Fixes a 0.8.0 bug found in its own first production cycle: hundreds of `advertised a download whose link could not be resolved` warnings, while other issues in the same search stored links fine. VK names a document **two** ways and the source returns both — 0.8.0's VK form was generalized from a single observed sample, so the other form was reported as the source breaking its contract when it was behaving correctly.
+
+### Fixed
+- **VK's signed `/s/v<n>/doc/<token>` document form is accepted**, alongside the canonical `/doc<owner>_<id>` form. The signed form is the majority for older posts; because `vk.com` *is* a supported host it had fallen into the "supported host, malformed link" branch, so those issues were reported as `PROTOCOL` failures, never indexed, never parked, and therefore **re-resolved on every cycle** — the exact per-cycle retry loop and permanent `degraded` state 0.8.0 set out to remove, still running for that subset. Verified live end-to-end: stored URL → derived CDN URL → HTTP 206 → `application/pdf` → `%PDF-1.6`. Each form is still validated strictly, and the signed CDN *file* path is still refused as a stored identity because it is ephemeral. A stored signed link that later expires fails as an unavailable share and the existing link refresh rotates in a fresh one.
+- **Indexing no longer spends source requests on fuzzy-search strangers.** An `Airliner World` search was resolving `aviation-news-*` and `african-aerospace-*`; `BBC Good Food` was resolving `new-scientist-international-*`. Those rows are cataloged without provenance and can never be claimed, so every request spent on them was waste — the same reasoning `backfill-urls` already applies. Resolution is now scoped to issues matching the triggering subscription, using the same canonical matcher that decides provenance moments later, so the two cannot drift. Nothing is lost permanently: subscribing later promotes the row and `backfill-urls` repairs its URL.
+
+### Changed
+- The link-refresh log line reads `Refreshed download link` rather than naming LimeWire, since it now reports VK URLs as often as LimeWire ones.
+
 ## [0.8.0] - 2026-09-08
 
 Restores downloading after freemagazines.top changed how it publishes download links, and adds its **second file host**. Diagnosed from a live NAS whose daemon had indexed new issues every night for months while queueing **zero** downloads, with no ERROR line in any cycle: the link had moved behind a masked server-side lookup, and the scraper's "no URL found" path was a silent no-op rather than a failure. Probing the fix's own first cycle then revealed the second half — the site serves links from both LimeWire **and VK** (its download button's `lw-vk-` prefix says so), and a VK link was being reported as "the source broke its contract". The LimeWire decryption pipeline was never implicated and is unchanged.

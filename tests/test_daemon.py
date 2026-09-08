@@ -925,3 +925,31 @@ async def test_structural_break_still_degrades_and_is_not_a_host_outcome(tmp_pat
     assert report.issues_dead_link == 0
     assert report.status is PipelineStatus.DEGRADED
     idx.close()
+
+
+@pytest.mark.asyncio
+async def test_stranger_results_do_not_consume_resolution_requests(tmp_path):
+    # Fuzzy site search returns unrelated titles; they are cataloged with no
+    # provenance and can never be claimed, so resolving their links would be
+    # pure wasted source traffic.
+    idx = MagazineIndex(tmp_path / "index.db")
+    wanted = _scraped(key=MASKED_KEY)
+    stranger = ScrapedIssue(
+        title="Totally Different Title June 2026",
+        page_url="https://freemagazines.top/stranger-june-2026/",
+        download_key=MASKED_KEY,
+    )
+    source = ScriptedSource([SourceResult(items=[wanted, stranger])])
+
+    await cli._run_daemon_cycle(
+        _config(tmp_path, "Magazine"),
+        idx,
+        source_client_factory=_source_factory(source),
+    )
+
+    # Exactly one resolution: the subscribed issue, not the stranger.
+    assert source.resolutions == [(NEW_PAGE, MASKED_KEY)]
+    stored = {r["page_url"]: r["limewire_url"] for r in idx.get_issues()}
+    assert stored[NEW_PAGE] == FRESH_URL
+    assert stored[stranger.page_url] is None  # cataloged, not resolved
+    idx.close()
