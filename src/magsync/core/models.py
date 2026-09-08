@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Generic, NamedTuple, TypeVar
 
 
 class DownloadStatus(str, Enum):
@@ -166,6 +166,10 @@ class RefreshOutcomeKind(str, Enum):
     NO_LINK = "no_link"
     SOURCE_BLOCKED = "source_blocked"
     SCRAPE_ERROR = "scrape_error"
+    # A re-probe that still finds nothing usable. Both re-park the row on a
+    # schedule rather than abandoning it: the source may rehost the issue.
+    DEAD_LINK = "dead_link"
+    UNSUPPORTED_HOST = "unsupported_host"
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,42 @@ class RefreshOutcome:
             raise ValueError("a rotated refresh outcome requires a URL")
         if self.kind is not RefreshOutcomeKind.ROTATED and self.url is not None:
             raise ValueError("only a rotated refresh outcome may carry a URL")
+
+
+class LinkResolutionKind(str, Enum):
+    """Outcome of exchanging a masked download key for a real link.
+
+    Only a genuine protocol/blocking failure is raised as an error. These are
+    *outcomes*: modelling an unsupported destination or a rejected key as a
+    source failure is what made a healthy source look permanently broken.
+    """
+
+    SUPPORTED = "supported"
+    UNSUPPORTED_HOST = "unsupported_host"
+    DEAD_LINK = "dead_link"
+
+
+@dataclass(frozen=True)
+class LinkResolution:
+    """A resolved download link, classified by outcome and host.
+
+    ``url`` is populated only for ``SUPPORTED`` and has passed the strict
+    supported-host validator. ``host`` is populated only for
+    ``UNSUPPORTED_HOST`` and is a bare hostname: the unvalidated URL itself is
+    never carried, so it cannot reach the index or the logs.
+    """
+
+    kind: LinkResolutionKind
+    url: str | None = None
+    host: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is LinkResolutionKind.SUPPORTED and not self.url:
+            raise ValueError("a supported link resolution requires a URL")
+        if self.kind is not LinkResolutionKind.SUPPORTED and self.url is not None:
+            raise ValueError("only a supported link resolution may carry a URL")
+        if self.kind is LinkResolutionKind.UNSUPPORTED_HOST and not self.host:
+            raise ValueError("an unsupported-host resolution requires its host")
 
 
 class RetryAction(str, Enum):
@@ -213,6 +253,16 @@ class CycleReport:
     source_failed: int = 0
     source_skipped: int = 0
     detail_failures: int = 0
+    # Issues indexed without a usable download link, and the resolution
+    # failures behind them. Counted apart from detail_failures: a source that
+    # stops publishing usable links must be diagnosable from the summary line.
+    issues_linkless: int = 0
+    link_resolution_failures: int = 0
+    # Links that resolved fine but are not usable. These are expected
+    # steady-state outcomes, not faults: counting them separately is what
+    # lets a catalog permanently containing them still report healthy.
+    issues_unsupported_host: int = 0
+    issues_dead_link: int = 0
     downloads_queued: int = 0
     downloads_unique: int = 0
     downloads_complete: int = 0
@@ -229,6 +279,18 @@ class CycleReport:
         """Number of attempted subscription searches with validated results."""
 
         return self.source_succeeded + self.source_empty
+
+
+class IndexOutcome(NamedTuple):
+    """What one indexing call did, beyond just counting new rows.
+
+    ``linkless`` counts issues stored or left without a usable download URL.
+    Such a row is a catalog entry no automatic claim can ever act on, so
+    ``added`` alone must never stand in for "actionable work was created".
+    """
+
+    added: int
+    linkless: int = 0
 
 
 @dataclass

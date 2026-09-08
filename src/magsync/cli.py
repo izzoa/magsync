@@ -22,6 +22,8 @@ from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.index import MagazineIndex
 from magsync.core.models import (
     DownloadStatus,
+    IndexOutcome,
+    LinkResolutionKind,
     SourceError,
     SourceFailure,
     SourceFailureKind,
@@ -30,6 +32,7 @@ from magsync.core.models import (
 from magsync.core.organizer import normalize_title, parse_date, strip_accents
 from magsync.core.scraper import (
     FreemagazinesClient,
+    resolve_masked_links,
     scrape_detail_page,
     search_with_details_result,
 )
@@ -76,7 +79,7 @@ def _filter_results(results, query: str, exact: bool):
     return [r for r in results if strip_accents(normalize_title(r.title)).lower() == query_norm]
 
 
-def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> int:
+def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> IndexOutcome:
     """Index scraped results, grouping by normalized title.
 
     Each unique normalized title gets its own magazine entry.
@@ -86,6 +89,9 @@ def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> int:
     when there is one: matching rows record subscription provenance (and
     null-provenance re-encounters are promoted); fuzzy strangers are cataloged
     without provenance and are never claimable work.
+
+    Returns an :class:`IndexOutcome`: new issues added, plus the number stored
+    or left without a usable download URL.
     """
     from collections import defaultdict
 
@@ -96,6 +102,7 @@ def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> int:
         by_magazine[norm].append(r)
 
     total_new = 0
+    total_linkless = 0
     for norm_title, issues in by_magazine.items():
         display_title = norm_title
         mag_id = idx.get_or_create_magazine(display_title, strip_accents(norm_title).lower())
@@ -113,9 +120,71 @@ def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> int:
                 "file_size": r.file_size,
                 "cover_image_url": r.cover_image_url,
             })
-        total_new += idx.add_issues(mag_id, issues_data, subscription=subscription)
+        outcome = idx.add_issues(mag_id, issues_data, subscription=subscription)
+        total_new += outcome.added
+        total_linkless += outcome.linkless
 
-    return total_new
+    return IndexOutcome(added=total_new, linkless=total_linkless)
+
+
+async def _resolve_links_for_indexing(items, idx: MagazineIndex, source_client):
+    """Resolve masked download links only for the issues that still need one.
+
+    Issues already carrying a usable stored URL cost no source request, so in
+    steady state only genuinely new issues are resolved. That gate is what
+    keeps link discovery from roughly doubling detail-request volume against a
+    challenge-protected source.
+    """
+    needed = idx.page_urls_missing_link([item.page_url for item in items])
+    return await resolve_masked_links(
+        items, source_client, needs_link=lambda issue: issue.page_url in needed
+    )
+
+
+def _park_link_dispositions(batch, idx: MagazineIndex) -> tuple[int, int]:
+    """Park issues whose link resolved but is not usable.
+
+    Returns ``(unsupported_host, dead_link)`` counts. Both are parked with a
+    scheduled re-probe rather than retried every cycle or abandoned: the
+    source may rehost or rotate the link later. The pending action is also
+    what keeps them out of the indexing resolution gate.
+    """
+    from magsync.core.policy import dead_link_reprobe_at, unsupported_host_reprobe_at
+
+    disposed = [issue for issue, _host in batch.unsupported_host] + list(
+        batch.dead_link
+    )
+    if not disposed:
+        return (0, 0)
+
+    ids = idx.issue_ids_for_page_urls([issue.page_url for issue in disposed])
+    unsupported = 0
+    for issue, host in batch.unsupported_host:
+        issue_id = ids.get(issue.page_url)
+        if issue_id is None:
+            continue
+        if idx.park_link_outcome(
+            issue_id,
+            DownloadStatus.UNSUPPORTED,
+            unsupported_host_reprobe_at(),
+            error=f"download link resolved to unsupported host {host}",
+        ):
+            unsupported += 1
+
+    dead = 0
+    for issue in batch.dead_link:
+        issue_id = ids.get(issue.page_url)
+        if issue_id is None:
+            continue
+        if idx.park_link_outcome(
+            issue_id,
+            DownloadStatus.UNAVAILABLE,
+            dead_link_reprobe_at(),
+            error="source reported no available download link",
+        ):
+            dead += 1
+
+    return (unsupported, dead)
 
 
 def _cli_source_failure_message(failure: SourceFailure) -> str:
@@ -195,7 +264,7 @@ def search(
     # Index the results (grouped by normalized title)
     idx = MagazineIndex()
     try:
-        new_count = _index_results(results, idx, cfg)
+        new_count = _index_results(results, idx, cfg).added
 
         # Display results
         norm = strip_accents(query).lower()
@@ -443,7 +512,7 @@ def update():
                         continue
 
                     detail_failures = len(source_result.failures)
-                    new = _index_results(source_result.items, idx, cfg)
+                    new = _index_results(source_result.items, idx, cfg).added
                     total_new += new
                     if detail_failures:
                         incomplete += 1
@@ -745,6 +814,34 @@ def backfill_urls(
                         detail = await scrape_detail_page(
                             row["page_url"], client=source_client
                         )
+                        if not detail.limewire_url and detail.download_key:
+                            # Explicit repair: always resolve the masked key.
+                            resolution = await source_client.resolve_masked_download(
+                                row["page_url"], detail.download_key
+                            )
+                            if resolution.kind is LinkResolutionKind.SUPPORTED:
+                                detail.limewire_url = resolution.url
+                            elif (
+                                resolution.kind
+                                is LinkResolutionKind.UNSUPPORTED_HOST
+                            ):
+                                if out.verbose:
+                                    console.print(
+                                        f"  [dim]–[/dim] {title}: unsupported "
+                                        f"host {resolution.host or 'unknown'}",
+                                        markup=True,
+                                        highlight=False,
+                                    )
+                                out.record("missing")
+                                continue
+                            else:
+                                if out.verbose:
+                                    console.print(
+                                        f"  [dim]–[/dim] {title}: no available "
+                                        "download link"
+                                    )
+                                out.record("missing")
+                                continue
                         if detail.limewire_url:
                             idx.set_limewire_url(row["id"], detail.limewire_url)
                             if out.verbose:
@@ -943,7 +1040,8 @@ def _log_cycle_report(report, logger: logging.Logger) -> None:
         level,
         (
             "Cycle %s in %.1fs: source %d/%d completed "
-            "(%d attempted, %d empty, %d failed, %d skipped, %d detail failures); "
+            "(%d attempted, %d empty, %d failed, %d skipped, %d detail failures, "
+            "%d link failures, %d link-less, %d unsupported host, %d dead link); "
             "downloads %d queued/%d unique "
             "(%d complete, %d unavailable, %d unsupported, %d failed); "
             "%d refreshes pending%s"
@@ -957,6 +1055,10 @@ def _log_cycle_report(report, logger: logging.Logger) -> None:
         report.source_failed,
         report.source_skipped,
         report.detail_failures,
+        report.link_resolution_failures,
+        report.issues_linkless,
+        report.issues_unsupported_host,
+        report.issues_dead_link,
         report.downloads_queued,
         report.downloads_unique,
         report.downloads_complete,
@@ -1000,7 +1102,7 @@ async def _run_daemon_cycle(
     from magsync.core.models import CycleReport, PipelineStatus, SourceFailureKind
     from magsync.core.notify import send_download_summary
     from magsync.core.scraper import FreemagazinesClient
-    from magsync.core.urls import URLValidationError, normalize_limewire_share_url
+    from magsync.core.urls import URLValidationError, normalize_download_url
 
     daemon_logger = logger or logging.getLogger("magsync")
     if subscriptions is None:
@@ -1075,11 +1177,67 @@ async def _run_daemon_cycle(
                     filtered = _filter_results(
                         source_result.items, sub.query, sub.exact
                     )
-                    new = (
-                        _index_results(filtered, idx, cfg, subscription=sub)
-                        if filtered
-                        else 0
-                    )
+                    new = 0
+                    if filtered:
+                        # Masked links are resolved before indexing, and only
+                        # for issues that actually need one.
+                        resolution = await _resolve_links_for_indexing(
+                            filtered, idx, source_client
+                        )
+                        if resolution.failures:
+                            report.link_resolution_failures += len(
+                                resolution.failures
+                            )
+                            source_failed = True
+                            daemon_logger.warning(
+                                "%s: %d issue(s) advertised a download whose "
+                                "link could not be resolved",
+                                sanitize_external_error(sub.query, 120),
+                                len(resolution.failures),
+                            )
+                            if source_reason is None:
+                                source_reason = (
+                                    f"{len(resolution.failures)} download "
+                                    "link(s) could not be resolved"
+                                )
+                        outcome = _index_results(
+                            resolution.items, idx, cfg, subscription=sub
+                        )
+                        new = outcome.added
+                        report.issues_linkless += outcome.linkless
+
+                        # A link that resolved but is unusable is an expected
+                        # outcome, not a fault: park it on a schedule so it
+                        # stops costing a request every cycle, and count it
+                        # without degrading the cycle.
+                        unsupported, dead = _park_link_dispositions(resolution, idx)
+                        report.issues_unsupported_host += unsupported
+                        report.issues_dead_link += dead
+                        if unsupported:
+                            hosts = sorted(
+                                {host for _issue, host in resolution.unsupported_host}
+                            )
+                            daemon_logger.info(
+                                "  %s: %d issue(s) on unsupported host(s) %s "
+                                "- parked for later re-probe",
+                                sanitize_external_error(sub.query, 120),
+                                unsupported,
+                                ", ".join(hosts),
+                            )
+                        if dead:
+                            daemon_logger.info(
+                                "  %s: %d issue(s) with no available download "
+                                "link - parked for later re-probe",
+                                sanitize_external_error(sub.query, 120),
+                                dead,
+                            )
+                        if outcome.linkless:
+                            daemon_logger.warning(
+                                "  %s: %d issue(s) indexed with no usable "
+                                "download link",
+                                sanitize_external_error(sub.query, 120),
+                                outcome.linkless,
+                            )
                     if new:
                         daemon_logger.info("  %s: %d new issues indexed", sub.query, new)
 
@@ -1149,7 +1307,7 @@ async def _run_daemon_cycle(
             for issue in claimed:
                 try:
                     identities.add(
-                        normalize_limewire_share_url(issue.get("limewire_url") or "")
+                        normalize_download_url(issue.get("limewire_url") or "")
                     )
                 except URLValidationError:
                     identities.add(f"invalid-issue:{issue.get('id')}")
@@ -1222,12 +1380,32 @@ async def _run_daemon_cycle(
     ):
         report.status = PipelineStatus.DEGRADED
         report.reason = source_reason
+        if report.reason is None and report.link_resolution_failures:
+            report.reason = (
+                f"{report.link_resolution_failures} download link(s) "
+                "could not be resolved"
+            )
         if report.reason is None and report.detail_failures:
             report.reason = f"{report.detail_failures} detail request(s) failed"
         if report.reason is None and report.downloads_failed:
             report.reason = f"{report.downloads_failed} download(s) failed"
         if report.reason is None and config_failure_reason is not None:
             report.reason = config_failure_reason
+    elif (
+        not dry_run
+        and report.issues_linkless
+        and report.downloads_queued == 0
+        and report.pending_refreshes == 0
+    ):
+        # Backstop for the next variant of this bug, whatever its cause:
+        # issues a subscription wanted were indexed, nothing was queued, and
+        # no pending action explains it. A cycle like that is not healthy even
+        # when every individual phase reported success.
+        report.status = PipelineStatus.DEGRADED
+        report.reason = (
+            f"{report.issues_linkless} wanted issue(s) indexed with no usable "
+            "download link and no download work queued"
+        )
     else:
         report.status = PipelineStatus.HEALTHY
 

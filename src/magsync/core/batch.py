@@ -17,6 +17,7 @@ from magsync.core.downloader import RateLimitGate, download_and_decrypt
 from magsync.core.index import MagazineIndex
 from magsync.core.models import (
     DownloadFailureKind,
+    LinkResolutionKind,
     DownloadResult,
     DownloadStatus,
     RefreshOutcome,
@@ -27,9 +28,13 @@ from magsync.core.models import (
     SourceFailureKind,
 )
 from magsync.core.organizer import organize_path
-from magsync.core.policy import get_download_failure_policy
+from magsync.core.policy import (
+    dead_link_reprobe_at,
+    get_download_failure_policy,
+    unsupported_host_reprobe_at,
+)
 from magsync.core.scraper import FreemagazinesClient, scrape_detail_page
-from magsync.core.urls import URLValidationError, normalize_limewire_share_url
+from magsync.core.urls import URLValidationError, normalize_download_url
 
 logger = logging.getLogger("magsync")
 
@@ -59,6 +64,33 @@ def _source_failure(
     return SourceFailure(kind=kind, message=message, operation=operation)
 
 
+def _refresh_source_error_outcome(exc: SourceError, title: str) -> RefreshOutcome:
+    """Map a typed source failure onto a structured refresh outcome.
+
+    Shared by the detail scrape and the masked-link resolution so both halves
+    of a refresh classify blocking, transient, and protocol failures the same
+    way (only the first two earn a future REFRESH_LINK action).
+    """
+    if exc.kind is SourceFailureKind.ACCESS_BLOCKED:
+        logger.info("Link refresh blocked by source challenge for %s", title)
+        return RefreshOutcome(
+            RefreshOutcomeKind.SOURCE_BLOCKED,
+            failure=exc.failure,
+        )
+    logger.log(
+        logging.WARNING
+        if exc.kind is SourceFailureKind.TRANSIENT
+        else logging.ERROR,
+        "Link refresh scrape failed for %s: %s",
+        title,
+        sanitize_external_error(exc.failure.message),
+    )
+    return RefreshOutcome(
+        RefreshOutcomeKind.SCRAPE_ERROR,
+        failure=exc.failure,
+    )
+
+
 async def _refresh_link_from_page(
     issue: dict,
     attempted_url: str,
@@ -85,24 +117,7 @@ async def _refresh_link_from_page(
     except asyncio.CancelledError:
         raise
     except SourceError as exc:
-        if exc.kind is SourceFailureKind.ACCESS_BLOCKED:
-            logger.info("Link refresh blocked by source challenge for %s", title)
-            return RefreshOutcome(
-                RefreshOutcomeKind.SOURCE_BLOCKED,
-                failure=exc.failure,
-            )
-        logger.log(
-            logging.WARNING
-            if exc.kind is SourceFailureKind.TRANSIENT
-            else logging.ERROR,
-            "Link refresh scrape failed for %s: %s",
-            title,
-            sanitize_external_error(exc.failure.message),
-        )
-        return RefreshOutcome(
-            RefreshOutcomeKind.SCRAPE_ERROR,
-            failure=exc.failure,
-        )
+        return _refresh_source_error_outcome(exc, title)
     except Exception:
         # Parser and adapter exceptions are deliberately converted without
         # reflecting raw exception text, which may contain a URL or response.
@@ -113,13 +128,47 @@ async def _refresh_link_from_page(
         logger.error("Unexpected link-refresh failure for %s", title)
         return RefreshOutcome(RefreshOutcomeKind.SCRAPE_ERROR, failure=failure)
 
+    if not detail.limewire_url and detail.download_key:
+        # A refresh is an explicit repair, so the key is always resolved: the
+        # page does advertise a download, and without this a masked-only page
+        # would report NO_LINK forever.
+        try:
+            resolution = await source_client.resolve_masked_download(
+                page_url, detail.download_key
+            )
+        except asyncio.CancelledError:
+            raise
+        except SourceError as exc:
+            return _refresh_source_error_outcome(exc, title)
+        except Exception:
+            failure = _source_failure(
+                SourceFailureKind.PROTOCOL,
+                "Unable to resolve masked download link during link refresh",
+            )
+            logger.error("Unexpected link-resolution failure for %s", title)
+            return RefreshOutcome(RefreshOutcomeKind.SCRAPE_ERROR, failure=failure)
+
+        if resolution.kind is LinkResolutionKind.UNSUPPORTED_HOST:
+            # Still on a host we cannot retrieve from. Re-park on the long
+            # backoff instead of clearing it: the source may rehost later.
+            logger.info(
+                "Link refresh for %s resolved to unsupported host %s",
+                title,
+                resolution.host or "unknown",
+            )
+            return RefreshOutcome(RefreshOutcomeKind.UNSUPPORTED_HOST)
+        if resolution.kind is LinkResolutionKind.DEAD_LINK:
+            logger.info("Link refresh found no available link for %s", title)
+            return RefreshOutcome(RefreshOutcomeKind.DEAD_LINK)
+        detail.limewire_url = resolution.url
+
     if not detail.limewire_url:
         logger.info("Link refresh found no download link for %s", title)
         return RefreshOutcome(RefreshOutcomeKind.NO_LINK)
 
     try:
-        old_identity = normalize_limewire_share_url(attempted_url)
-        new_identity = normalize_limewire_share_url(detail.limewire_url)
+        old_identity = normalize_download_url(attempted_url)
+        new_identity = normalize_download_url(detail.limewire_url)
     except (TypeError, URLValidationError):
         failure = _source_failure(
             SourceFailureKind.PROTOCOL,
@@ -138,13 +187,32 @@ async def _refresh_link_from_page(
 
 
 def _refresh_needs_reschedule(outcome: RefreshOutcome) -> bool:
-    if outcome.kind is RefreshOutcomeKind.SOURCE_BLOCKED:
+    if outcome.kind in (
+        RefreshOutcomeKind.SOURCE_BLOCKED,
+        # Both re-probe outcomes keep a schedule: the row is still unusable,
+        # but a later rotation or rehost can recover it.
+        RefreshOutcomeKind.DEAD_LINK,
+        RefreshOutcomeKind.UNSUPPORTED_HOST,
+    ):
         return True
     return (
         outcome.kind is RefreshOutcomeKind.SCRAPE_ERROR
         and outcome.failure is not None
         and outcome.failure.kind is SourceFailureKind.TRANSIENT
     )
+
+
+def _refresh_retry_at(outcome: RefreshOutcome) -> datetime:
+    """Pick the re-probe delay for a rescheduled refresh outcome.
+
+    A rehost to a supported host is far less likely than a rotated link, so it
+    waits much longer; transient/blocked refreshes keep the short delay.
+    """
+    if outcome.kind is RefreshOutcomeKind.UNSUPPORTED_HOST:
+        return unsupported_host_reprobe_at()
+    if outcome.kind is RefreshOutcomeKind.DEAD_LINK:
+        return dead_link_reprobe_at()
+    return _next_retry_at()
 
 
 def _apply_refresh_outcome(
@@ -165,7 +233,7 @@ def _apply_refresh_outcome(
         return idx.resolve_link_refresh(
             issue_id,
             outcome,
-            retry_at=_next_retry_at(),
+            retry_at=_refresh_retry_at(outcome),
         )
     if outcome.kind is RefreshOutcomeKind.SCRAPE_ERROR:
         return idx.clear_link_refresh(issue_id)
@@ -461,7 +529,7 @@ async def _download_one_impl(
         )
 
     try:
-        identity = normalize_limewire_share_url(raw_url)
+        identity = normalize_download_url(raw_url)
     except (TypeError, URLValidationError):
         return await _persist_and_emit(
             issue,

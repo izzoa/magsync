@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 
 import magsync.core.batch as batch_mod
@@ -418,3 +419,95 @@ async def test_due_refresh_rotates_without_requesting_dead_share(tmp_path, monke
     assert stored["limewire_url"] == FRESH_A
     assert stored["download_status"] == DownloadStatus.PENDING.value
     assert stored["next_action"] is None
+
+
+# --- masked-link resolution on the repair path ---
+
+MASKED_KEY = "dl_key_7d40aadd760489dfd1138c652765a2e8"
+
+
+def _masked_source(payload, *, status: int = 200):
+    """A source client whose masked-key exchange returns ``payload``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            text=payload if isinstance(payload, str) else None,
+            json=None if isinstance(payload, str) else payload,
+            headers={"content-type": "application/json"},
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _claim_due_refresh(idx, issue):
+    idx.record_download_failure(
+        issue["id"],
+        DownloadFailureKind.SHARE_UNAVAILABLE,
+        "dead share",
+    )
+    idx.schedule_link_refresh(issue["id"], datetime.now(timezone.utc))
+    claimed = idx.claim_due_link_refreshes([], now=datetime.now(timezone.utc))
+    assert len(claimed) == 1
+    return claimed
+
+
+async def test_due_refresh_resolves_masked_link_and_rotates(tmp_path, monkeypatch):
+    # A masked-only page has no inline URL at all: without key resolution the
+    # refresh would report NO_LINK forever and the share would stay dead.
+    cfg, idx, by_page = _setup(
+        tmp_path,
+        [_row("Masked Refresh - January 2025", "masked-refresh-2025", SHARED)],
+    )
+    claimed = await _claim_due_refresh(idx, next(iter(by_page.values())))
+
+    async def fake_scrape(page_url, **kwargs):
+        return ScrapedIssue("Masked", page_url, download_key=MASKED_KEY)
+
+    async def forbidden_download(*args, **kwargs):
+        pytest.fail("source-only refresh requested the known-dead LimeWire share")
+
+    monkeypatch.setattr(batch_mod, "scrape_detail_page", fake_scrape)
+    monkeypatch.setattr(batch_mod, "download_and_decrypt", forbidden_download)
+
+    async with _masked_source({"success": True, "data": {"url": FRESH_A}}) as http:
+        outcomes = await refresh_due_links(
+            claimed, idx, FreemagazinesClient(http_client=http, scrape_delay=0)
+        )
+
+    stored = idx.get_issues()[0]
+    idx.close()
+
+    assert outcomes[0]["success"] is True
+    assert outcomes[0]["outcome"].kind is RefreshOutcomeKind.ROTATED
+    assert stored["limewire_url"] == FRESH_A
+    assert stored["download_status"] == DownloadStatus.PENDING.value
+
+
+async def test_rejected_key_on_refresh_reparks_as_dead_link(
+    tmp_path, monkeypatch
+):
+    cfg, idx, by_page = _setup(
+        tmp_path,
+        [_row("Masked Broken - January 2025", "masked-broken-2025", SHARED)],
+    )
+    claimed = await _claim_due_refresh(idx, next(iter(by_page.values())))
+
+    async def fake_scrape(page_url, **kwargs):
+        return ScrapedIssue("Masked", page_url, download_key=MASKED_KEY)
+
+    monkeypatch.setattr(batch_mod, "scrape_detail_page", fake_scrape)
+
+    async with _masked_source({"success": False}) as http:
+        outcomes = await refresh_due_links(
+            claimed, idx, FreemagazinesClient(http_client=http, scrape_delay=0)
+        )
+
+    stored = idx.get_issues()[0]
+    idx.close()
+
+    # A rejected key is an outcome, not an error: the row keeps its URL and is
+    # re-parked on a schedule rather than being cleared or retried at once.
+    assert outcomes[0]["outcome"].kind is RefreshOutcomeKind.DEAD_LINK
+    assert stored["limewire_url"] == SHARED  # unchanged, never cleared
+    assert stored["next_action"] == "REFRESH_LINK"

@@ -1341,3 +1341,309 @@ async def test_rotated_transient_contract_is_one_immediate_attempt(
     assert result.failure_kind is DownloadFailureKind.TRANSIENT
     assert result.attempt_count == 1
     assert len(requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# VK document backend and host dispatch
+# ---------------------------------------------------------------------------
+
+VK_PAGE = "https://vk.com/doc711807114_676564963"
+VK_DIRECT = "https://psv4.userapi.com/s/v1/d/OPAQUE/Magazine_freemagazines_top.pdf"
+PDF_BODY = b"%PDF-1.6\n" + b"x" * 512
+
+
+def _vk_page_html(direct: str = VK_DIRECT) -> str:
+    escaped = direct.replace("/", "\\/")
+    return f'<html><body><script>var d = {{"docUrl":"{escaped}"}};</script></body></html>'
+
+
+def _vk_transport(
+    *,
+    page_status: int = 200,
+    page_html: str | None = None,
+    body: bytes = PDF_BODY,
+    file_status: int | None = None,
+    requests: list | None = None,
+):
+    """A transport serving the VK doc page and its direct file URL."""
+
+    html = _vk_page_html() if page_html is None else page_html
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append((request.method, str(request.url), dict(request.headers)))
+        if request.url.host == "vk.com":
+            return httpx.Response(
+                page_status, text=html, headers={"content-type": "text/html"}
+            )
+        # The direct file URL.
+        if file_status is not None:
+            return httpx.Response(file_status, text="error body")
+        rng = request.headers.get("range")
+        if rng:
+            start = int(rng.split("=")[1].split("-")[0])
+            if start >= len(body):
+                return httpx.Response(
+                    416,
+                    headers={"content-range": f"bytes */{len(body)}"},
+                )
+            return httpx.Response(
+                206,
+                content=body[start:],
+                headers={
+                    "content-type": "application/pdf",
+                    "content-range": f"bytes {start}-{len(body) - 1}/{len(body)}",
+                },
+            )
+        return httpx.Response(
+            200,
+            content=body,
+            headers={
+                "content-type": "application/pdf",
+                "content-length": str(len(body)),
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.fixture
+def vk_client(monkeypatch):
+    """Route the downloader's own client at a scripted VK transport."""
+
+    def install(**kwargs):
+        transport = _vk_transport(**kwargs)
+        real = _REAL_ASYNC_CLIENT
+
+        def factory(*args, **client_kwargs):
+            client_kwargs.pop("transport", None)
+            return real(*args, transport=transport, **client_kwargs)
+
+        monkeypatch.setattr(dl.httpx, "AsyncClient", factory)
+        return transport
+
+    return install
+
+
+@pytest.fixture(autouse=True)
+def _isolated_download_env(monkeypatch, tmp_path):
+    """Keep VK finalization off the real user index and rate gate.
+
+    ``_finalize_vk_download`` consults the index for content deduplication, so
+    without this the suite would read the developer's own ~/.magsync database.
+    """
+    import magsync.core.index as index_mod
+
+    monkeypatch.setattr(dl, "get_rate_limit_gate", lambda: RateLimitGate())
+    monkeypatch.setattr(
+        index_mod, "get_db_path", lambda: tmp_path / "isolated-index.db"
+    )
+
+
+async def test_vk_document_downloads_without_credentials_or_decryption(
+    tmp_path, vk_client
+):
+    requests: list = []
+    vk_client(requests=requests)
+
+    dest = tmp_path / "Issue.pdf"
+    result = await dl._download_vk_once(VK_PAGE, dest)
+
+    assert result.success, result.error
+    assert dest.read_bytes() == PDF_BODY
+    assert result.sha256 == hashlib.sha256(PDF_BODY).hexdigest()
+    # No credential, token, or cookie is ever sent.
+    for _method, _url, headers in requests:
+        assert "authorization" not in headers
+        assert "cookie" not in headers
+
+
+async def test_vk_direct_url_is_derived_per_attempt_and_never_persisted(
+    tmp_path, vk_client, caplog
+):
+    requests: list = []
+    vk_client(requests=requests)
+    caplog.set_level(logging.DEBUG, logger="magsync")
+
+    result = await dl._download_vk_once(VK_PAGE, tmp_path / "Issue.pdf")
+    assert result.success
+
+    # The page is fetched every attempt, so the signed URL's TTL never matters.
+    assert sum(1 for m, u, _h in requests if "vk.com" in u) == 1
+    # The signed URL never reaches the result or the logs.
+    assert VK_DIRECT not in caplog.text
+    assert result.file_path is not None
+    assert "userapi" not in str(result.file_path)
+
+
+async def test_vk_page_without_a_derivable_url_is_a_typed_failure(
+    tmp_path, vk_client
+):
+    vk_client(page_html="<html><body>no document here</body></html>")
+
+    result = await dl._download_vk_once(VK_PAGE, tmp_path / "Issue.pdf")
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+    assert not (tmp_path / "Issue.pdf").exists()
+
+
+async def test_vk_direct_url_on_a_foreign_host_is_refused(tmp_path, vk_client):
+    vk_client(page_html=_vk_page_html("https://evil.test/steal.pdf"))
+
+    result = await dl._download_vk_once(VK_PAGE, tmp_path / "Issue.pdf")
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+
+
+async def test_vk_resumes_from_local_partial_bytes(tmp_path, vk_client):
+    requests: list = []
+    vk_client(requests=requests)
+    dest = tmp_path / "Issue.pdf"
+    part = dl._part_path_for(dest, VK_PAGE)
+    part.write_bytes(PDF_BODY[:100])
+
+    result = await dl._download_vk_once(VK_PAGE, dest)
+
+    assert result.success
+    assert dest.read_bytes() == PDF_BODY
+    ranged = [h.get("range") for _m, u, h in requests if "userapi" in u]
+    assert ranged == ["bytes=100-"]  # resumed, not restarted
+
+
+async def test_vk_range_inconsistent_response_is_not_appended(tmp_path, monkeypatch):
+    dest = tmp_path / "Issue.pdf"
+    part = dl._part_path_for(dest, VK_PAGE)
+    part.write_bytes(b"%PDF-1.6" + b"y" * 92)
+    original = bytes(part.read_bytes())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "vk.com":
+            return httpx.Response(
+                200, text=_vk_page_html(), headers={"content-type": "text/html"}
+            )
+        # Wrong offset for the requested range.
+        return httpx.Response(
+            206,
+            content=b"WRONG",
+            headers={"content-range": f"bytes 0-4/{len(PDF_BODY)}"},
+        )
+
+    real = _REAL_ASYNC_CLIENT
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        dl.httpx,
+        "AsyncClient",
+        lambda *a, **k: real(*a, transport=transport, **{x: y for x, y in k.items() if x != "transport"}),
+    )
+
+    result = await dl._download_vk_once(VK_PAGE, dest)
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert part.read_bytes() == original  # never spliced
+
+
+async def test_vk_error_body_is_never_written_to_the_partial(tmp_path, vk_client):
+    vk_client(file_status=503)
+    dest = tmp_path / "Issue.pdf"
+
+    result = await dl._download_vk_once(VK_PAGE, dest)
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    part = dl._part_path_for(dest, VK_PAGE)
+    assert not part.exists() or b"error body" not in part.read_bytes()
+
+
+async def test_vk_non_pdf_payload_is_terminally_unsupported(tmp_path, vk_client):
+    vk_client(body=b"PK\x03\x04" + b"z" * 256)
+    dest = tmp_path / "Issue.pdf"
+
+    result = await dl._download_vk_once(VK_PAGE, dest)
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.UNSUPPORTED
+    assert result.unsupported is True
+    assert not dest.exists()
+
+
+async def test_vk_incomplete_download_is_transient_and_keeps_the_partial(
+    tmp_path, monkeypatch
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "vk.com":
+            return httpx.Response(
+                200, text=_vk_page_html(), headers={"content-type": "text/html"}
+            )
+        # Advertises more than it delivers.
+        return httpx.Response(
+            200,
+            content=PDF_BODY[:50],
+            headers={
+                "content-type": "application/pdf",
+                "content-length": str(len(PDF_BODY)),
+            },
+        )
+
+    real = _REAL_ASYNC_CLIENT
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        dl.httpx,
+        "AsyncClient",
+        lambda *a, **k: real(*a, transport=transport, **{x: y for x, y in k.items() if x != "transport"}),
+    )
+    dest = tmp_path / "Issue.pdf"
+
+    result = await dl._download_vk_once(VK_PAGE, dest)
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert dl._part_path_for(dest, VK_PAGE).exists()  # kept for resume
+
+
+async def test_dispatch_routes_vk_urls_to_the_document_backend(tmp_path, monkeypatch):
+    called: list[str] = []
+
+    async def fake_vk(page_url, dest, **kwargs):
+        called.append(page_url)
+        return DownloadResult(success=True, file_path=dest)
+
+    async def fake_limewire(*args, **kwargs):
+        called.append("limewire")
+        return DownloadResult(success=True, file_path=tmp_path / "x.pdf")
+
+    monkeypatch.setattr(dl, "_download_vk_once", fake_vk)
+    monkeypatch.setattr(dl, "_download_and_decrypt_once", fake_limewire)
+
+    await dl.download_and_decrypt(
+        VK_PAGE, tmp_path / "a.pdf", constants=LimeWireConstants(), retry_attempts=0
+    )
+    await dl.download_and_decrypt(
+        URL, tmp_path / "b.pdf", constants=LimeWireConstants(), retry_attempts=0
+    )
+
+    assert called == [VK_PAGE, "limewire"]
+
+
+async def test_dispatch_refuses_an_unsupported_host_without_requesting_bytes(
+    tmp_path, monkeypatch
+):
+    async def forbidden(*args, **kwargs):
+        pytest.fail("an unsupported host must never be attempted")
+
+    monkeypatch.setattr(dl, "_download_vk_once", forbidden)
+    monkeypatch.setattr(dl, "_download_and_decrypt_once", forbidden)
+
+    result = await dl.download_and_decrypt(
+        "https://mega.nz/file/abc#key",
+        tmp_path / "a.pdf",
+        constants=LimeWireConstants(),
+        retry_attempts=0,
+    )
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.UNSUPPORTED
+    assert result.unsupported is True
+    assert "mega.nz" in (result.error or "")

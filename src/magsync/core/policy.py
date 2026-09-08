@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from magsync.core.models import (
     DownloadFailureKind,
@@ -104,3 +105,27 @@ def policy_for_result(result: DownloadResult) -> DownloadFailurePolicy:
         raise ValueError("successful download results do not have failure policy")
     kind = result.failure_kind or DownloadFailureKind.INTERNAL
     return get_download_failure_policy(kind)
+
+
+# Re-probe delays for links that resolved but are not usable. These are
+# deliberately long because the daemon cycles on a multi-hour interval: a
+# short delay would be due on every cycle, which is the per-cycle retry loop
+# these schedules exist to prevent. A dead/expired key may be rotated within
+# days; a rehost to a supported file host is far less likely, so it waits
+# much longer. Ordering between the two is required behavior, not a detail.
+DEAD_LINK_REPROBE_DELAY = timedelta(hours=24)
+UNSUPPORTED_HOST_REPROBE_DELAY = timedelta(days=30)
+
+assert UNSUPPORTED_HOST_REPROBE_DELAY > DEAD_LINK_REPROBE_DELAY
+
+
+def dead_link_reprobe_at(now: datetime | None = None) -> datetime:
+    """Return when a rejected-key row should be re-probed."""
+
+    return (now or datetime.now(timezone.utc)) + DEAD_LINK_REPROBE_DELAY
+
+
+def unsupported_host_reprobe_at(now: datetime | None = None) -> datetime:
+    """Return when an unsupported-host row should be re-probed."""
+
+    return (now or datetime.now(timezone.utc)) + UNSUPPORTED_HOST_REPROBE_DELAY

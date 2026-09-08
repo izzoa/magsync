@@ -194,7 +194,7 @@ class MagSyncApp(App):
                 "file_size": r.file_size,
                 "cover_image_url": r.cover_image_url,
             })
-        new_count = self.idx.add_issues(mag_id, issues_data)
+        new_count = self.idx.add_issues(mag_id, issues_data).added
 
         # Get indexed issues
         all_issues = self.idx.get_issues(magazine_title=norm)

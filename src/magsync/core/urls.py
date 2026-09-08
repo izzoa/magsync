@@ -1,17 +1,45 @@
 """Strict external URL validation and normalization.
 
-LimeWire URL fragments are decryption-key material.  Callers may use the
-normalized full URL as an internal retry/single-flight identity, but must never
-write that identity to logs or persisted diagnostic text.
+LimeWire URL fragments are decryption-key material, and a VK access hash is an
+access token.  Callers may use the normalized full URL as an internal
+retry/single-flight identity, but must never write that identity to logs or
+persisted diagnostic text.
+
+The source serves download links from more than one file host, so a stored
+download URL is validated against a *supported host* rather than one host: see
+:func:`normalize_download_url`.  Shared safety rules (HTTPS, no credentials, no
+nonstandard port, exact host spelling) live in one place so a lookalike host
+cannot pass on any per-host branch.
 """
 
 from __future__ import annotations
 
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+import re
+from enum import Enum
+from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 LIMEWIRE_HOSTS = frozenset({"limewire.com", "www.limewire.com"})
+VK_HOSTS = frozenset({"vk.com", "www.vk.com"})
 SOURCE_HOSTS = frozenset({"freemagazines.top", "www.freemagazines.top"})
+
+# A VK document path names exactly one document: /doc<owner>_<id>. Owner ids
+# are negative for community-owned documents.
+_VK_DOC_PATH_RE = re.compile(r"^/doc(-?\d{1,20})_(\d{1,20})$")
+# The only query parameter a VK document URL may carry. Its value is an access
+# token and is treated as secret material.
+_VK_ALLOWED_QUERY_KEYS = frozenset({"hash"})
+
+
+class DownloadHost(str, Enum):
+    """A file host magsync can retrieve a payload from.
+
+    Values are stable strings so they are safe to report in counters and
+    diagnostics; the host is derived from a URL and never persisted as schema.
+    """
+
+    LIMEWIRE = "limewire"
+    VK = "vk"
 
 
 class URLValidationError(ValueError):
@@ -109,6 +137,109 @@ def limewire_sharing_id(url: str) -> str:
 
     normalized = normalize_limewire_share_url(url)
     return urlsplit(normalized).path[len("/d/") :]
+
+
+def normalize_vk_document_url(url: str) -> str:
+    """Validate and return the canonical VK document URL.
+
+    Strict form: HTTPS, exact ``vk.com``/``www.vk.com`` host, an exact
+    ``/doc<owner>_<id>`` path naming one document, and no query beyond an
+    optional ``hash`` access token.  Any fragment is dropped: it is not part of
+    a document's identity, and rejecting one would risk misclassifying an
+    otherwise valid link as an unsupported host.
+    """
+
+    parsed = _split_https_url(url, allowed_hosts=VK_HOSTS)
+
+    if not _VK_DOC_PATH_RE.match(parsed.path):
+        raise URLValidationError("VK document path must be /doc<owner>_<id>")
+
+    query = parsed.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=False)
+        if not pairs or any(key not in _VK_ALLOWED_QUERY_KEYS for key, _ in pairs):
+            raise URLValidationError("VK document URL query is not allowed")
+        query = urlencode(pairs)
+
+    return urlunsplit(("https", "vk.com", parsed.path, query, ""))
+
+
+def is_valid_vk_document_url(url: str | None) -> bool:
+    """Return whether ``url`` is a strict VK document URL."""
+
+    if url is None:
+        return False
+    try:
+        normalize_vk_document_url(url)
+    except (TypeError, URLValidationError):
+        return False
+    return True
+
+
+# Per-host strict validators, in dispatch order. Adding a backend is an entry
+# here plus a downloader dispatch arm.
+_DOWNLOAD_HOSTS: tuple[tuple[DownloadHost, frozenset[str], object], ...] = (
+    (DownloadHost.LIMEWIRE, LIMEWIRE_HOSTS, normalize_limewire_share_url),
+    (DownloadHost.VK, VK_HOSTS, normalize_vk_document_url),
+)
+
+
+def is_supported_download_host(hostname: str | None) -> bool:
+    """Return whether ``hostname`` is a host magsync has a backend for.
+
+    Host membership only: a URL on a supported host may still fail that
+    host's strict form, which is a malformed link rather than an unsupported
+    destination. Callers need to tell those two apart.
+    """
+
+    if not hostname:
+        return False
+    lowered = hostname.lower()
+    return any(lowered in hosts for _host, hosts, _normalizer in _DOWNLOAD_HOSTS)
+
+
+def download_host_of(url: str) -> DownloadHost:
+    """Return which supported host ``url`` belongs to, in its strict form.
+
+    Raises :class:`URLValidationError` when the URL is on no supported host or
+    fails that host's strict form. The hostname is matched exactly, so a
+    lookalike host can never select a backend.
+    """
+
+    if not isinstance(url, str) or not url:
+        raise URLValidationError("URL is empty")
+    try:
+        hostname = (urlsplit(url).hostname or "").lower()
+    except (TypeError, ValueError) as exc:
+        raise URLValidationError("URL is malformed") from exc
+
+    for host, hosts, normalizer in _DOWNLOAD_HOSTS:
+        if hostname in hosts:
+            normalizer(url)  # enforce that host's strict form
+            return host
+    raise URLValidationError("URL host is not a supported download host")
+
+
+def normalize_download_url(url: str) -> str:
+    """Validate and canonicalize a download URL on any supported host."""
+
+    host = download_host_of(url)
+    for candidate, _hosts, normalizer in _DOWNLOAD_HOSTS:
+        if candidate is host:
+            return normalizer(url)
+    raise URLValidationError("URL host is not a supported download host")
+
+
+def is_valid_download_url(url: str | None) -> bool:
+    """Return whether ``url`` is a strict URL on some supported download host."""
+
+    if url is None:
+        return False
+    try:
+        normalize_download_url(url)
+    except (TypeError, URLValidationError):
+        return False
+    return True
 
 
 def normalize_source_url(url: str) -> str:

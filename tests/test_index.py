@@ -8,7 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from magsync.core.index import MagazineIndex, _plausible_limewire_url
+from magsync.core.index import MagazineIndex, _plausible_download_url
 from magsync.core.models import (
     DownloadFailureKind,
     DownloadStatus,
@@ -44,11 +44,13 @@ def test_backfill_fills_null_limewire_url(tmp_path):
     idx = _index(tmp_path)
     mag = idx.get_or_create_magazine("Mag", "mag")
     added = idx.add_issues(mag, [{"title": "T", "page_url": "p1", "limewire_url": None}])
-    assert added == 1
+    assert added.added == 1
+    assert added.linkless == 1  # stored, but nothing can claim it yet
 
     # Re-scrape now yields a URL for the same page_url → backfill, not a new row.
     added2 = idx.add_issues(mag, [{"title": "T", "page_url": "p1", "limewire_url": LW_A}])
-    assert added2 == 0
+    assert added2.added == 0
+    assert added2.linkless == 0  # repaired in place
 
     rows = idx.get_issues()
     assert rows[0]["limewire_url"] == LW_A
@@ -94,7 +96,8 @@ def test_identical_link_is_noop(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="magsync"):
         added = idx.add_issues(mag, [{"title": "T", "page_url": "p1", "limewire_url": LW_A}])
 
-    assert added == 0  # not counted as new
+    assert added.added == 0  # not counted as new
+    assert added.linkless == 0
     assert idx.get_issues()[0]["limewire_url"] == LW_A
     assert idx.get_issues()[0]["download_status"] == "pending"
     assert not any("Refreshed LimeWire link" in r.getMessage() for r in caplog.records)
@@ -124,13 +127,17 @@ def test_implausible_and_lookalike_candidates_rejected(tmp_path):
     idx.close()
 
 
-def test_plausible_limewire_url_guard():
-    assert _plausible_limewire_url(LW_A)
-    assert _plausible_limewire_url("https://www.limewire.com/d/Xy9#frag")
-    assert not _plausible_limewire_url("https://notlimewire.com/d/x#k")
-    assert not _plausible_limewire_url("https://limewire.com/d/#k")
-    assert not _plausible_limewire_url("https://limewire.com/d/x/y#k")
-    assert not _plausible_limewire_url("")
+def test_plausible_download_url_guard():
+    assert _plausible_download_url(LW_A)
+    assert _plausible_download_url("https://www.limewire.com/d/Xy9#frag")
+    # Any supported host passes the same storage guard.
+    assert _plausible_download_url("https://vk.com/doc711807114_676564963")
+    assert not _plausible_download_url("https://notlimewire.com/d/x#k")
+    assert not _plausible_download_url("https://limewire.com/d/#k")
+    assert not _plausible_download_url("https://limewire.com/d/x/y#k")
+    assert not _plausible_download_url("https://vk.com.evil.com/doc1_2")
+    assert not _plausible_download_url("https://psv4.userapi.com/x.pdf")
+    assert not _plausible_download_url("")
 
 
 def test_url_change_resets_failed_and_unavailable_to_pending(tmp_path):
@@ -189,8 +196,8 @@ def test_title_is_not_backfilled(tmp_path):
 def test_genuinely_new_page_url_is_counted(tmp_path):
     idx = _index(tmp_path)
     mag = idx.get_or_create_magazine("Mag", "mag")
-    assert idx.add_issues(mag, [{"title": "A", "page_url": "pa", "limewire_url": LW_A}]) == 1
-    assert idx.add_issues(mag, [{"title": "B", "page_url": "pb", "limewire_url": LW_B}]) == 1
+    assert idx.add_issues(mag, [{"title": "A", "page_url": "pa", "limewire_url": LW_A}]).added == 1
+    assert idx.add_issues(mag, [{"title": "B", "page_url": "pb", "limewire_url": LW_B}]).added == 1
     idx.close()
 
 
@@ -221,6 +228,80 @@ def test_get_issues_missing_url_filtered_by_magazine(tmp_path):
 
     missing = idx.get_issues_missing_url(magazine_title="alpha")
     assert [m["page_url"] for m in missing] == ["pa"]
+    idx.close()
+
+
+def test_page_urls_missing_link_gates_resolution(tmp_path):
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    idx.add_issues(
+        mag,
+        [
+            {"title": "Linked", "page_url": "pa", "limewire_url": LW_A},
+            {"title": "Linkless", "page_url": "pb", "limewire_url": None},
+            {"title": "Empty", "page_url": "pc", "limewire_url": ""},
+        ],
+    )
+
+    needed = idx.page_urls_missing_link(["pa", "pb", "pc", "never-indexed"])
+    # A linked page needs nothing; NULL/empty and unknown pages do.
+    assert needed == {"pb", "pc", "never-indexed"}
+    assert idx.page_urls_missing_link([]) == set()
+    idx.close()
+
+
+def test_missing_link_gate_and_missing_url_query_agree(tmp_path):
+    # Backfill and link-less reporting must never disagree on the row set.
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    rows = [
+        {"title": "A", "page_url": "pa", "limewire_url": None},
+        {"title": "B", "page_url": "pb", "limewire_url": LW_B},
+        {"title": "C", "page_url": "pc", "limewire_url": ""},
+    ]
+    idx.add_issues(mag, rows)
+
+    from_query = {r["page_url"] for r in idx.get_issues_missing_url()}
+    from_gate = idx.page_urls_missing_link([r["page_url"] for r in rows])
+    assert from_query == from_gate == {"pa", "pc"}
+    idx.close()
+
+
+def test_skipped_resolution_leaves_stored_url_intact(tmp_path):
+    # An issue whose key was deliberately not resolved reaches indexing with
+    # no URL. That must never clear the working URL already stored.
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    idx.add_issues(mag, [{"title": "T", "page_url": "p1", "limewire_url": LW_A}])
+
+    outcome = idx.add_issues(
+        mag, [{"title": "T", "page_url": "p1", "limewire_url": None}]
+    )
+
+    assert idx.get_issues()[0]["limewire_url"] == LW_A
+    assert outcome.added == 0
+    assert outcome.linkless == 0  # it has a link; it just wasn't re-resolved
+    idx.close()
+
+
+def test_linkless_count_ignores_stranger_results(tmp_path):
+    # A fuzzy-search stranger is cataloged and never claimed by design, so
+    # counting it link-less would report every healthy cycle as broken.
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    sub = Subscription(query="Wanted Mag")
+
+    outcome = idx.add_issues(
+        mag,
+        [
+            {"title": "Wanted Mag - Jan 2026", "page_url": "pw", "limewire_url": None},
+            {"title": "Stranger Mag - Jan 2026", "page_url": "ps", "limewire_url": None},
+        ],
+        subscription=sub,
+    )
+
+    assert outcome.added == 2
+    assert outcome.linkless == 1  # only the wanted one
     idx.close()
 
 
@@ -735,4 +816,141 @@ def test_pipeline_state_survives_restart_and_recovers_after_valid_empty(tmp_path
     assert state["consecutive_source_failure_cycles"] == 0
     assert state["last_successful_source_check_at"] == recovered.isoformat()
     assert state["degraded_reason"] is None
+    idx.close()
+
+
+# --- parking unusable links, and keeping them out of the resolution gate ---
+
+
+def _add_linkless(idx, page_url: str = "pa", title: str = "T") -> int:
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    idx.add_issues(mag, [{"title": title, "page_url": page_url, "limewire_url": None}])
+    issue_id = next(r["id"] for r in idx.get_issues() if r["page_url"] == page_url)
+    idx.mark_manual([issue_id])
+    return issue_id
+
+
+def test_park_link_outcome_sets_status_and_schedule(tmp_path):
+    idx = _index(tmp_path)
+    unsupported_id = _add_linkless(idx, "pa", "Unsupported")
+    dead_id = _add_linkless(idx, "pb", "Dead")
+    now = datetime.now(timezone.utc)
+
+    assert idx.park_link_outcome(
+        unsupported_id, DownloadStatus.UNSUPPORTED, now + timedelta(days=30)
+    )
+    assert idx.park_link_outcome(
+        dead_id, DownloadStatus.UNAVAILABLE, now + timedelta(hours=24)
+    )
+
+    rows = {r["page_url"]: r for r in idx.get_issues()}
+    assert rows["pa"]["download_status"] == "unsupported"
+    assert rows["pb"]["download_status"] == "unavailable"
+    for row in rows.values():
+        assert row["next_action"] == "REFRESH_LINK"
+    # The rehost re-probe waits longer than the dead-link re-probe.
+    assert rows["pa"]["next_retry_at"] > rows["pb"]["next_retry_at"]
+    idx.close()
+
+
+def test_park_link_outcome_never_disturbs_a_complete_row(tmp_path):
+    idx = _index(tmp_path)
+    issue_id = _add_one(idx, LW_A)
+    idx.update_download_status(issue_id, DownloadStatus.COMPLETE, file_path="/x.pdf")
+
+    assert not idx.park_link_outcome(
+        issue_id, DownloadStatus.UNSUPPORTED, datetime.now(timezone.utc)
+    )
+    assert idx.get_issues()[0]["download_status"] == "complete"
+    idx.close()
+
+
+def test_parked_rows_are_excluded_from_the_resolution_gate(tmp_path):
+    # Load-bearing: without this the scheduled backoff is defeated, because
+    # indexing would resolve the row again on the very next cycle.
+    idx = _index(tmp_path)
+    parked = _add_linkless(idx, "pa")
+    _add_linkless(idx, "pb")
+
+    assert idx.page_urls_missing_link(["pa", "pb"]) == {"pa", "pb"}
+    idx.park_link_outcome(
+        parked, DownloadStatus.UNSUPPORTED, datetime.now(timezone.utc) + timedelta(days=30)
+    )
+    assert idx.page_urls_missing_link(["pa", "pb"]) == {"pb"}
+    idx.close()
+
+
+def test_refresh_claim_covers_unsupported_rows_and_respects_provenance(tmp_path):
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    idx.add_issues(
+        mag,
+        [
+            {"title": "Wanted", "page_url": "pa", "limewire_url": None},
+            {"title": "Stranger", "page_url": "pb", "limewire_url": None},
+        ],
+    )
+    ids = {r["page_url"]: r["id"] for r in idx.get_issues()}
+    idx.mark_manual([ids["pa"]])  # only this one is requested
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    idx.park_link_outcome(ids["pa"], DownloadStatus.UNSUPPORTED, due)
+    idx.park_link_outcome(ids["pb"], DownloadStatus.UNSUPPORTED, due)
+
+    claimed = idx.claim_due_link_refreshes([], now=datetime.now(timezone.utc))
+
+    # Unsupported rows are re-probeable, but a never-requested one is not work.
+    assert [row["page_url"] for row in claimed] == ["pa"]
+    idx.close()
+
+
+def test_future_reprobe_is_not_claimed_early(tmp_path):
+    idx = _index(tmp_path)
+    issue_id = _add_linkless(idx, "pa")
+    idx.park_link_outcome(
+        issue_id,
+        DownloadStatus.UNSUPPORTED,
+        datetime.now(timezone.utc) + timedelta(days=30),
+    )
+
+    assert idx.claim_due_link_refreshes([], now=datetime.now(timezone.utc)) == []
+    idx.close()
+
+
+def test_rehosted_issue_becomes_claimable_again(tmp_path):
+    # A due re-probe that finds a supported-host link must recover the row.
+    idx = _index(tmp_path)
+    issue_id = _add_linkless(idx, "pa")
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    idx.park_link_outcome(issue_id, DownloadStatus.UNSUPPORTED, due)
+    idx.claim_due_link_refreshes([], now=datetime.now(timezone.utc))
+
+    idx.resolve_link_refresh(
+        issue_id, RefreshOutcome(RefreshOutcomeKind.ROTATED, url=LW_A)
+    )
+
+    row = idx.get_issues()[0]
+    assert row["limewire_url"] == LW_A
+    assert row["download_status"] == "pending"
+    claimed = idx.claim_pending_and_due_downloads([])
+    assert [r["limewire_url"] for r in claimed] == [LW_A]
+    idx.close()
+
+
+def test_still_unusable_reprobe_is_reparked_on_the_long_backoff(tmp_path):
+    idx = _index(tmp_path)
+    issue_id = _add_linkless(idx, "pa")
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    idx.park_link_outcome(issue_id, DownloadStatus.UNSUPPORTED, due)
+    idx.claim_due_link_refreshes([], now=datetime.now(timezone.utc))
+
+    later = datetime.now(timezone.utc) + timedelta(days=30)
+    assert idx.resolve_link_refresh(
+        issue_id,
+        RefreshOutcome(RefreshOutcomeKind.UNSUPPORTED_HOST),
+        retry_at=later,
+    )
+
+    row = idx.get_issues()[0]
+    assert row["download_status"] == "unsupported"
+    assert row["next_action"] == "REFRESH_LINK"
     idx.close()

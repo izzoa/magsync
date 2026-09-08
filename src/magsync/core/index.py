@@ -11,10 +11,10 @@ from urllib.parse import urlparse
 
 from magsync.config import get_db_path
 from magsync.core.matching import eligible_for_any, title_match
-from magsync.core.models import DownloadStatus, RequestedBy
+from magsync.core.models import DownloadStatus, IndexOutcome, RequestedBy
 from magsync.core.urls import (
-    is_valid_limewire_share_url,
-    normalize_limewire_share_url,
+    is_valid_download_url,
+    normalize_download_url,
 )
 
 logger = logging.getLogger("magsync")
@@ -45,9 +45,14 @@ def _utc_timestamp(value: datetime | str | None = None) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _plausible_limewire_url(url: str) -> bool:
-    """Compatibility wrapper around the shared strict validator."""
-    return is_valid_limewire_share_url(url)
+def _plausible_download_url(url: str) -> bool:
+    """Wrapper around the shared strict *supported-host* validator.
+
+    Every write to a stored download URL and every claim predicate goes
+    through here, so widening it to any supported host is what makes the
+    index host-agnostic without touching each call site.
+    """
+    return is_valid_download_url(url)
 
 
 def _sharing_id(url: str) -> str:
@@ -237,13 +242,30 @@ class MagazineIndex:
         null-provenance rows by promotion on re-encounter. Non-matching
         (stranger) results stay null-provenance catalog entries, which no
         automatic claim ever downloads.
+
+        Returns an :class:`IndexOutcome` carrying both the number of newly
+        added issues and, distinctly, the number stored or left without a
+        usable download URL. Callers must not treat ``added`` alone as
+        "actionable work was created": a link-less row can never be claimed.
+
+        ``linkless`` counts only rows that could ever be work — matching the
+        given ``subscription``, or every link-less row when no subscription
+        context is supplied. Stranger results are cataloged by design, so
+        counting them would report a healthy cycle as broken.
         """
         added = 0
+        linkless = 0
         backfill_columns = ("genre", "file_size", "cover_image_url")
         for issue in issues:
             sub_wants = subscription is not None and title_match(
                 issue.get("title") or "", subscription
             )
+            # Only rows that could ever become work are counted link-less.
+            # A fuzzy-search stranger is cataloged and never claimed by
+            # design, so counting it would make every cycle look broken.
+            # With no subscription context (CLI paths) "wanted" is unknown,
+            # so every link-less row counts.
+            counts_linkless = subscription is None or sub_wants
             existing = self.conn.execute(
                 "SELECT id, limewire_url, genre, file_size, cover_image_url "
                 "FROM issues WHERE page_url = ?",
@@ -257,14 +279,14 @@ class MagazineIndex:
                 }
                 incoming_raw = issue.get("limewire_url")
                 incoming_url = (
-                    normalize_limewire_share_url(incoming_raw)
-                    if _plausible_limewire_url(incoming_raw)
+                    normalize_download_url(incoming_raw)
+                    if _plausible_download_url(incoming_raw)
                     else None
                 )
                 url_changed = bool(
                     incoming_url
                     and incoming_url != existing["limewire_url"]
-                    and _plausible_limewire_url(incoming_url)
+                    and _plausible_download_url(incoming_url)
                 )
                 if incoming_url and not existing["limewire_url"]:
                     updates["limewire_url"] = incoming_url
@@ -316,6 +338,13 @@ class MagazineIndex:
                         f"Refreshed LimeWire link for {issue['page_url']}: "
                         f"{_sharing_id(existing['limewire_url'] or '')} → {_sharing_id(incoming_url)}"
                     )
+                # An absent incoming URL is "no information", never a
+                # reason to clear a stored one - so a row is only link-less
+                # here when neither the store nor this scrape has a link.
+                if counts_linkless and not (
+                    updates.get("limewire_url") or existing["limewire_url"]
+                ):
+                    linkless += 1
                 if sub_wants:
                     # Promotion on re-encounter: heals rows cataloged before
                     # this subscription existed. Guarded to NULL so manual (or
@@ -329,8 +358,8 @@ class MagazineIndex:
 
             incoming_raw = issue.get("limewire_url")
             incoming_url = (
-                normalize_limewire_share_url(incoming_raw)
-                if _plausible_limewire_url(incoming_raw)
+                normalize_download_url(incoming_raw)
+                if _plausible_download_url(incoming_raw)
                 else None
             )
             cursor = self.conn.execute(
@@ -363,9 +392,11 @@ class MagazineIndex:
                 ),
             )
             added += 1
+            if counts_linkless and not incoming_url:
+                linkless += 1
 
         self.conn.commit()
-        return added
+        return IndexOutcome(added=added, linkless=linkless)
 
     def update_download_status(
         self,
@@ -591,11 +622,67 @@ class MagazineIndex:
         rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
+    def issue_ids_for_page_urls(self, page_urls: list[str]) -> dict[str, int]:
+        """Map indexed page URLs to their issue ids, one query per chunk.
+
+        Callers that must act on a just-indexed row (for example to park it)
+        need its id without re-reading the whole catalog.
+        """
+        wanted = [url for url in dict.fromkeys(page_urls) if url]
+        if not wanted:
+            return {}
+        found: dict[str, int] = {}
+        for start in range(0, len(wanted), _SQL_IN_CHUNK):
+            chunk = wanted[start : start + _SQL_IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT id, page_url FROM issues WHERE page_url IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            found.update({row["page_url"]: row["id"] for row in rows})
+        return found
+
+    def page_urls_missing_link(self, page_urls: list[str]) -> set[str]:
+        """Return which of ``page_urls`` still need a download URL resolved.
+
+        A page needs one when it is not indexed at all (a genuinely new issue)
+        or is indexed with a NULL/empty ``limewire_url`` *and* is not already
+        parked with a pending link re-probe.  Callers use this to gate
+        masked-link resolution so already-linked issues cost no source
+        request; it is one query per chunk, never one per issue.
+
+        Excluding parked rows is load-bearing: a row parked as a dead link or
+        on an unsupported host still has no usable URL, so without this the
+        scheduled backoff would be defeated by indexing re-resolving it on the
+        very next cycle - which is exactly the per-cycle retry loop that kept
+        the daemon permanently degraded.
+        """
+        wanted = [url for url in dict.fromkeys(page_urls) if url]
+        if not wanted:
+            return set()
+        linked: set[str] = set()
+        for start in range(0, len(wanted), _SQL_IN_CHUNK):
+            chunk = wanted[start : start + _SQL_IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT i.page_url
+                    FROM issues i
+                    LEFT JOIN downloads d ON d.issue_id = i.id
+                    WHERE i.page_url IN ({placeholders})
+                      AND (
+                          (i.limewire_url IS NOT NULL AND i.limewire_url != '')
+                          OR d.next_action = 'REFRESH_LINK'
+                      )""",
+                chunk,
+            ).fetchall()
+            linked.update(row["page_url"] for row in rows)
+        return {url for url in wanted if url not in linked}
+
     def set_limewire_url(self, issue_id: int, limewire_url: str):
         """Store a validated URL and apply new-link attempt semantics."""
-        if not _plausible_limewire_url(limewire_url):
+        if not _plausible_download_url(limewire_url):
             raise ValueError("invalid LimeWire share URL")
-        self.rotate_limewire_url(issue_id, normalize_limewire_share_url(limewire_url))
+        self.rotate_limewire_url(issue_id, normalize_download_url(limewire_url))
 
     def get_tracked_magazines(self) -> list[dict]:
         """Get all tracked magazines with issue counts."""
@@ -710,7 +797,7 @@ class MagazineIndex:
                 subscriptions,
             ):
                 continue
-            if not _plausible_limewire_url(row["limewire_url"]):
+            if not _plausible_download_url(row["limewire_url"]):
                 continue
             eligible.append(row)
         if unknown:
@@ -821,7 +908,7 @@ class MagazineIndex:
                       i.title, i.year, i.month
                FROM downloads d
                JOIN issues i ON i.id = d.issue_id
-               WHERE d.status = 'unavailable'
+               WHERE d.status IN ('unavailable', 'unsupported')
                  AND d.next_action = 'REFRESH_LINK'
                  AND d.next_retry_at IS NOT NULL
                  AND datetime(d.next_retry_at) <= datetime(?)
@@ -884,7 +971,7 @@ class MagazineIndex:
                     """UPDATE downloads
                        SET next_action = NULL, next_retry_at = NULL
                        WHERE issue_id = ?
-                         AND status = 'unavailable'
+                         AND status IN ('unavailable', 'unsupported')
                          AND next_action = 'REFRESH_LINK'
                          AND next_retry_at IS NOT NULL
                          AND datetime(next_retry_at) <= datetime(?)
@@ -965,7 +1052,7 @@ class MagazineIndex:
             skipped = len(wanted) - len(linked)
             claimed_ids: list[int] = []
             for row in linked:
-                if not _plausible_limewire_url(row["limewire_url"]):
+                if not _plausible_download_url(row["limewire_url"]):
                     skipped += 1
                     continue
                 cursor = self.conn.execute(
@@ -996,6 +1083,42 @@ class MagazineIndex:
             self.conn.rollback()
             raise
 
+    def park_link_outcome(
+        self,
+        issue_id: int,
+        status: DownloadStatus | str,
+        retry_at: datetime | str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """Park a freshly indexed row whose link is not usable yet.
+
+        Unlike :meth:`schedule_link_refresh`, this moves the row *into* its
+        parked status from any non-complete state, which is what a
+        just-indexed ``pending`` row needs. ``complete`` and in-flight rows are
+        never disturbed. The scheduled action is what keeps the row out of the
+        indexing resolution gate, so it stops costing a request every cycle.
+        """
+        from magsync.core.diagnostics import sanitize_external_error
+
+        cursor = self.conn.execute(
+            """UPDATE downloads
+               SET status = ?,
+                   next_action = 'REFRESH_LINK',
+                   next_retry_at = ?,
+                   last_error = COALESCE(?, last_error)
+               WHERE issue_id = ?
+                 AND status NOT IN ('complete', 'downloading')""",
+            (
+                _enum_value(status),
+                _utc_timestamp(retry_at),
+                sanitize_external_error(error) if error else None,
+                issue_id,
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
     def schedule_link_refresh(
         self,
         issue_id: int,
@@ -1003,16 +1126,25 @@ class MagazineIndex:
         *,
         error: str | BaseException | None = None,
     ) -> bool:
-        """Park an unavailable share with a future source-only refresh."""
+        """Park an unusable row with a future source-only refresh.
+
+        Applies to ``unavailable`` (dead share) and ``unsupported`` (live link
+        magsync cannot retrieve) rows alike: both may become downloadable if
+        the source rehosts or rotates the link, so both keep a schedule
+        instead of being abandoned.
+        """
         from magsync.core.diagnostics import sanitize_external_error
 
         sanitized = sanitize_external_error(error) if error is not None else None
         cursor = self.conn.execute(
+            # The parked status is preserved, not forced: re-parking an
+            # unsupported-host row as 'unavailable' would silently downgrade
+            # it to a dead share and lose the distinction the caller needs.
             """UPDATE downloads
-               SET status = 'unavailable', next_action = 'REFRESH_LINK',
+               SET next_action = 'REFRESH_LINK',
                    next_retry_at = ?,
                    last_error = COALESCE(?, last_error)
-               WHERE issue_id = ? AND status = 'unavailable'""",
+               WHERE issue_id = ? AND status IN ('unavailable', 'unsupported')""",
             (_utc_timestamp(retry_at), sanitized, issue_id),
         )
         self.conn.commit()
@@ -1025,7 +1157,7 @@ class MagazineIndex:
         cursor = self.conn.execute(
             """UPDATE downloads
                SET next_action = NULL, next_retry_at = NULL
-               WHERE issue_id = ? AND status = 'unavailable'""",
+               WHERE issue_id = ? AND status IN ('unavailable', 'unsupported')""",
             (issue_id,),
         )
         self.conn.commit()
@@ -1033,9 +1165,9 @@ class MagazineIndex:
 
     def rotate_limewire_url(self, issue_id: int, limewire_url: str) -> bool:
         """Atomically store a validated different URL and clear old identity."""
-        if not _plausible_limewire_url(limewire_url):
+        if not _plausible_download_url(limewire_url):
             raise ValueError("invalid LimeWire share URL")
-        limewire_url = normalize_limewire_share_url(limewire_url)
+        limewire_url = normalize_download_url(limewire_url)
 
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1110,9 +1242,13 @@ class MagazineIndex:
         if kind in (
             RefreshOutcomeKind.SOURCE_BLOCKED.value,
             RefreshOutcomeKind.SCRAPE_ERROR.value,
+            RefreshOutcomeKind.DEAD_LINK.value,
+            RefreshOutcomeKind.UNSUPPORTED_HOST.value,
         ):
             if retry_at is None:
                 raise ValueError("blocked/failed refresh outcome requires retry_at")
+            # A still-unusable re-probe keeps its parked status and simply gets
+            # a new due time; only ROTATED can make the row work again.
             failure = getattr(outcome, "failure", None)
             message = getattr(failure, "message", None) or getattr(
                 failure, "error", None

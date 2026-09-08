@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from cryptography.hazmat.primitives import hashes
@@ -31,7 +32,14 @@ from magsync.config import LimeWireConstants, load_config, save_config
 from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.models import DownloadFailureKind, DownloadResult, LimeWireSession
 from magsync.core.policy import get_download_failure_policy
-from magsync.core.urls import URLValidationError, normalize_limewire_share_url
+from magsync.core.urls import (
+    DownloadHost,
+    URLValidationError,
+    download_host_of,
+    is_supported_download_host,
+    normalize_download_url,
+    normalize_limewire_share_url,
+)
 
 logger = logging.getLogger("magsync")
 
@@ -66,13 +74,17 @@ class DownloadPipelineError(RuntimeError):
 def _part_path_for(dest: Path, limewire_url: str) -> Path:
     """Return the resume ``.part`` path for this dest+URL, removing stale partials.
 
+    Host-agnostic: the identity is the normalized stored download URL for any
+    supported host, so a VK document and a LimeWire share never share a
+    partial.
+
     Partials are keyed to the exact share URL (including the #fragment key) via
     a hash-prefix in the filename, so a rotated link never resumes bytes fetched
     for a different blob/key — splicing ciphertexts would decrypt to garbage and
     masquerade as a stale-constants failure. Partials keyed to any other URL,
     and legacy un-fingerprinted ``<dest>.part`` files, are deleted here.
     """
-    identity = normalize_limewire_share_url(limewire_url)
+    identity = normalize_download_url(limewire_url)
     fp = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
     part_path = dest.parent / f"{dest.name}.{fp}.part"
     if dest.parent.is_dir():
@@ -928,6 +940,299 @@ def _parse_retry_after(response: httpx.Response) -> int:
     return min(max(seconds, 1), _MAX_RETRY_AFTER_SECONDS)
 
 
+# VK serves document payloads from its own CDN, and the exact CDN hostname
+# varies, so it is read from the page rather than hardcoded. A suffix
+# allowlist of VK-operated domains keeps that from becoming "follow any URL
+# the page names": each entry begins with a dot, so "evil-userapi.com" and
+# "userapi.com.evil.test" are both rejected.
+_VK_CDN_HOST_SUFFIXES = (".userapi.com", ".vk-cdn.net", ".vkuser.net")
+_VK_DOC_URL_KEY_RE = re.compile(r'"docUrl"\s*:\s*(?=")')
+
+
+def _extract_vk_doc_url(html: str) -> str | None:
+    """Return the direct file URL advertised by a VK document page.
+
+    The key is located by name and its value is decoded with the JSON parser,
+    so escape sequences are handled by that parser rather than by hand-rolled
+    string replacement. Returns ``None`` when the page advertises no such URL.
+    """
+    decoder = json.JSONDecoder()
+    for match in _VK_DOC_URL_KEY_RE.finditer(html):
+        try:
+            value, _end = decoder.raw_decode(html, match.end())
+        except ValueError:
+            continue
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _valid_vk_direct_url(candidate: str | None) -> str | None:
+    """Return a VK-operated https direct URL, or ``None``.
+
+    The signed URL is ephemeral and is never persisted or logged; this only
+    keeps a page-supplied value from redirecting retrieval to another host.
+    """
+    if not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate)
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme.lower() != "https":
+        return None
+    host = (parsed.hostname or "").lower()
+    if host == "vk.com" or any(host.endswith(sfx) for sfx in _VK_CDN_HOST_SUFFIXES):
+        return candidate
+    return None
+
+
+async def _resolve_vk_direct_url(client: httpx.AsyncClient, page_url: str) -> str:
+    """Derive the ephemeral direct file URL from the stable document page.
+
+    Called on every attempt, including resumes and retries, so the CDN
+    signature's lifetime never has to be assumed or tracked.
+    """
+    try:
+        response = await client.get(page_url)
+    except httpx.RequestError as exc:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"VK document page request failed: {exc}",
+        ) from exc
+
+    if response.status_code == 429:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            "VK document page rate limited",
+            retry_after=_parse_retry_after(response),
+        )
+    if response.status_code >= 500:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"VK document page returned HTTP {response.status_code}",
+        )
+    if response.status_code in (403, 404, 410):
+        # Gone, or gated behind an account. Either way it is terminal here:
+        # magsync never authenticates to a file host.
+        raise DownloadPipelineError(
+            DownloadFailureKind.SHARE_UNAVAILABLE,
+            f"VK document is not publicly available (HTTP {response.status_code})",
+        )
+    if not 200 <= response.status_code < 300:
+        raise DownloadPipelineError(
+            DownloadFailureKind.SHARE_UNAVAILABLE,
+            f"VK document page returned HTTP {response.status_code}",
+        )
+
+    direct = _valid_vk_direct_url(_extract_vk_doc_url(response.text))
+    if direct is None:
+        # A page that advertises no derivable file URL is a typed failure,
+        # never a silent skip or a success with no file.
+        raise DownloadPipelineError(
+            DownloadFailureKind.METADATA_INVALID,
+            "VK document page advertised no usable file URL",
+        )
+    return direct
+
+
+async def _stream_vk_payload(
+    client: httpx.AsyncClient,
+    direct_url: str,
+    part_path: Path,
+    *,
+    on_progress: callable | None = None,
+) -> int | None:
+    """Stream a VK payload into ``part_path``, resuming from local bytes.
+
+    Returns the object's own reported total when the host provides one, which
+    is the only authority for judging completeness. The response status is
+    inspected *before* the file is opened for writing, so an error body can
+    never be appended to a partial file.
+    """
+    existing = part_path.stat().st_size if part_path.exists() else 0
+    headers = {"Range": f"bytes={existing}-"} if existing else {}
+
+    async with client.stream("GET", direct_url, headers=headers) as stream:
+        status = stream.status_code
+        if status == 429:
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                "VK payload request was rate limited",
+                retry_after=_parse_retry_after(stream),
+            )
+        if status >= 500:
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                f"VK payload returned HTTP {status}",
+            )
+        if status == 416:
+            # The local partial already covers the whole object. Trust the
+            # object's reported total over the local length.
+            total = _content_range_total(stream.headers.get("content-range"))
+            if total is not None and existing > total:
+                with part_path.open("r+b") as handle:
+                    handle.truncate(total)
+            return total
+        if status == 200:
+            # The host ignored the range request, so the body starts at zero.
+            mode = "wb"
+            written = 0
+            total = _content_range_total(
+                stream.headers.get("content-range")
+            ) or _int_or_none(stream.headers.get("content-length"))
+        elif status == 206:
+            start, total = _content_range_parts(stream.headers.get("content-range"))
+            if start != existing:
+                # A mis-offset splice would silently corrupt the file.
+                raise DownloadPipelineError(
+                    DownloadFailureKind.TRANSIENT,
+                    "VK range response offset did not match the local partial file",
+                )
+            mode = "ab"
+            written = existing
+        else:
+            raise DownloadPipelineError(
+                DownloadFailureKind.SHARE_UNAVAILABLE,
+                f"VK payload returned HTTP {status}",
+            )
+
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        with part_path.open(mode) as handle:
+            async for chunk in stream.aiter_bytes():
+                handle.write(chunk)
+                written += len(chunk)
+                if on_progress is not None:
+                    try:
+                        on_progress(written, total)
+                    except Exception:  # progress must never fail a download
+                        pass
+    return total
+
+
+def _int_or_none(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _finalize_vk_download(
+    part_path: Path, dest: Path, expected_total: int | None
+) -> DownloadResult:
+    """Validate, deduplicate, and place a completed VK payload."""
+    if not part_path.exists():
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error="VK download produced no file",
+        )
+
+    size = part_path.stat().st_size
+    if expected_total is not None and size < expected_total:
+        # Keep the partial: the next attempt resumes from these bytes.
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.TRANSIENT,
+            error="VK download was incomplete",
+        )
+
+    with part_path.open("rb") as handle:
+        head = handle.read(8)
+    if _classify_payload(head) != "pdf":
+        # A live link whose payload is not a PDF is terminal, exactly as for
+        # a non-PDF LimeWire share. No decryption is involved, so an unknown
+        # signature is simply not a PDF.
+        _cleanup_part(part_path)
+        error = sanitize_external_error(f"Unsupported payload: {dest.name}")
+        logger.info("%s — skipping", error)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.UNSUPPORTED,
+            unsupported=True,
+            error=error,
+        )
+
+    digest = hashlib.sha256()
+    with part_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    file_hash = digest.hexdigest()
+
+    from magsync.core.index import MagazineIndex
+
+    try:
+        idx = MagazineIndex()
+        existing_path = idx.find_by_hash(file_hash)
+        idx.close()
+    except Exception:
+        existing_path = None
+
+    if existing_path:
+        logger.info(
+            "Duplicate detected (same content as %s), skipping save", existing_path
+        )
+        part_path.unlink(missing_ok=True)
+        return DownloadResult(
+            success=True,
+            file_path=Path(existing_path),
+            file_size_bytes=size,
+            sha256=file_hash,
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part_path.replace(dest)
+    return DownloadResult(
+        success=True, file_path=dest, file_size_bytes=size, sha256=file_hash
+    )
+
+
+async def _download_vk_once(
+    page_url: str,
+    dest: Path,
+    *,
+    on_progress: callable | None = None,
+    rate_gate: RateLimitGate | None = None,
+) -> DownloadResult:
+    """One VK retrieval attempt: derive, stream, validate, place.
+
+    No key derivation and no decryption: a VK document is a plain file. The
+    signed direct URL is derived fresh here on every attempt and is never
+    persisted or logged.
+    """
+    part_path = _part_path_for(dest, page_url)
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=120.0,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            direct_url = await _resolve_vk_direct_url(client, page_url)
+            expected_total = await _stream_vk_payload(
+                client, direct_url, part_path, on_progress=on_progress
+            )
+    except DownloadPipelineError as exc:
+        if exc.kind is DownloadFailureKind.TRANSIENT and exc.retry_after and rate_gate:
+            await rate_gate.trigger(exc.retry_after, reason="VK rate limited (429)")
+        return DownloadResult(
+            success=False, failure_kind=exc.kind, error=str(exc)
+        )
+    except httpx.RequestError as exc:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.TRANSIENT,
+            error=sanitize_external_error(f"VK download failed: {exc}"),
+        )
+    except OSError as exc:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error=sanitize_external_error(f"VK download could not be written: {exc}"),
+        )
+
+    return _finalize_vk_download(part_path, dest, expected_total)
+
+
 async def download_and_decrypt(
     limewire_url: str,
     dest: Path,
@@ -937,7 +1242,12 @@ async def download_and_decrypt(
     retry_attempts: int | None = None,
     rate_gate: RateLimitGate | None = None,
 ) -> DownloadResult:
-    """Full pipeline: download an encrypted file from LimeWire and decrypt it.
+    """Full pipeline: retrieve a payload from its file host and store it.
+
+    The backend is selected from the stored URL's host: a LimeWire share goes
+    through key derivation and decryption, a VK document is a plain file that
+    needs neither. Everything around dispatch - the retry budget, the shared
+    rate gate, failure policy, deduplication, and placement - is shared.
 
     Retries transient errors with exponential backoff. 429 responses
     trigger a shared pause across all concurrent downloads.
@@ -946,12 +1256,29 @@ async def download_and_decrypt(
     Returns a DownloadResult with success status and file path.
     """
     try:
-        normalized_url = normalize_limewire_share_url(limewire_url)
+        host = download_host_of(limewire_url)
+        normalized_url = normalize_download_url(limewire_url)
     except (TypeError, URLValidationError) as exc:
+        # A URL on a host magsync has no backend for is a terminal unsupported
+        # outcome, not a configuration error: it is never attempted and never
+        # auto-retried, and no payload byte is requested.
+        try:
+            hostname = (urlparse(limewire_url or "").hostname or "").lower()
+        except (TypeError, ValueError):
+            hostname = ""
+        if hostname and not is_supported_download_host(hostname):
+            error = sanitize_external_error(f"Unsupported download host: {hostname}")
+            logger.info("%s — skipping", error)
+            return DownloadResult(
+                success=False,
+                failure_kind=DownloadFailureKind.UNSUPPORTED,
+                unsupported=True,
+                error=error,
+            )
         return DownloadResult(
             success=False,
             failure_kind=DownloadFailureKind.CONFIGURATION,
-            error=sanitize_external_error(f"Invalid LimeWire share URL: {exc}"),
+            error=sanitize_external_error(f"Invalid download URL: {exc}"),
         )
 
     if constants is None:
@@ -982,10 +1309,15 @@ async def download_and_decrypt(
     for attempt in range(1, total + 1):
         await rate_gate.wait()
 
-        result = await _download_and_decrypt_once(
-            normalized_url, dest, constants=constants, on_progress=on_progress,
-            rate_gate=rate_gate, retry_attempts=retry_attempts,
-        )
+        if host is DownloadHost.VK:
+            result = await _download_vk_once(
+                normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate
+            )
+        else:
+            result = await _download_and_decrypt_once(
+                normalized_url, dest, constants=constants, on_progress=on_progress,
+                rate_gate=rate_gate, retry_attempts=retry_attempts,
+            )
         result.attempt_count = attempt
         if result.success:
             return result

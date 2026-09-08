@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from html import unescape
 from urllib.parse import quote_plus, urljoin, urlparse
 
@@ -15,6 +16,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from magsync.core.models import (
+    LinkResolution,
+    LinkResolutionKind,
     SourceError,
     SourceFailure,
     SourceFailureKind,
@@ -22,7 +25,8 @@ from magsync.core.models import (
 )
 from magsync.core.urls import (
     URLValidationError,
-    normalize_limewire_share_url,
+    is_supported_download_host,
+    normalize_download_url,
     normalize_source_url,
     validate_source_origin,
 )
@@ -54,19 +58,58 @@ _CHALLENGE_BODY_MARKER_PAIRS = (
     (b"/cdn-cgi/challenge-platform/", b"_cf_chl_opt"),
 )
 
+# The source may expose an issue's share link only through a masked
+# server-side lookup: the detail page renders a trigger carrying an opaque
+# key, which is exchanged for the real URL at this endpoint. These live
+# together so the next template reshuffle is a constant change, not a rewrite.
+_MASKED_DOWNLOAD_PATH = "/wp-admin/admin-ajax.php"
+_MASKED_DOWNLOAD_ACTION = "get_masked_download"
+_MASKED_ACTION_FIELD = "action"
+_MASKED_KEY_FIELD = "download_key"
+_MASKED_TRIGGER_ID = "lw-vk-js-trigger"
+_MASKED_TRIGGER_CLASS = "lw-vk-download-btn"
+_MASKED_KEY_ATTR = "data-key"
+# The key is opaque, so constrain it to a safe charset and length rather than
+# its current "dl_key_<hex>" spelling: a format change must not break
+# discovery, but page-controlled data must never be posted verbatim.
+_MASKED_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{8,128}")
+_MASKED_RESPONSE_TYPES = frozenset({"application/json", "text/json"})
+_HTML_RESPONSE_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 
-def _valid_limewire_url(candidate: str | None) -> str | None:
-    """Return a normalized strict LimeWire share URL, or ``None``.
+
+def _safe_resolved_host(candidate: str) -> str | None:
+    """Return a bounded, safe hostname from an unvalidated resolved URL.
+
+    Only the hostname is ever taken from a URL that failed strict validation:
+    the URL itself must never reach the index, a log line, or a callback.
+    Returns ``None`` when the value is not even a plausible http(s) URL.
+    """
+    try:
+        parsed = urlparse(candidate)
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    host = parsed.hostname
+    if not host or not _SAFE_HOST_RE.fullmatch(host):
+        return None
+    return host.lower()
+
+
+def _valid_download_url(candidate: str | None) -> str | None:
+    """Return a normalized strict URL on any supported host, or ``None``.
 
     Candidates are HTML-unescaped because the fallback scanner operates on raw
     markup. Validation is centralized in :mod:`magsync.core.urls`; in
-    particular, lookalike hosts, credentials, queries, unsafe ports, missing
-    fragments, and non-``/d/<id>`` paths are rejected here.
+    particular, lookalike hosts, credentials, unexpected queries, unsafe
+    ports, and paths that are not a valid share/document form are rejected
+    here. The source serves links from more than one file host, so an inline
+    candidate on any supported host is accepted.
     """
     if not candidate:
         return None
     try:
-        return normalize_limewire_share_url(unescape(candidate.strip()))
+        return normalize_download_url(unescape(candidate.strip()))
     except URLValidationError:
         return None
 
@@ -79,6 +122,9 @@ class ScrapedIssue:
     limewire_url: str | None = None
     genre: str | None = None
     file_size: str | None = None
+    # Set only when the page advertises a masked download and no inline URL was
+    # found: the caller decides whether this issue needs a resolution request.
+    download_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +290,7 @@ class FreemagazinesClient:
         *,
         operation: str,
         later_page: bool,
+        expected_types: frozenset[str] = _HTML_RESPONSE_TYPES,
     ) -> _ValidatedHTML | None:
         # Validation order is security- and behavior-significant. Challenges
         # are detected before status/body parsing, including HTTP 200 pages.
@@ -268,11 +315,12 @@ class FreemagazinesClient:
         if response.status_code == 404 and later_page:
             return None
         if response.status_code == 404:
-            message = (
-                "Source returned HTTP 404 for the first search page"
-                if operation == "search"
-                else "Source detail page returned HTTP 404"
-            )
+            if operation == "search":
+                message = "Source returned HTTP 404 for the first search page"
+            elif operation == "detail":
+                message = "Source detail page returned HTTP 404"
+            else:
+                message = f"Source returned HTTP 404 for the {operation} request"
             raise SourceError(
                 SourceFailureKind.PROTOCOL,
                 message,
@@ -303,10 +351,10 @@ class FreemagazinesClient:
         content_type = (
             response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
         )
-        if content_type not in {"text/html", "application/xhtml+xml"}:
+        if content_type not in expected_types:
             raise SourceError(
                 SourceFailureKind.PROTOCOL,
-                "Source response was not HTML",
+                "Source response had an unexpected content type",
                 operation=operation,
                 status_code=response.status_code,
                 host=host,
@@ -346,6 +394,146 @@ class FreemagazinesClient:
             response,
             operation=operation,
             later_page=later_page,
+        )
+
+    async def _request_masked_download(
+        self, *, key: str, referer: str, operation: str
+    ) -> _ValidatedHTML:
+        """POST one masked-key exchange through the shared validated session."""
+        url = f"{BASE_URL}{_MASKED_DOWNLOAD_PATH}"
+        self._raise_if_circuit_open(operation=operation)
+        await self._limiter.wait()
+        # A concurrent request may have opened the circuit while this request
+        # was waiting for the global pacing lock.
+        self._raise_if_circuit_open(operation=operation)
+
+        host, path = self._safe_context(url)
+        try:
+            response = await self._http_client.post(
+                url,
+                # Multipart with no filenames, matching the browser's FormData.
+                files={
+                    _MASKED_ACTION_FIELD: (None, _MASKED_DOWNLOAD_ACTION),
+                    _MASKED_KEY_FIELD: (None, key),
+                },
+                headers={"Referer": referer},
+            )
+        except asyncio.CancelledError:
+            raise
+        except httpx.RequestError as exc:
+            raise SourceError(
+                SourceFailureKind.TRANSIENT,
+                "Source request failed transiently",
+                operation=operation,
+                host=host,
+                path=path,
+            ) from exc
+
+        validated = self._validate_response(
+            response,
+            operation=operation,
+            later_page=False,
+            expected_types=_MASKED_RESPONSE_TYPES,
+        )
+        assert validated is not None  # resolution never uses later-page semantics
+        return validated
+
+    async def resolve_masked_download(
+        self, page_url: str, download_key: str
+    ) -> LinkResolution:
+        """Exchange a masked download key for a classified link resolution.
+
+        Runs through this client's session, cookie jar, pacing gate, detail
+        concurrency bound, and circuit - exactly like the detail request that
+        produced the key - so resolving links can neither burst past the
+        configured source rate nor bypass challenge detection.
+
+        Must not be called while already holding the detail semaphore: the
+        resolution pass is deliberately separate from detail scraping.
+
+        Raises :class:`SourceError` only for genuine source failures -
+        challenge, transient, and structurally broken payloads. A rejected key
+        and an unsupported destination host are returned as outcomes.
+        """
+        operation = "resolve"
+        key = (download_key or "").strip()
+        if not _MASKED_KEY_RE.fullmatch(key):
+            raise SourceError(
+                SourceFailureKind.PROTOCOL,
+                "Masked download key was not a usable token",
+                operation=operation,
+            )
+        try:
+            referer = normalize_source_url(page_url)
+        except URLValidationError as exc:
+            raise SourceError(
+                SourceFailureKind.PROTOCOL,
+                "Detail page URL is not an allowed source URL",
+                operation=operation,
+            ) from exc
+
+        async with self._detail_semaphore:
+            validated = await self._request_masked_download(
+                key=key, referer=referer, operation=operation
+            )
+
+        host, path = self._safe_context(f"{BASE_URL}{_MASKED_DOWNLOAD_PATH}")
+        try:
+            payload = json.loads(validated.text)
+        except ValueError as exc:
+            raise SourceError(
+                SourceFailureKind.PROTOCOL,
+                "Masked download response was not valid JSON",
+                operation=operation,
+                host=host,
+                path=path,
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise SourceError(
+                SourceFailureKind.PROTOCOL,
+                "Masked download response was not an object",
+                operation=operation,
+                host=host,
+                path=path,
+            )
+
+        # The source answered correctly and reports no available link. That is
+        # a dead or expired key, not a broken contract, so it is an outcome
+        # for the caller's retry schedule rather than a cycle-degrading error.
+        if not payload.get("success"):
+            return LinkResolution(LinkResolutionKind.DEAD_LINK)
+
+        data = payload.get("data")
+        raw_url = data.get("url") if isinstance(data, dict) else None
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            raise SourceError(
+                SourceFailureKind.PROTOCOL,
+                "Masked download response contained no URL",
+                operation=operation,
+                host=host,
+                path=path,
+            )
+
+        resolved = _valid_download_url(raw_url)
+        if resolved is not None:
+            return LinkResolution(LinkResolutionKind.SUPPORTED, url=resolved)
+
+        # Strict validation failed. Distinguish a link on a host we simply
+        # cannot retrieve from - the source honored its contract and only the
+        # destination is unusable - from a malformed link on a host we do
+        # support, which is a genuine contract break.
+        resolved_host = _safe_resolved_host(raw_url)
+        if resolved_host is None or is_supported_download_host(resolved_host):
+            raise SourceError(
+                SourceFailureKind.PROTOCOL,
+                "Masked download response URL failed strict validation",
+                operation=operation,
+                host=host,
+                path=path,
+            )
+        return LinkResolution(
+            LinkResolutionKind.UNSUPPORTED_HOST, host=resolved_host
         )
 
     async def search(
@@ -555,6 +743,31 @@ def _has_next_search_page(
     return False
 
 
+def _extract_download_key(soup: BeautifulSoup) -> str | None:
+    """Locate the masked download trigger's opaque key, structurally.
+
+    The key is read from the trigger element's own attribute via the parsed
+    DOM - by element identity, then class, then any element carrying the
+    attribute - and never by matching the inline script that happens to name
+    the endpoint today.  A cosmetic template edit must not silently disable
+    link discovery (this is the fourth such break in this pipeline).
+    """
+    candidates: list = []
+    by_id = soup.find(id=_MASKED_TRIGGER_ID)
+    if by_id is not None:
+        candidates.append(by_id)
+    candidates.extend(soup.find_all(class_=_MASKED_TRIGGER_CLASS))
+    candidates.extend(soup.find_all(attrs={_MASKED_KEY_ATTR: True}))
+    for tag in candidates:
+        raw = tag.get(_MASKED_KEY_ATTR)
+        if not isinstance(raw, str):
+            continue
+        key = raw.strip()
+        if _MASKED_KEY_RE.fullmatch(key):
+            return key
+    return None
+
+
 def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -568,17 +781,17 @@ def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
 
     limewire_url = None
     for tag in soup.find_all(attrs={"data-url": True}):
-        limewire_url = _valid_limewire_url(tag.get("data-url"))
+        limewire_url = _valid_download_url(tag.get("data-url"))
         if limewire_url:
             break
     if not limewire_url:
         for anchor in soup.find_all("a", href=True):
-            limewire_url = _valid_limewire_url(anchor["href"])
+            limewire_url = _valid_download_url(anchor["href"])
             if limewire_url:
                 break
     if not limewire_url:
         for match in _LIMEWIRE_RE.finditer(html):
-            limewire_url = _valid_limewire_url(match.group(0))
+            limewire_url = _valid_download_url(match.group(0))
             if limewire_url:
                 break
 
@@ -605,6 +818,10 @@ def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
         str(og_image.get("content")) if og_image and og_image.get("content") else None
     )
 
+    # An inline URL is authoritative and costs no extra request, so a key is
+    # only surfaced when discovery would otherwise come up empty.
+    download_key = None if limewire_url else _extract_download_key(soup)
+
     return ScrapedIssue(
         title=title,
         page_url=page_url,
@@ -612,7 +829,100 @@ def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
         limewire_url=limewire_url,
         genre=genre,
         file_size=file_size,
+        download_key=download_key,
     )
+
+
+@dataclass
+class ResolvedLinkBatch:
+    """Outcome of a resolution pass: indexable items plus dispositions.
+
+    ``items`` carries every issue that should be indexed, including those with
+    no usable link - a disposed issue is still stored so it is countable and
+    can be parked, rather than silently re-discovered every cycle.
+    ``unsupported_host`` pairs an issue with the bare hostname its link
+    resolved to; the unvalidated URL is deliberately never carried. The
+    caller owns all index mutation: this module has no database access.
+    """
+
+    items: list[ScrapedIssue] = field(default_factory=list)
+    failures: list[SourceFailure] = field(default_factory=list)
+    unsupported_host: list[tuple[ScrapedIssue, str]] = field(default_factory=list)
+    dead_link: list[ScrapedIssue] = field(default_factory=list)
+
+
+async def resolve_masked_links(
+    issues: list[ScrapedIssue],
+    client: FreemagazinesClient,
+    *,
+    needs_link: Callable[[ScrapedIssue], bool] | None = None,
+) -> ResolvedLinkBatch:
+    """Resolve masked download keys for the issues that actually need a link.
+
+    Issues already carrying an inline URL, and issues ``needs_link`` reports as
+    already having a usable stored URL, are returned untouched at zero request
+    cost.  That gate is what keeps link discovery from doubling source traffic:
+    in steady state only genuinely new issues are resolved.  ``needs_link`` of
+    ``None`` means "resolve everything that needs it", for explicit repair
+    operations (link refresh, URL backfill).
+
+    Resolution outcomes are classified rather than collapsed into a failure:
+    a link on a supported host fills the issue's URL, an unsupported
+    destination host and a rejected key are reported as dispositions for the
+    caller to park, and only a structurally broken response is a typed
+    failure.  A page with no download affordance at all is a legitimate
+    link-less outcome and is not a failure.
+
+    Returned issues never carry a resolved-but-unvalidated URL: every resolved
+    candidate has passed the strict supported-host validator.
+    """
+    batch = ResolvedLinkBatch()
+    items = batch.items
+    failures = batch.failures
+    blocked: SourceFailure | None = None
+
+    for issue in issues:
+        # Nothing to resolve: an inline URL wins, and a page with no download
+        # affordance is legitimately link-less.
+        if issue.limewire_url or not issue.download_key:
+            items.append(issue)
+            continue
+        # Already has a usable stored URL; skipping is safe because indexing
+        # treats an absent incoming URL as "no information" and never clears
+        # the stored one.
+        if needs_link is not None and not needs_link(issue):
+            items.append(issue)
+            continue
+        if client.circuit_open:
+            # Report the block once; these issues are blocked, not link-less.
+            if blocked is None:
+                blocked = client.circuit_failure
+                if blocked is not None:
+                    failures.append(blocked)
+            continue
+        try:
+            resolution = await client.resolve_masked_download(
+                issue.page_url, issue.download_key
+            )
+        except asyncio.CancelledError:
+            raise
+        except SourceError as exc:
+            failures.append(exc.failure)
+            continue
+
+        if resolution.kind is LinkResolutionKind.SUPPORTED:
+            items.append(replace(issue, limewire_url=resolution.url))
+            continue
+
+        # Disposed issues are still indexed (link-less) so they are countable
+        # and can be parked on a schedule; the caller applies the disposition.
+        items.append(issue)
+        if resolution.kind is LinkResolutionKind.UNSUPPORTED_HOST:
+            batch.unsupported_host.append((issue, resolution.host or "unknown"))
+        else:
+            batch.dead_link.append(issue)
+
+    return batch
 
 
 def _raise_result_failure(result: SourceResult[ScrapedIssue]) -> None:
