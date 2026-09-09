@@ -118,13 +118,35 @@ def strip_accents(s: str) -> str:
     )
 
 
+# The source used to prepend a format label to every listing ("[PDF] ..."),
+# and issues indexed back then still carry it in their stored title. Anchored,
+# bracketed and length-bounded so bracketed *issue detail* elsewhere survives.
+_FORMAT_TAG_RE = re.compile(r"^\[[A-Za-z0-9+/.\- ]{1,12}\]\s*")
+
+
+def strip_format_tag(title: str) -> str:
+    """Remove a leading bracketed source format tag from a title.
+
+    The tag is source presentation, not part of the publication's name.
+    Leaving it in splits the library into duplicate directories, and because
+    claim eligibility compares the *stored* title it also makes an ``exact``
+    subscription unable to match its own back catalogue.
+    """
+    if not title:
+        return title
+    return _FORMAT_TAG_RE.sub("", title, count=1)
+
+
 def normalize_title(title: str) -> str:
     """Strip date/issue information and accents from a title to get the base magazine name.
 
     "The New Yorker – April 13, 2026" → "The New Yorker"
     "Bon Appétit – March 2026" → "Bon Appetit"
     "Science News – Vol 208 No 05, May 2026" → "Science News"
+    "[PDF] Airliner World – January 2024" → "Airliner World"
     """
+    # A leading source format tag is never part of the magazine's name.
+    title = strip_format_tag(title)
     # Remove everything after common separators (–, -, |, :) if followed by date-like content
     separators = [" – ", " - ", " | ", ": "]
     for sep in separators:

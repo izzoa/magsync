@@ -131,6 +131,10 @@ magsync retry "The Economist"   # limit to one magazine
 magsync backfill-urls
 magsync backfill-urls "The Economist"   # limit to one magazine
 
+# One-off: repair stored titles carrying the source's old "[PDF] " label
+magsync repair-titles --dry-run   # preview every change first
+magsync repair-titles
+
 # View/change configuration
 magsync config
 magsync config output_dir ~/MyMagazines
@@ -141,6 +145,8 @@ magsync config output_dir ~/MyMagazines
 **Download provenance.** Indexing catalogs every issue a search returns, but cataloging is not a download request: each download row records *who wanted it* (`subscription` when a subscription search matched its title, `manual` when you explicitly fetched or selected it, or nothing — a `cataloged` side-effect entry). Only wanted rows are ever automatic work; the fuzzy strangers freemagazines.top's search returns alongside real matches are cataloged and left alone. Explicit requests are one-way: fetching an issue marks it `manual`, and that outlives a later unsubscribe.
 
 **Retry scope.** The daemon automatically schedules exhausted transient downloads and source-blocked dead-link refreshes for a later due cycle; those UTC schedules survive restarts, and each cycle claims only wanted rows that still match a **current** subscription (title honoring `exact`, plus its `since` floor — the daemon re-reads subscriptions every cycle, so config-file edits apply without a restart). `magsync retry` is an explicit override: it atomically claims exactly the wanted linked `failed`/`unavailable` rows in its invocation snapshot — including rows whose subscription has lapsed — bypasses their current schedule, and never drains unrelated pending, `unsupported`, or never-requested work. Excluded never-requested failures are counted with the recovery path (`magsync fetch "<title>"` marks every matching row requested, then `retry` takes the failures); link-less failures are skipped and counted (also under `-q`) — run `magsync backfill-urls` to repair them first (`--all` to include never-requested rows).
+
+**Legacy titles.** The source used to prepend a format label to every listing (`[PDF] …`). A leading bracketed tag is normalized away, so it never affects a magazine's name, its folder, or subscription matching — importantly, an `exact` subscription can match such an issue, which it previously could not. Issues indexed before that fix keep the tag in their *stored* title (indexing never rewrites a title, since it drives derived dates and magazine association), which splits the library into duplicate folders like `[PDF] Science News`. Run `magsync repair-titles` once to consolidate: it strips the tag, re-derives the affected fields, re-associates magazines, moves already-downloaded files into their correct folder, updates the recorded path so deduplication keeps resolving, and prunes emptied records. It never overwrites an existing file, and `--dry-run` previews everything.
 
 **Status meanings.** `pending` is queued wanted work, `cataloged` is an indexed side-effect entry nobody requested (never auto-downloaded; fetch or select it to make it wanted), `complete` is a stored PDF, `unavailable` is a confirmed dead/orphaned share that may recover only through a refreshed source link or manual retry, `unsupported` is a live link magsync cannot use — a non-PDF payload, or a link on a file host it has no backend for — and `failed` covers a typed transient or deterministic processing failure. An `unsupported` row and an `unavailable` row both keep a scheduled re-probe (30 days and 24 hours respectively), so an issue the site later rehosts or relinks can recover on its own. Only typed transient failures on wanted rows are automatically scheduled for another download attempt.
 

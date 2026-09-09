@@ -3,6 +3,19 @@
 All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.8.2] - 2026-09-09
+
+Fixes duplicate `[PDF] …` library folders that appeared as soon as 0.8.0/0.8.1 made the legacy back catalogue downloadable — and the quieter half of the same bug, which had been silently skipping every `exact` subscription's back catalogue.
+
+The source no longer emits that label anywhere (verified live: zero occurrences in search listings and detail `og:title`). It survives in **stored** titles from when it did, and indexing deliberately never backfills a title because it drives the derived date fields and magazine association. Those rows sat unclaimable for months, so nobody saw it; then they downloaded under their old names.
+
+### Fixed
+- **A leading source format tag is no longer treated as part of a magazine's name.** Title normalization strips it, which fixes directory names, filename prefixes, magazine grouping, and subscription matching at once — all four already routed through the same normalizer. Only an anchored, bracketed, length-bounded tag is removed; bracketed *issue detail* elsewhere in a title is preserved.
+- **`exact` subscriptions can claim their legacy back catalogue again.** Claim eligibility compares the **stored** title, so while the tag counted as part of the name `[pdf] afar` never matched `afar`: those issues resolved links fine and were then never claimed. A substring subscription still matched (the name is inside the tagged string), which is why every duplicate folder belonged to one and not a single `exact` subscription had one — the tell that led to this.
+
+### Added
+- **`magsync repair-titles`** consolidates what is already stored and on disk: strips the tag from stored titles, re-derives the fields the title determines, re-associates each issue with its correctly-named magazine, moves any already-downloaded file to its corrected path, and updates the recorded path so content deduplication keeps resolving to a real file. It never overwrites an occupied destination (both files are left in place and the collision reported), prunes tagged magazine records and folders left empty, is safe to re-run, and supports `--dry-run` to preview everything first.
+
 ## [0.8.1] - 2026-09-08
 
 Fixes a 0.8.0 bug found in its own first production cycle: hundreds of `advertised a download whose link could not be resolved` warnings, while other issues in the same search stored links fine. VK names a document **two** ways and the source returns both — 0.8.0's VK form was generalized from a single observed sample, so the other form was reported as the source breaking its contract when it was behaving correctly.

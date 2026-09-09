@@ -678,6 +678,82 @@ class MagazineIndex:
             linked.update(row["page_url"] for row in rows)
         return {url for url in wanted if url not in linked}
 
+    def get_issues_with_tagged_titles(self) -> list[dict]:
+        """Return issues whose stored title still carries a legacy format tag.
+
+        ``[`` and ``]`` are literal in SQLite ``LIKE``, so this is a coarse
+        prefilter; the caller applies the anchored tag pattern to decide.
+        """
+        rows = self.conn.execute(
+            """SELECT i.id, i.title, i.page_url, i.magazine_id,
+                      d.status AS download_status, d.file_path
+               FROM issues i
+               LEFT JOIN downloads d ON d.issue_id = i.id
+               WHERE i.title LIKE '[%]%'
+               ORDER BY i.id"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def repair_issue_title(
+        self,
+        issue_id: int,
+        *,
+        title: str,
+        magazine_id: int,
+        year: int | None,
+        month: int | None,
+        date_raw: str,
+    ) -> bool:
+        """Rewrite a stored title together with everything it determines.
+
+        ``add_issues`` deliberately never backfills ``title`` because it drives
+        the derived date fields and magazine association, so a repair has to
+        set all of them in one write rather than rewriting the title alone.
+        """
+        cursor = self.conn.execute(
+            """UPDATE issues
+               SET title = ?, magazine_id = ?, year = ?, month = ?, date_raw = ?
+               WHERE id = ?""",
+            (title, magazine_id, year, month, date_raw, issue_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def set_download_file_path(self, issue_id: int, file_path: str) -> bool:
+        """Point a download row at a relocated file.
+
+        Content deduplication resolves a hash to this path, so a moved file
+        whose path is not updated would leave dedup naming a missing file.
+        """
+        cursor = self.conn.execute(
+            "UPDATE downloads SET file_path = ? WHERE issue_id = ?",
+            (str(file_path), issue_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def prune_empty_tagged_magazines(self) -> list[str]:
+        """Delete legacy-tagged magazine rows that have no issues.
+
+        Scoped to tagged titles on purpose: a repair should not quietly delete
+        unrelated empty records the user never asked about. Rows go empty
+        either because this repair moved their issues to the correctly-named
+        magazine, or because historical indexing created them and the issues
+        stayed attached elsewhere.
+        """
+        rows = self.conn.execute(
+            """SELECT id, title FROM magazines
+               WHERE title LIKE '[%]%'
+                 AND id NOT IN (SELECT DISTINCT magazine_id FROM issues)"""
+        ).fetchall()
+        if not rows:
+            return []
+        self.conn.executemany(
+            "DELETE FROM magazines WHERE id = ?", [(row["id"],) for row in rows]
+        )
+        self.conn.commit()
+        return [row["title"] for row in rows]
+
     def set_limewire_url(self, issue_id: int, limewire_url: str):
         """Store a validated URL and apply new-link attempt semantics."""
         if not _plausible_download_url(limewire_url):

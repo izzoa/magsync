@@ -762,6 +762,126 @@ def retry(
         idx.close()
 
 
+@app.command("repair-titles")
+def repair_titles(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would change without writing anything"
+    ),
+):
+    """Repair stored titles carrying a legacy source format tag (e.g. "[PDF] ").
+
+    The source used to prepend a format label to every listing. Issues indexed
+    back then still carry it, and because indexing deliberately never
+    backfills a title, they never healed. That splits the library into
+    duplicate directories and — since claim eligibility compares the *stored*
+    title — makes an `exact` subscription unable to claim its own back
+    catalogue at all.
+
+    This strips the tag, re-derives the fields the title determines,
+    re-associates each issue with its correctly-named magazine, moves any
+    already-downloaded file to its corrected path, and updates the recorded
+    path so content deduplication keeps resolving. Safe to re-run.
+    """
+    from magsync.core.organizer import organize_path, strip_format_tag
+
+    cfg = load_config()
+    idx = MagazineIndex()
+    output_dir = Path(cfg.output_dir).expanduser()
+    try:
+        candidates = [
+            row
+            for row in idx.get_issues_with_tagged_titles()
+            if strip_format_tag(row["title"] or "") != (row["title"] or "")
+        ]
+        if not candidates:
+            console.print("[green]No titles need repair.[/green]")
+        else:
+            suffix = " [dim](dry run — nothing will be written)[/dim]" if dry_run else ""
+            console.print(f"Repairing {len(candidates)} issue(s){suffix}")
+
+        repaired = moved = collisions = missing = 0
+        touched_dirs: set[Path] = set()
+
+        for row in candidates:
+            new_title = strip_format_tag(row["title"])
+            parsed = parse_date(new_title, row["page_url"] or "")
+            norm = normalize_title(new_title)
+            label = sanitize_external_error(new_title[:56])
+
+            if dry_run:
+                magazine_id = row["magazine_id"]
+            else:
+                magazine_id = idx.get_or_create_magazine(
+                    norm, strip_accents(norm).lower()
+                )
+                idx.repair_issue_title(
+                    row["id"],
+                    title=new_title,
+                    magazine_id=magazine_id,
+                    year=parsed.year,
+                    month=parsed.month,
+                    date_raw=new_title,
+                )
+            repaired += 1
+
+            old_path = Path(row["file_path"]) if row["file_path"] else None
+            if row["download_status"] != DownloadStatus.COMPLETE.value or old_path is None:
+                console.print(f"  [dim]·[/dim] {label} → {norm}")
+                continue
+
+            new_path = organize_path(new_title, row["page_url"] or "", str(output_dir))
+            if old_path == new_path:
+                console.print(f"  [dim]·[/dim] {label} (file already correct)")
+                continue
+            if not old_path.exists():
+                missing += 1
+                console.print(
+                    f"  [yellow]?[/yellow] {label}: recorded file is missing, left alone",
+                    markup=True,
+                )
+                continue
+            if new_path.exists():
+                # Never guess which of two files is canonical.
+                collisions += 1
+                console.print(
+                    f"  [yellow]![/yellow] {label}: destination already exists, "
+                    "both files left in place"
+                )
+                continue
+
+            if not dry_run:
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                old_path.replace(new_path)
+                idx.set_download_file_path(row["id"], str(new_path))
+            touched_dirs.add(old_path.parent)
+            moved += 1
+            console.print(f"  [green]→[/green] {label}: moved into {new_path.parent.name}")
+
+        pruned: list[str] = []
+        removed_dirs = 0
+        if not dry_run:
+            pruned = idx.prune_empty_tagged_magazines()
+            for directory in touched_dirs:
+                try:
+                    if directory.is_dir() and not any(directory.iterdir()):
+                        directory.rmdir()
+                        removed_dirs += 1
+                except OSError:
+                    pass  # best effort; a non-empty or busy directory is fine
+
+        console.print(
+            f"\n[bold]{repaired} title(s) repaired[/bold], {moved} file(s) moved"
+            + (f", {collisions} collision(s)" if collisions else "")
+            + (f", {missing} missing file(s)" if missing else "")
+            + (f", {len(pruned)} empty magazine record(s) pruned" if pruned else "")
+            + (f", {removed_dirs} empty folder(s) removed" if removed_dirs else "")
+        )
+        if dry_run:
+            console.print("[dim]Dry run: no titles, paths, or files were changed.[/dim]")
+    finally:
+        idx.close()
+
+
 @app.command(name="backfill-urls")
 def backfill_urls(
     query: str = typer.Argument(None, help="Only backfill issues for this magazine"),
