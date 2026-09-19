@@ -22,6 +22,7 @@ A CLI/TUI tool for indexing and downloading PDF magazines from [freemagazines.to
 - **Track** what you've downloaded with a local SQLite index — never re-download the same issue
 - **Update** your index on demand to discover new issues for tracked magazines
 - **TUI** for interactive browsing, or **CLI** for scripted/headless use
+- **Optional companion API** for Polyreader and other trusted backends: isolated library scopes, durable operations, verified PDF exports and import receipts ([service guide](docs/companion-service.md))
 - **Self-healing** — automatically refreshes encryption constants when LimeWire updates their JS bundles
 
 ## Installation
@@ -114,7 +115,7 @@ magsync search "The Economist"
 # Download all issues from March 2026 onward
 magsync fetch "The New Yorker" --since 2026-03
 
-# Preview what would be downloaded (no actual download)
+# Preview matching cached pending issues (read-only; no source traffic)
 magsync fetch "The New Yorker" --since 2026-03 --dry-run
 
 # Download to a custom directory
@@ -138,13 +139,18 @@ magsync repair-titles
 # View/change configuration
 magsync config
 magsync config output_dir ~/MyMagazines
+
+# Preview what the next daemon cycle would download (cached catalog; no source traffic)
+magsync daemon --dry-run
 ```
 
-**Batch output.** `fetch`, `retry`, and `backfill-urls` show one progress bar with live outcome counters (`downloaded`, `unavailable`, `unsupported`, and `failed`) on an interactive terminal, and fall back to periodic textual progress lines when output is piped or run under `docker exec` without a TTY. Expected per-issue unavailable/unsupported messages are hidden by default; use `-v/--verbose` to see them, `-q/--quiet` for the summary only, and `--no-progress` (or `MAGSYNC_NO_PROGRESS=1`) to disable the live bar in scripts. The `daemon` is unaffected — it keeps its structured, timestamped logs.
+**Running beside a daemon or service.** While a daemon or companion service owns the library, terminal commands are executed by it and print the same tables, messages and per-issue outcomes as standalone commands; commands never wait behind a discovery cycle. Read-only commands (`magsync config` without a value, `magsync subscribe` without a query, and every `--dry-run`) never involve it. If another terminal command is running, a new one waits up to 60 seconds and then reports that it is busy, queuing nothing. Pressing Ctrl-C (or closing the terminal) before the daemon starts a submitted command cancels it; a command is never run later behind your back.
+
+**Batch output.** The live progress rendering described here applies to standalone commands. `fetch`, `retry`, and `backfill-urls` show one progress bar with live outcome counters (`downloaded`, `unavailable`, `unsupported`, and `failed`) on an interactive terminal, and fall back to periodic textual progress lines when output is piped or run under `docker exec` without a TTY. Expected per-issue unavailable/unsupported messages are hidden by default; use `-v/--verbose` to see them, `-q/--quiet` for the summary only, and `--no-progress` (or `MAGSYNC_NO_PROGRESS=1`) to disable the live bar in scripts. The `daemon` is unaffected — it keeps its structured, timestamped logs.
 
 **Download provenance.** Indexing catalogs every issue a search returns, but cataloging is not a download request: each download row records *who wanted it* (`subscription` when a subscription search matched its title, `manual` when you explicitly fetched or selected it, or nothing — a `cataloged` side-effect entry). Only wanted rows are ever automatic work; the fuzzy strangers freemagazines.top's search returns alongside real matches are cataloged and left alone. Explicit requests are one-way: fetching an issue marks it `manual`, and that outlives a later unsubscribe.
 
-**Retry scope.** The daemon automatically schedules exhausted transient downloads and source-blocked dead-link refreshes for a later due cycle; those UTC schedules survive restarts, and each cycle claims only wanted rows that still match a **current** subscription (title honoring `exact`, plus its `since` floor — the daemon re-reads subscriptions every cycle, so config-file edits apply without a restart). `magsync retry` is an explicit override: it atomically claims exactly the wanted linked `failed`/`unavailable` rows in its invocation snapshot — including rows whose subscription has lapsed — bypasses their current schedule, and never drains unrelated pending, `unsupported`, or never-requested work. Excluded never-requested failures are counted with the recovery path (`magsync fetch "<title>"` marks every matching row requested, then `retry` takes the failures); link-less failures are skipped and counted (also under `-q`) — run `magsync backfill-urls` to repair them first (`--all` to include never-requested rows).
+**Retry scope.** The daemon automatically schedules exhausted transient downloads and source-blocked dead-link refreshes for a later due cycle; those UTC schedules survive restarts, and each cycle claims only wanted rows that still match a **current** subscription (title honoring `exact`, plus its `since` floor — the daemon re-reads subscriptions every cycle, so config-file edits apply without a restart). `magsync retry` is an explicit override: it atomically claims exactly the wanted linked `failed`/`unavailable` rows in its invocation snapshot — only while current local intent remains; remote-only or lapsed-only demand is excluded — bypasses their current schedule, and never drains unrelated pending, `unsupported`, or never-requested work. Excluded never-requested failures are counted with the recovery path (`magsync fetch "<title>"` marks every matching row requested, then `retry` takes the failures); link-less failures are skipped and counted (also under `-q`) — run `magsync backfill-urls` to repair them first (`--all` to include never-requested rows).
 
 **Legacy titles.** The source used to prepend a format label to every listing (`[PDF] …`). A leading bracketed tag is normalized away, so it never affects a magazine's name, its folder, or subscription matching — importantly, an `exact` subscription can match such an issue, which it previously could not. Issues indexed before that fix keep the tag in their *stored* title (indexing never rewrites a title, since it drives derived dates and magazine association), which splits the library into duplicate folders like `[PDF] Science News`. Run `magsync repair-titles` once to consolidate: it strips the tag, re-derives the affected fields, re-associates magazines, moves already-downloaded files into their correct folder, updates the recorded path so deduplication keeps resolving, and prunes emptied records. It never overwrites an existing file, and `--dry-run` previews everything.
 
@@ -183,13 +189,32 @@ exact = true
 
 **Matching scope.** Subscriptions match by substring, so `"The Economist"` also captures sibling titles like *The Economist Audio* or regional editions. Set `exact = true` (CLI: `--exact`; env: prefix the entry with `!`, e.g. `!The Economist`) to index only issues whose normalized title matches the query exactly.
 
+## Optional companion service
+
+```bash
+pip install -e '.[service]'
+magsync companion init
+magsync clients create Polyreader  # token shown once
+magsync serve                     # private loopback binding, port 8765
+```
+
+Use one service or daemon per store. Terminal commands share its durable queue when it is running; otherwise they take temporary ownership. `magsync serve` runs discovery on the same schedule as the daemon (`--interval` or `MAGSYNC_INTERVAL`, default `6h`) and sends the same download notifications. Each remote library has an independent client-owned scope, and multiple scopes can share bytes while receiving separate verified-import receipts. Search creates no demand. Cancellation never deletes consumer imports.
+
+The [service guide](docs/companion-service.md) covers API examples, credentials, capacity/retention settings, trusted mounts, Docker switching and coordinated backup/restore. The [version 1 OpenAPI schema](docs/companion-openapi-v1.json) describes the consumer contract. The base CLI/TUI installation stays independent of HTTP dependencies.
+
 ## Docker
+
+`docker-compose.example.yml` is a complete starting point: it builds the daemon image and, under the optional `companion` profile, `magsync-service`. Run one of them at a time: stop the daemon and explicitly start the service when switching. The service port is exposed only on the private container network, with no host port mapping. Both images run as a non-root user.
+
+Mount the configuration **directory** (`./config:/config`) so configuration updates (`subscribe`, self-healing encryption constants) are replaced atomically. A single-file mount (`./config.toml:/config/config.toml`) also works: magsync then rewrites the file in place. A read-only mount makes `subscribe`/`config` report the read-only configuration instead of saving.
 
 Run magsync as an unattended daemon in Docker. Automatically fetches new issues on a schedule.
 
-Each daemon cycle reports separate pipeline health: `healthy` when attempted phases produced validated outcomes, `degraded` when useful work continued alongside source/worker failures, and `failed` when a local/configuration/database problem prevented all intended work. A cycle is also `degraded` when a resolution response is structurally broken, and — as a backstop — when it indexed issues a subscription wanted but queued no download work with no pending action explaining it, so a source that stops publishing usable links can never look like a source with no new issues. An issue on an unsupported host or with no available link is **not** a fault: both are parked with a scheduled re-probe and leave the cycle `healthy`, because a status that is always `degraded` diagnoses nothing. The summary counts each cause separately (`N link failures, N link-less, N unsupported host, N dead link`), which is also how you read the split between hosts in your own library. This state is persisted for diagnostics. Docker's `/tmp/magsync-healthy` check remains only a process-liveness heartbeat: external degradation does not trigger a restart loop, while a stalled daemon still becomes unhealthy at the existing threshold.
+Each daemon cycle reports separate pipeline health: `healthy` when attempted phases produced validated outcomes, `degraded` when useful work continued alongside source/worker failures, and `failed` when a local/configuration/database problem prevented all intended work. A cycle is also `degraded` when a resolution response is structurally broken, and — as a backstop — when it indexed issues a subscription wanted but queued no download work with no pending action explaining it, so a source that stops publishing usable links can never look like a source with no new issues. An issue on an unsupported host or with no available link is **not** a fault: both are parked with a scheduled re-probe and leave the cycle `healthy`, because a status that is always `degraded` diagnoses nothing. The summary counts each cause separately (`N link failures, N link-less, N unsupported host, N dead link`), which is also how you read the split between hosts in your own library. This state is persisted for diagnostics. Docker's `/tmp/magsync-healthy` check remains only a process-liveness heartbeat: external degradation does not trigger a restart loop, while a stalled daemon still becomes unhealthy after the configured stale threshold (30 seconds by default, with a five-second heartbeat).
 
 Subscriptions are re-read from configuration at the start of every cycle, so editing a mounted `config.toml` (unsubscribe, `since`, `exact`) takes effect at the next cycle without restarting the container; env-var subscriptions still require a container recreate by nature. Each cycle downloads and refreshes only *wanted* rows (see **Download provenance** above).
+
+> **Upgrading to 0.9.0:** stop and upgrade all CLI/TUI/daemon/service writers together. Back up the database, its identity marker, configuration, original files and exports. Never run an older binary against the migrated store; restore a matched pre-upgrade backup to roll back. See the [backup and recovery procedure](docs/companion-service.md#upgrade-backup-restore-and-rollback).
 
 > **Upgrading to 0.7.0:** back up `~/.magsync/index.db` first. Rolling back to 0.6.x requires restoring that backup — a 0.6.x daemon ignores download provenance and would immediately re-download everything 0.7.0 parks as `cataloged`.
 
@@ -214,8 +239,9 @@ services:
     image: ghcr.io/izzoa/magsync:latest
     container_name: magsync
     volumes:
-      - ./config.toml:/config/config.toml
+      - ./config:/config            # directory holding config.toml
       - magsync_data:/data
+      - magsync_exports:/exports
       - /path/to/magazines:/magazines
     environment:
       - MAGSYNC_OUTPUT_DIR=/magazines
@@ -226,6 +252,7 @@ services:
 
 volumes:
   magsync_data:
+  magsync_exports:
 ```
 
 ### Multi-Architecture
@@ -243,7 +270,7 @@ All config values can be overridden via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MAGSYNC_OUTPUT_DIR` | Magazine output directory | `~/Magazines` |
-| `MAGSYNC_INTERVAL` | Daemon cycle interval | `6h` |
+| `MAGSYNC_INTERVAL` | Daemon/service discovery interval | `6h` |
 | `MAGSYNC_SUBSCRIPTIONS` | Comma-separated `query:since` pairs; prefix an entry with `!` for exact title matching (e.g. `!The Economist:2024-06`) | (none) |
 | `MAGSYNC_APPRISE_URLS` | Comma-separated [Apprise](https://github.com/caronc/apprise/wiki) notification URLs | (none) |
 | `MAGSYNC_CONFIG_DIR` | Config directory path | `~/.magsync` |
@@ -254,6 +281,8 @@ All config values can be overridden via environment variables:
 | `MAGSYNC_NO_PROGRESS` | Disable the live progress bar in bulk commands (use the textual fallback) | (unset) |
 
 ### NAS Deployment (Synology, QNAP)
+
+With `:ro`, subscription and config changes report the read-only configuration; drop it to allow updates.
 
 ```yaml
 volumes:

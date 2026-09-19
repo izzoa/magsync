@@ -50,6 +50,20 @@ _DEFAULT_RETRY_AFTER_SECONDS = 30
 _MAX_RETRY_AFTER_SECONDS = 300
 
 
+from contextvars import ContextVar
+
+# Set only by the owner that reserved disk headroom. Base callers retain their
+# existing policy until they enter the shared runtime.
+download_byte_limit = ContextVar('magsync_download_byte_limit', default=None)
+
+
+def _check_download_size(size: int) -> None:
+    limit = download_byte_limit.get()
+    if limit is not None and size > limit:
+        raise DownloadPipelineError(DownloadFailureKind.CONFIGURATION,
+                                    "Payload exceeds the configured maximum download size")
+
+
 class DownloadPipelineError(RuntimeError):
     """Typed internal failure converted to :class:`DownloadResult` at the boundary."""
 
@@ -1051,6 +1065,7 @@ async def _stream_vk_payload(
     never be appended to a partial file.
     """
     existing = part_path.stat().st_size if part_path.exists() else 0
+    _check_download_size(existing)
     headers = {"Range": f"bytes={existing}-"} if existing else {}
 
     async with client.stream("GET", direct_url, headers=headers) as stream:
@@ -1097,9 +1112,11 @@ async def _stream_vk_payload(
                 f"VK payload returned HTTP {status}",
             )
 
+        _check_download_size(total or 0)
         part_path.parent.mkdir(parents=True, exist_ok=True)
         with part_path.open(mode) as handle:
             async for chunk in stream.aiter_bytes():
+                _check_download_size(written + len(chunk))
                 handle.write(chunk)
                 written += len(chunk)
                 if on_progress is not None:
@@ -1523,6 +1540,7 @@ async def _do_download(
         part_path = _part_path_for(dest, limewire_url)
 
         existing_bytes = part_path.stat().st_size if part_path.exists() else 0
+        _check_download_size(existing_bytes)
         if existing_bytes > 0:
             logger.info(f"Resuming download from {existing_bytes:,} bytes")
 
@@ -1584,9 +1602,11 @@ async def _do_download(
                     effective_total = int(content_length) if content_length.isdigit() else 0
                     mode = "wb"
                     total_downloaded = 0
+                _check_download_size(effective_total)
                 streamed = True
                 with open(part_path, mode) as f:
                     async for chunk in stream.aiter_bytes(chunk_size=65536):
+                        _check_download_size(total_downloaded + len(chunk))
                         f.write(chunk)
                         total_downloaded += len(chunk)
                         if on_progress:

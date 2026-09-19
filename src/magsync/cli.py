@@ -8,35 +8,38 @@ import os
 import re
 import signal
 import sys
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from magsync.config import load_config, save_config, set_config_value
+from magsync.config import (
+    ConfigurationConflict,
+    add_subscription,
+    get_db_path,
+    load_config,
+    remove_subscription,
+    set_config_value,
+)
 from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.index import MagazineIndex
 from magsync.core.models import (
     DownloadStatus,
-    IndexOutcome,
     LinkResolutionKind,
     SourceError,
     SourceFailure,
     SourceFailureKind,
-    Subscription,
 )
-from magsync.core.organizer import normalize_title, parse_date, strip_accents
+from magsync.core.organizer import strip_accents
 from magsync.core.scraper import (
     FreemagazinesClient,
-    resolve_masked_links,
     scrape_detail_page,
     search_with_details_result,
 )
 from magsync.output import BatchOutput, resolve_mode
+from magsync.companion.local import coordinated, read_only_snapshot
+from magsync.companion.protocol import ProtocolError
 
 app = typer.Typer(
     name="magsync",
@@ -45,6 +48,12 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 console = Console()
+
+# The operator surface stays importable without FastAPI/Uvicorn installed.
+from magsync.companion.cli import companion, clients, serve
+app.add_typer(companion, name="companion")
+app.add_typer(clients, name="clients")
+app.command()(serve)
 
 
 def _reject_conflicting_flags(verbose: bool, quiet: bool) -> None:
@@ -71,139 +80,9 @@ def main(ctx: typer.Context):
         tui_app.run()
 
 
-def _filter_results(results, query: str, exact: bool):
-    """Filter scraped results by exact title match if requested."""
-    if not exact:
-        return results
-    query_norm = strip_accents(query).lower()
-    return [r for r in results if strip_accents(normalize_title(r.title)).lower() == query_norm]
-
-
-def _index_results(results, idx: MagazineIndex, cfg, subscription=None) -> IndexOutcome:
-    """Index scraped results, grouping by normalized title.
-
-    Each unique normalized title gets its own magazine entry.
-    Returns total new issues added.
-
-    ``subscription`` is the subscription whose search produced these results,
-    when there is one: matching rows record subscription provenance (and
-    null-provenance re-encounters are promoted); fuzzy strangers are cataloged
-    without provenance and are never claimable work.
-
-    Returns an :class:`IndexOutcome`: new issues added, plus the number stored
-    or left without a usable download URL.
-    """
-    from collections import defaultdict
-
-    # Group results by normalized title
-    by_magazine: dict[str, list] = defaultdict(list)
-    for r in results:
-        norm = normalize_title(r.title) if r.title else "Unknown"
-        by_magazine[norm].append(r)
-
-    total_new = 0
-    total_linkless = 0
-    for norm_title, issues in by_magazine.items():
-        display_title = norm_title
-        mag_id = idx.get_or_create_magazine(display_title, strip_accents(norm_title).lower())
-        issues_data = []
-        for r in issues:
-            parsed = parse_date(r.title, r.page_url)
-            issues_data.append({
-                "title": r.title,
-                "page_url": r.page_url,
-                "limewire_url": r.limewire_url,
-                "year": parsed.year,
-                "month": parsed.month,
-                "date_raw": r.title,
-                "genre": r.genre,
-                "file_size": r.file_size,
-                "cover_image_url": r.cover_image_url,
-            })
-        outcome = idx.add_issues(mag_id, issues_data, subscription=subscription)
-        total_new += outcome.added
-        total_linkless += outcome.linkless
-
-    return IndexOutcome(added=total_new, linkless=total_linkless)
-
-
-async def _resolve_links_for_indexing(
-    items, idx: MagazineIndex, source_client, *, subscription=None
-):
-    """Resolve masked download links only for the issues that still need one.
-
-    Two gates, both about not spending source requests pointlessly:
-
-    * Issues already carrying a usable stored URL, or already parked with a
-      pending re-probe, are skipped - so in steady state only genuinely new
-      issues are resolved.
-    * When the search was driven by a subscription, issues whose title does
-      not match it are skipped too. A fuzzy-search stranger is cataloged with
-      no provenance and can never be claimed, so resolving its link is wasted
-      traffic - the same reason ``backfill-urls`` repairs only wanted rows.
-      Nothing is lost permanently: subscribing later promotes the row, and
-      ``backfill-urls`` then repairs its URL.
-    """
-    from magsync.core.matching import title_match
-
-    needed = idx.page_urls_missing_link([item.page_url for item in items])
-
-    def needs_link(issue) -> bool:
-        if issue.page_url not in needed:
-            return False
-        if subscription is not None and not title_match(
-            issue.title or "", subscription
-        ):
-            return False
-        return True
-
-    return await resolve_masked_links(items, source_client, needs_link=needs_link)
-
-
-def _park_link_dispositions(batch, idx: MagazineIndex) -> tuple[int, int]:
-    """Park issues whose link resolved but is not usable.
-
-    Returns ``(unsupported_host, dead_link)`` counts. Both are parked with a
-    scheduled re-probe rather than retried every cycle or abandoned: the
-    source may rehost or rotate the link later. The pending action is also
-    what keeps them out of the indexing resolution gate.
-    """
-    from magsync.core.policy import dead_link_reprobe_at, unsupported_host_reprobe_at
-
-    disposed = [issue for issue, _host in batch.unsupported_host] + list(
-        batch.dead_link
-    )
-    if not disposed:
-        return (0, 0)
-
-    ids = idx.issue_ids_for_page_urls([issue.page_url for issue in disposed])
-    unsupported = 0
-    for issue, host in batch.unsupported_host:
-        issue_id = ids.get(issue.page_url)
-        if issue_id is None:
-            continue
-        if idx.park_link_outcome(
-            issue_id,
-            DownloadStatus.UNSUPPORTED,
-            unsupported_host_reprobe_at(),
-            error=f"download link resolved to unsupported host {host}",
-        ):
-            unsupported += 1
-
-    dead = 0
-    for issue in batch.dead_link:
-        issue_id = ids.get(issue.page_url)
-        if issue_id is None:
-            continue
-        if idx.park_link_outcome(
-            issue_id,
-            DownloadStatus.UNAVAILABLE,
-            dead_link_reprobe_at(),
-            error="source reported no available download link",
-        ):
-            dead += 1
-
-    return (unsupported, dead)
+from magsync.core.orchestration import _index_results
+# One daemon cycle through the production runtime (tests and diagnostics).
+from magsync.core.orchestration import _run_daemon_cycle  # noqa: F401
 
 
 def _cli_source_failure_message(failure: SourceFailure) -> str:
@@ -245,7 +124,380 @@ def _print_partial_details(count: int) -> None:
         )
 
 
+def _parse_since_option(since: str | None) -> tuple[int | None, int | None]:
+    """Parse ``--since YYYY[-MM]``; reject anything else before doing work."""
+    if not since:
+        return None, None
+    parts = since.split("-")
+    try:
+        year = int(parts[0])
+        month = int(parts[1]) if len(parts) > 1 and parts[1] else None
+    except ValueError:
+        raise typer.BadParameter("--since must look like YYYY-MM (for example 2025-06)") from None
+    if month is not None and not 1 <= month <= 12:
+        raise typer.BadParameter("--since month must be between 01 and 12")
+    return year, month
+
+
+def _print_search_table(query: str, result_count: int, new_count: int, idx: MagazineIndex) -> None:
+    """The search result table, shared by standalone and daemon-executed searches."""
+    norm = strip_accents(query).lower()
+    table = Table(title=f"Results for '{query}' ({result_count} issues, {new_count} new)")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Title", style="cyan", max_width=60)
+    table.add_column("Year", width=6)
+    table.add_column("Month", width=6)
+    table.add_column("Size", width=8)
+    table.add_column("Status", width=10)
+
+    for i, issue in enumerate(idx.get_issues(magazine_title=norm), 1):
+        status = issue.get("download_status", "pending")
+        # Never-requested rows are catalog entries, not queued work — a
+        # parked side-effect row must not present itself as "pending".
+        if status not in ("complete", "downloading") and issue.get(
+            "requested_by"
+        ) not in ("manual", "subscription"):
+            status = "cataloged"
+        status_style = {
+            "complete": "[green]done[/green]",
+            "pending": "[dim]pending[/dim]",
+            "cataloged": "[dim italic]cataloged[/dim italic]",
+            "failed": "[red]failed[/red]",
+            "downloading": "[yellow]downloading[/yellow]",
+            "unavailable": "[red dim]unavailable[/red dim]",
+            "unsupported": "[magenta]unsupported[/magenta]",
+        }.get(status, status)
+
+        table.add_row(
+            str(i),
+            escape(issue["title"][:60]),
+            str(issue.get("year") or "?"),
+            str(issue.get("month") or "?"),
+            escape(issue.get("file_size") or "?"),
+            status_style,
+        )
+
+    console.print(table)
+
+
+def _print_dry_run_table(issues: list[dict], title: str) -> None:
+    """Cached issues a dry run would download, with an estimated total size."""
+    table = Table(title=title)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Title", style="cyan", max_width=55)
+    table.add_column("Year", width=6)
+    table.add_column("Month", width=6)
+    table.add_column("Size", width=8)
+    total_size = 0
+    for i, issue in enumerate(issues, 1):
+        table.add_row(
+            str(i),
+            escape((issue.get("title") or "")[:55]),
+            str(issue.get("year") or "?"),
+            str(issue.get("month") or "?"),
+            escape(issue.get("file_size") or "?"),
+        )
+        size_str = issue.get("file_size") or ""
+        if "MB" in size_str:
+            try:
+                total_size += int("".join(c for c in size_str if c.isdigit()))
+            except ValueError:
+                pass
+    console.print(table)
+    if total_size:
+        console.print(f"\n[dim]Estimated total: ~{total_size} MB[/dim]")
+
+
+_DRY_RUN_NOTE = "Dry run — cached catalog only; no source requests and no files downloaded."
+
+_OPERATION_ERRORS = {
+    "internal_error": "The magsync daemon could not complete this command; see its log for details.",
+    "runtime_unavailable": "The magsync daemon stopped before finishing this command.",
+    "interrupted": "The command was interrupted before it finished.",
+    "abandoned": "The command was abandoned before it started.",
+    "withdrawn": "The command was cancelled before it started.",
+    "capacity_exhausted": "Not enough free disk space to download right now; free some space and try again.",
+    "configuration_managed": "Configuration is managed outside magsync; the change was not saved.",
+    "invalid_request": "The command was not valid.",
+    "scope_disabled": "The local library is disabled.",
+}
+
+_OUTCOME_LABELS = {
+    "complete": ("✓", "downloaded", "green"),
+    "unavailable": ("○", "unavailable", "yellow"),
+    "unsupported": ("⊘", "unsupported", "magenta"),
+    "failed": ("✗", "failed", "red"),
+    "pending": ("·", "not downloaded", "dim"),
+    "downloading": ("…", "downloading", "yellow"),
+}
+
+
+def _render_operation_error(operation: dict) -> int | None:
+    """Print a sentence for an operation that failed as a whole; return its exit code."""
+    result = operation.get("result") or {}
+    if operation["state"] != "failed" or result.get("failure"):
+        return None
+    code = result.get("code")
+    message = result.get("message") or _OPERATION_ERRORS.get(code) or f"The command failed ({code or 'unknown'})."
+    console.print(message, style="red", markup=False, highlight=False)
+    return 1
+
+
+def _render_source_failure(result: dict) -> None:
+    failure = result.get("failure") or {}
+    try:
+        _print_source_failure(SourceFailure(
+            SourceFailureKind(failure["kind"]), failure.get("message") or "",
+            status_code=failure.get("status_code"), host=failure.get("host"), cf_ray=failure.get("cf_ray"),
+        ))
+    except (KeyError, ValueError, TypeError):
+        console.print("Source search failed; retry later.", style="red", markup=False, highlight=False)
+
+
+def _print_outcomes(store, outcomes: list[dict]) -> dict[str, int]:
+    """One line per issue (title, marker, typed outcome); returns counts by label."""
+    internal = {}
+    for outcome in outcomes:
+        try:
+            internal[outcome["issue_id"]] = store.internal_issue(outcome["issue_id"])
+        except ProtocolError:
+            continue
+    rows = {row["id"]: row for row in store.index.get_issues_by_ids(list(internal.values()))}
+    counts: dict[str, int] = {}
+    for outcome in outcomes:
+        row = rows.get(internal.get(outcome["issue_id"])) or {}
+        marker, label, style = _OUTCOME_LABELS.get(outcome.get("status") or "failed", _OUTCOME_LABELS["failed"])
+        counts[label] = counts.get(label, 0) + 1
+        kind = outcome.get("failure_kind")
+        detail = f" ({kind})" if kind and label != "downloaded" else ""
+        title = sanitize_external_error((row.get("title") or "Unknown issue")[:60])
+        console.print(f"  {marker} {title}: {label}{detail}", style=style, markup=False, highlight=False)
+    return counts
+
+
+def _render_search(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    result = operation["result"]
+    if result.get("outcome") in ("blocked", "failed"):
+        _render_source_failure(result)
+        return 1
+    if result.get("outcome") == "empty":
+        console.print(f"[yellow]No results found for '{escape(body['query'])}'[/yellow]")
+        return 0
+    detail_failures = result.get("detail_failures") or 0
+    _print_partial_details(detail_failures)
+    _print_search_table(body["query"], len(result.get("items") or []), result.get("added") or 0, store.index)
+    return 1 if detail_failures else 0
+
+
+def _render_fetch(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    result = operation["result"]
+    if result.get("outcome") in ("blocked", "failed"):
+        _render_source_failure(result)
+        return 1
+    if result.get("outcome") == "empty":
+        console.print(f"[yellow]No results found for '{escape(body['query'])}'[/yellow]")
+        return 0
+    detail_failures = result.get("detail_failures") or 0
+    _print_partial_details(detail_failures)
+    recoverable = result.get("recoverable") or 0
+    if recoverable:
+        console.print(
+            f"[yellow]{recoverable} previously failed/unavailable "
+            f"issue{'s' if recoverable != 1 else ''} marked as requested — run "
+            "'magsync retry' to attempt them.[/yellow]"
+        )
+    pending = result.get("pending") or 0
+    if not pending:
+        console.print("[green]All matching issues already downloaded![/green]")
+        return 1 if detail_failures else 0
+    counts = _print_outcomes(store, result.get("outcomes") or [])
+    summary = ", ".join(f"{count} {label}" for label, count in counts.items()) or "nothing processed"
+    console.print(f"\nFetched {pending} issue{'s' if pending != 1 else ''}: {summary}.", markup=False, highlight=False)
+    if result.get("code") == "capacity_exhausted":
+        console.print(_OPERATION_ERRORS["capacity_exhausted"], style="yellow", markup=False)
+        return 1
+    return 1 if detail_failures else 0
+
+
+def _render_update(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    result = operation["result"]
+    if not result.get("tracked"):
+        console.print("[yellow]No tracked magazines. Run 'magsync search' first.[/yellow]")
+        return 0
+    for line in result.get("magazines") or []:
+        title = line["title"]
+        if line["outcome"] in ("blocked", "failed"):
+            console.print(f"Update for '{title}' failed:", style="red", markup=False)
+            _render_source_failure(line)
+        elif line.get("detail_failures"):
+            console.print(f"  {title}: {line.get('added') or 0} new issues; {line['detail_failures']} detail page(s) omitted",
+                          style="yellow", markup=False)
+        elif line.get("added"):
+            console.print(f"  [cyan]{escape(title)}[/cyan]: {line['added']} new issues")
+        else:
+            console.print(f"  [dim]{escape(title)}: up to date[/dim]")
+    if result.get("incomplete") or result.get("skipped"):
+        console.print(
+            f"\nUpdate incomplete: {result.get('new') or 0} new issues; {result.get('incomplete') or 0} source "
+            f"operation(s) incomplete; {result.get('skipped') or 0} skipped after source blocking.",
+            style="yellow", markup=False,
+        )
+        return 1
+    console.print(f"\n[green]Update complete.[/green] {result.get('new') or 0} new issues found.")
+    return 0
+
+
+def _render_backfill(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    result = operation["result"]
+    parked = result.get("parked_skipped") or 0
+    if parked:
+        console.print(f"[dim]{parked} never-requested issue{'s' if parked != 1 else ''} skipped (use --all to include them).[/dim]")
+    if not result.get("total"):
+        console.print("[green]No issues missing a download URL.[/green]")
+        return 0
+    repaired, missing = result.get("repaired") or 0, result.get("missing") or 0
+    failed, skipped = result.get("failed") or 0, result.get("skipped") or 0
+    if failed or skipped or result.get("outcome") == "blocked":
+        console.print(f"\nBackfill incomplete. {repaired} repaired, {missing} checked with no URL, "
+                      f"{skipped} skipped, {failed} failed.", style="yellow", markup=False)
+        return 1
+    console.print(f"\n[green]Backfill complete.[/green] {repaired} repaired, {missing} still missing a URL.")
+    return 0
+
+
+def _render_config(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    console.print(f"Set {body['key']} = {body['value']}", style="green", markup=False, highlight=False)
+    return 0
+
+
+def _subscribed_message(query: str, since: str | None, exact: bool) -> str:
+    since_str = f" since {since}" if since else ""
+    exact_str = " (exact match)" if exact else ""
+    return f"Subscribed to '{query}'{since_str}{exact_str}"
+
+
+def _render_subscribe(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    if operation["result"].get("outcome") == "unchanged":
+        console.print(f"Already subscribed to '{body['query']}'", style="yellow", markup=False, highlight=False)
+        return 0
+    console.print(_subscribed_message(body["query"], body.get("since"), bool(body.get("exact"))),
+                  style="green", markup=False, highlight=False)
+    return 0
+
+
+def _render_unsubscribe(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    if operation["result"].get("outcome") == "unchanged":
+        console.print(f"No subscription found for '{body['query']}'", style="yellow", markup=False, highlight=False)
+        return 0
+    console.print(f"Unsubscribed from '{body['query']}'", style="green", markup=False, highlight=False)
+    return 0
+
+
+def _render_retry(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    result = operation["result"]
+    outcomes = result.get("outcomes") or []
+    skipped, excluded = result.get("skipped") or 0, result.get("excluded") or 0
+    if not outcomes and not skipped and not excluded:
+        console.print("[green]No failed downloads to retry.[/green]")
+        return 0
+    console.print(f"Retried {result.get('physical_attempts', 0)} shared download(s).", markup=False, highlight=False)
+    _print_outcomes(store, outcomes)
+    if skipped:
+        console.print(f"{skipped} skipped: no download link (run 'magsync backfill-urls' to repair).",
+                      style="yellow", markup=False, highlight=False)
+    if excluded:
+        console.print(f"{excluded} excluded: no current local request (subscribe or fetch first, then retry).",
+                      style="yellow", markup=False, highlight=False)
+    return 0
+
+
+def _print_repair(report: dict, *, dry_run: bool) -> None:
+    """Repair output, shared by standalone and daemon-executed repair-titles."""
+    if not report["candidates"]:
+        console.print("[green]No titles need repair.[/green]")
+    else:
+        suffix = " [dim](dry run — nothing will be written)[/dim]" if dry_run else ""
+        console.print(f"Repairing {report['candidates']} issue(s){suffix}")
+    for kind, label, detail in report["lines"]:
+        label = escape(label)
+        if kind == "renamed":
+            console.print(f"  [dim]·[/dim] {label} → {escape(detail)}")
+        elif kind == "correct":
+            console.print(f"  [dim]·[/dim] {label} (file already correct)")
+        elif kind == "missing":
+            console.print(f"  [yellow]?[/yellow] {label}: recorded file is missing, left alone")
+        elif kind == "collision":
+            console.print(f"  [yellow]![/yellow] {label}: destination already exists, both files left in place")
+        elif kind == "moved":
+            console.print(f"  [green]→[/green] {label}: moved into {escape(detail)}")
+    pruned = report.get("pruned") or []
+    console.print(
+        f"\n[bold]{report['repaired']} title(s) repaired[/bold], {report['moved']} file(s) moved"
+        + (f", {report['collisions']} collision(s)" if report["collisions"] else "")
+        + (f", {report['missing']} missing file(s)" if report["missing"] else "")
+        + (f", {len(pruned)} empty magazine record(s) pruned" if pruned else "")
+        + (f", {report['removed_dirs']} empty folder(s) removed" if report.get("removed_dirs") else "")
+    )
+    if dry_run:
+        console.print("[dim]Dry run: no titles, paths, or files were changed.[/dim]")
+
+
+def _render_repair(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    _print_repair(operation["result"], dry_run=False)
+    return 0
+
+
+def _preview_fetch(arguments: dict) -> None:
+    """``fetch --dry-run``: cached pending issues, read from a private snapshot."""
+    query = arguments["query"]
+    since_year, since_month = _parse_since_option(arguments.get("since"))
+    with read_only_snapshot() as preview:
+        pending = preview.get_issues(
+            magazine_title=strip_accents(query).lower(),
+            since_year=since_year,
+            since_month=since_month,
+            status=DownloadStatus.PENDING,
+        )
+    if not pending:
+        console.print(
+            f"No cached issues match '{query}'. Run magsync search \"{query}\" "
+            "(or fetch without --dry-run) to refresh the catalog first.",
+            style="yellow", markup=False, highlight=False,
+        )
+        return
+    _print_dry_run_table(pending, f"Would download {len(pending)} cached issues")
+    console.print(f"\n[yellow]{_DRY_RUN_NOTE}[/yellow]")
+
+
 @app.command()
+@coordinated("search", render=_render_search)
 def search(
     query: str = typer.Argument(..., help="Magazine title to search for"),
 ):
@@ -284,46 +536,7 @@ def search(
     idx = MagazineIndex()
     try:
         new_count = _index_results(results, idx, cfg).added
-
-        # Display results
-        norm = strip_accents(query).lower()
-        table = Table(title=f"Results for '{query}' ({len(results)} issues, {new_count} new)")
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Title", style="cyan", max_width=60)
-        table.add_column("Year", width=6)
-        table.add_column("Month", width=6)
-        table.add_column("Size", width=8)
-        table.add_column("Status", width=10)
-
-        all_issues = idx.get_issues(magazine_title=norm)
-        for i, issue in enumerate(all_issues, 1):
-            status = issue.get("download_status", "pending")
-            # Never-requested rows are catalog entries, not queued work — a
-            # parked side-effect row must not present itself as "pending".
-            if status not in ("complete", "downloading") and issue.get(
-                "requested_by"
-            ) not in ("manual", "subscription"):
-                status = "cataloged"
-            status_style = {
-                "complete": "[green]done[/green]",
-                "pending": "[dim]pending[/dim]",
-                "cataloged": "[dim italic]cataloged[/dim italic]",
-                "failed": "[red]failed[/red]",
-                "downloading": "[yellow]downloading[/yellow]",
-                "unavailable": "[red dim]unavailable[/red dim]",
-                "unsupported": "[magenta]unsupported[/magenta]",
-            }.get(status, status)
-
-            table.add_row(
-                str(i),
-                issue["title"][:60],
-                str(issue.get("year") or "?"),
-                str(issue.get("month") or "?"),
-                issue.get("file_size") or "?",
-                status_style,
-            )
-
-        console.print(table)
+        _print_search_table(query, len(results), new_count, idx)
     finally:
         idx.close()
     if detail_failures:
@@ -331,6 +544,7 @@ def search(
 
 
 @app.command()
+@coordinated("fetch", render=_render_fetch, preview=_preview_fetch)
 def fetch(
     query: str = typer.Argument(..., help="Magazine title to fetch"),
     since: str = typer.Option(None, "--since", help="Fetch issues from this date (YYYY-MM)"),
@@ -346,12 +560,7 @@ def fetch(
     if output:
         cfg.output_dir = output
 
-    # Parse --since
-    since_year = since_month = None
-    if since:
-        parts = since.split("-")
-        since_year = int(parts[0])
-        since_month = int(parts[1]) if len(parts) > 1 else None
+    since_year, since_month = _parse_since_option(since)
 
     idx = MagazineIndex()
     try:
@@ -432,35 +641,8 @@ def fetch(
                     return 1 if detail_failures else 0
 
                 if dry_run:
-                    table = Table(title=f"Would download {len(pending)} issues")
-                    table.add_column("#", style="dim", width=4)
-                    table.add_column("Title", style="cyan", max_width=55)
-                    table.add_column("Year", width=6)
-                    table.add_column("Month", width=6)
-                    table.add_column("Size", width=8)
-                    total_size = 0
-                    for i, issue in enumerate(pending, 1):
-                        table.add_row(
-                            str(i),
-                            issue["title"][:55],
-                            str(issue.get("year") or "?"),
-                            str(issue.get("month") or "?"),
-                            issue.get("file_size") or "?",
-                        )
-                        size_str = issue.get("file_size") or ""
-                        if "MB" in size_str:
-                            try:
-                                total_size += int(
-                                    "".join(c for c in size_str if c.isdigit())
-                                )
-                            except ValueError:
-                                pass
-                    console.print(table)
-                    if total_size:
-                        console.print(
-                            f"\n[dim]Estimated total: ~{total_size} MB[/dim]"
-                        )
-                    console.print("\n[yellow]Dry run — no files downloaded.[/yellow]")
+                    _print_dry_run_table(pending, f"Would download {len(pending)} issues")
+                    console.print(f"\n[yellow]{_DRY_RUN_NOTE}[/yellow]")
                     return 1 if detail_failures else 0
 
                 console.print(
@@ -489,6 +671,7 @@ def fetch(
 
 
 @app.command()
+@coordinated("update", render=_render_update)
 def update():
     """Re-scrape all tracked magazines and update the index."""
     cfg = load_config()
@@ -569,15 +752,26 @@ def update():
         raise typer.Exit(exit_code)
 
 
+def _print_config_error(exc: BaseException) -> None:
+    """One sentence for a rejected configuration change; never a traceback."""
+    console.print(str(exc), style="red", markup=False, highlight=False)
+
+
 @app.command()
+@coordinated("config", read_only=lambda arguments: not (arguments.get("key") and arguments.get("value")),
+             render=_render_config)
 def config(
     key: str = typer.Argument(None, help="Config key to view or set (e.g., 'output_dir')"),
     value: str = typer.Argument(None, help="Value to set"),
 ):
     """View or modify magsync configuration."""
     if key and value:
-        cfg = set_config_value(key, value)
-        console.print(f"[green]Set {key} = {value}[/green]")
+        try:
+            cfg = set_config_value(key, value)
+        except (ValueError, ConfigurationConflict) as exc:
+            _print_config_error(exc)
+            raise typer.Exit(1)
+        console.print(f"Set {key} = {value}", style="green", markup=False, highlight=False)
     else:
         cfg = load_config()
         table = Table(title="magsync configuration")
@@ -605,6 +799,7 @@ def config(
 
 
 @app.command()
+@coordinated("subscribe", read_only=lambda arguments: arguments.get("query") is None, render=_render_subscribe)
 def subscribe(
     query: str = typer.Argument(None, help="Magazine title to subscribe to"),
     since: str = typer.Option(None, "--since", help="Only fetch issues from this date (YYYY-MM)"),
@@ -631,62 +826,36 @@ def subscribe(
         console.print(table)
         raise typer.Exit()
 
-    # Check for duplicate (accent-insensitive)
-    for sub in cfg.subscriptions:
-        if strip_accents(sub.query).lower() == strip_accents(query).lower():
-            console.print(f"[yellow]Already subscribed to '{query}'[/yellow]")
-            raise typer.Exit()
-
-    cfg.subscriptions.append(Subscription(query=query, since=since, exact=exact))
-    save_config(cfg)
-    since_str = f" since {since}" if since else ""
-    exact_str = " (exact match)" if exact else ""
-    console.print(f"[green]Subscribed to '{query}'{since_str}{exact_str}[/green]")
+    try:
+        added = add_subscription(query, since=since, exact=exact)
+    except ConfigurationConflict as exc:
+        _print_config_error(exc)
+        raise typer.Exit(1)
+    if not added:
+        console.print(f"Already subscribed to '{query}'", style="yellow", markup=False, highlight=False)
+        raise typer.Exit()
+    console.print(_subscribed_message(query, since, exact), style="green", markup=False, highlight=False)
 
 
 @app.command()
+@coordinated("unsubscribe", render=_render_unsubscribe)
 def unsubscribe(
     query: str = typer.Argument(..., help="Magazine title to unsubscribe from"),
 ):
     """Remove a magazine subscription."""
-    cfg = load_config()
-    original_count = len(cfg.subscriptions)
-    cfg.subscriptions = [s for s in cfg.subscriptions if strip_accents(s.query).lower() != strip_accents(query).lower()]
-
-    if len(cfg.subscriptions) == original_count:
-        console.print(f"[yellow]No subscription found for '{query}'[/yellow]")
+    try:
+        removed = remove_subscription(query)
+    except ConfigurationConflict as exc:
+        _print_config_error(exc)
+        raise typer.Exit(1)
+    if not removed:
+        console.print(f"No subscription found for '{query}'", style="yellow", markup=False, highlight=False)
         raise typer.Exit()
-
-    save_config(cfg)
-    console.print(f"[green]Unsubscribed from '{query}'[/green]")
-
-
-HEALTH_CHECK_PATH = Path("/tmp/magsync-healthy")
-
-
-def _start_heartbeat(interval: int = 30) -> Callable:
-    """Start a daemon thread that touches the health check file every `interval` seconds.
-
-    Returns a stop function.
-    """
-    import threading
-
-    stop_event = threading.Event()
-
-    def _beat():
-        while not stop_event.is_set():
-            try:
-                HEALTH_CHECK_PATH.touch()
-            except OSError:
-                pass
-            stop_event.wait(interval)
-
-    t = threading.Thread(target=_beat, daemon=True)
-    t.start()
-    return stop_event.set
+    console.print(f"Unsubscribed from '{query}'", style="green", markup=False, highlight=False)
 
 
 @app.command()
+@coordinated("retry", render=_render_retry)
 def retry(
     query: str = typer.Argument(None, help="Only retry failed downloads for this magazine"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-issue detail (dead-link logs, ✓/✗ lines)"),
@@ -763,6 +932,7 @@ def retry(
 
 
 @app.command("repair-titles")
+@coordinated("repair", render=_render_repair)
 def repair_titles(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Report what would change without writing anything"
@@ -782,107 +952,19 @@ def repair_titles(
     already-downloaded file to its corrected path, and updates the recorded
     path so content deduplication keeps resolving. Safe to re-run.
     """
-    from magsync.core.organizer import organize_path, strip_format_tag
+    from magsync.core.repair import repair_titles as run_repair
 
     cfg = load_config()
     idx = MagazineIndex()
-    output_dir = Path(cfg.output_dir).expanduser()
     try:
-        candidates = [
-            row
-            for row in idx.get_issues_with_tagged_titles()
-            if strip_format_tag(row["title"] or "") != (row["title"] or "")
-        ]
-        if not candidates:
-            console.print("[green]No titles need repair.[/green]")
-        else:
-            suffix = " [dim](dry run — nothing will be written)[/dim]" if dry_run else ""
-            console.print(f"Repairing {len(candidates)} issue(s){suffix}")
-
-        repaired = moved = collisions = missing = 0
-        touched_dirs: set[Path] = set()
-
-        for row in candidates:
-            new_title = strip_format_tag(row["title"])
-            parsed = parse_date(new_title, row["page_url"] or "")
-            norm = normalize_title(new_title)
-            label = sanitize_external_error(new_title[:56])
-
-            if dry_run:
-                magazine_id = row["magazine_id"]
-            else:
-                magazine_id = idx.get_or_create_magazine(
-                    norm, strip_accents(norm).lower()
-                )
-                idx.repair_issue_title(
-                    row["id"],
-                    title=new_title,
-                    magazine_id=magazine_id,
-                    year=parsed.year,
-                    month=parsed.month,
-                    date_raw=new_title,
-                )
-            repaired += 1
-
-            old_path = Path(row["file_path"]) if row["file_path"] else None
-            if row["download_status"] != DownloadStatus.COMPLETE.value or old_path is None:
-                console.print(f"  [dim]·[/dim] {label} → {norm}")
-                continue
-
-            new_path = organize_path(new_title, row["page_url"] or "", str(output_dir))
-            if old_path == new_path:
-                console.print(f"  [dim]·[/dim] {label} (file already correct)")
-                continue
-            if not old_path.exists():
-                missing += 1
-                console.print(
-                    f"  [yellow]?[/yellow] {label}: recorded file is missing, left alone",
-                    markup=True,
-                )
-                continue
-            if new_path.exists():
-                # Never guess which of two files is canonical.
-                collisions += 1
-                console.print(
-                    f"  [yellow]![/yellow] {label}: destination already exists, "
-                    "both files left in place"
-                )
-                continue
-
-            if not dry_run:
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                old_path.replace(new_path)
-                idx.set_download_file_path(row["id"], str(new_path))
-            touched_dirs.add(old_path.parent)
-            moved += 1
-            console.print(f"  [green]→[/green] {label}: moved into {new_path.parent.name}")
-
-        pruned: list[str] = []
-        removed_dirs = 0
-        if not dry_run:
-            pruned = idx.prune_empty_tagged_magazines()
-            for directory in touched_dirs:
-                try:
-                    if directory.is_dir() and not any(directory.iterdir()):
-                        directory.rmdir()
-                        removed_dirs += 1
-                except OSError:
-                    pass  # best effort; a non-empty or busy directory is fine
-
-        console.print(
-            f"\n[bold]{repaired} title(s) repaired[/bold], {moved} file(s) moved"
-            + (f", {collisions} collision(s)" if collisions else "")
-            + (f", {missing} missing file(s)" if missing else "")
-            + (f", {len(pruned)} empty magazine record(s) pruned" if pruned else "")
-            + (f", {removed_dirs} empty folder(s) removed" if removed_dirs else "")
-        )
-        if dry_run:
-            console.print("[dim]Dry run: no titles, paths, or files were changed.[/dim]")
+        report = run_repair(idx, cfg.output_dir, dry_run=dry_run)
     finally:
         idx.close()
+    _print_repair(report.as_dict(), dry_run=dry_run)
 
 
 @app.command(name="backfill-urls")
+@coordinated("backfill", render=_render_backfill)
 def backfill_urls(
     query: str = typer.Argument(None, help="Only backfill issues for this magazine"),
     include_all: bool = typer.Option(
@@ -1090,508 +1172,41 @@ def _configure_daemon_external_logging() -> None:
             handler.addFilter(_DaemonRedactionFilter())
 
 
-def _source_failure_reason(failure: Any) -> str:
-    """Render only the safe fields carried by a structured source failure."""
-
-    from magsync.core.diagnostics import sanitize_external_error
-
-    parts = [getattr(getattr(failure, "kind", None), "value", "source_failure")]
-    message = getattr(failure, "message", None)
-    if message:
-        parts.append(str(message))
-    status_code = getattr(failure, "status_code", None)
-    if status_code is not None:
-        parts.append(f"status={status_code}")
-    host = getattr(failure, "host", None)
-    if host:
-        parts.append(f"host={host}")
-    cf_ray = getattr(failure, "cf_ray", None)
-    if cf_ray:
-        parts.append(f"cf_ray={cf_ray}")
-    return sanitize_external_error("; ".join(parts))
-
-
-def _batch_failure_kind(result: dict):
-    """Read a batch result's typed kind without consulting display text."""
-
-    from magsync.core.models import DownloadFailureKind
-
-    value = result.get("failure_kind")
-    if value is None:
-        nested = result.get("result")
-        value = getattr(nested, "failure_kind", None)
-    try:
-        return DownloadFailureKind(value) if value is not None else DownloadFailureKind.INTERNAL
-    except (TypeError, ValueError):
-        return DownloadFailureKind.INTERNAL
-
-
-def _reconcile_download_results(
-    report,
-    results: list[dict],
-    logger: logging.Logger,
-) -> list[dict]:
-    """Update a cycle report solely from returned typed batch results."""
-
-    from magsync.core.diagnostics import sanitize_external_error
-    from magsync.core.models import DownloadSummaryBucket
-    from magsync.core.policy import get_download_failure_policy
-
-    downloaded: list[dict] = []
-    for result in results:
-        issue = result.get("issue") or {}
-        title = sanitize_external_error(issue.get("title") or "Unknown issue", 120)
-        if result.get("success"):
-            report.downloads_complete += 1
-            downloaded.append(issue)
-            logger.info("  Done: %s", title)
-            continue
-
-        kind = _batch_failure_kind(result)
-        policy = get_download_failure_policy(kind)
-        if policy.summary_bucket is DownloadSummaryBucket.UNAVAILABLE:
-            report.downloads_unavailable += 1
-            label = "Unavailable"
-        elif policy.summary_bucket is DownloadSummaryBucket.UNSUPPORTED:
-            report.downloads_unsupported += 1
-            label = "Skipped (unsupported)"
-        else:
-            report.downloads_failed += 1
-            label = "Failed"
-
-        detail = sanitize_external_error(result.get("error") or kind.value)
-        logger.log(policy.log_level, "  %s: %s: %s", label, title, detail)
-    return downloaded
-
-
-def _log_cycle_report(report, logger: logging.Logger) -> None:
-    """Emit one reconciled, secret-safe phase summary."""
-
-    from magsync.core.models import PipelineStatus
-
-    level = {
-        PipelineStatus.HEALTHY: logging.INFO,
-        PipelineStatus.DEGRADED: logging.WARNING,
-        PipelineStatus.FAILED: logging.ERROR,
-    }[report.status]
-    reason = f"; reason={report.reason}" if report.reason else ""
-    logger.log(
-        level,
-        (
-            "Cycle %s in %.1fs: source %d/%d completed "
-            "(%d attempted, %d empty, %d failed, %d skipped, %d detail failures, "
-            "%d link failures, %d link-less, %d unsupported host, %d dead link); "
-            "downloads %d queued/%d unique "
-            "(%d complete, %d unavailable, %d unsupported, %d failed); "
-            "%d refreshes pending%s"
-        ),
-        report.status.value,
-        report.elapsed_seconds,
-        report.source_completed,
-        report.source_total,
-        report.source_attempted,
-        report.source_empty,
-        report.source_failed,
-        report.source_skipped,
-        report.detail_failures,
-        report.link_resolution_failures,
-        report.issues_linkless,
-        report.issues_unsupported_host,
-        report.issues_dead_link,
-        report.downloads_queued,
-        report.downloads_unique,
-        report.downloads_complete,
-        report.downloads_unavailable,
-        report.downloads_unsupported,
-        report.downloads_failed,
-        report.pending_refreshes,
-        reason,
-    )
-
-
-async def _run_daemon_cycle(
-    cfg,
-    idx: MagazineIndex,
-    *,
-    dry_run: bool = False,
-    logger: logging.Logger | None = None,
-    now: datetime | None = None,
-    clock: Callable[[], float] = time.monotonic,
-    source_client_factory: Callable[..., Any] | None = None,
-    subscriptions: list[Any] | None = None,
-    config_failure_reason: str | None = None,
-) -> Any:
-    """Run one complete daemon cycle in one event loop and source session.
-
-    Subscription indexing, due source-only refreshes, and cached downloads all
-    share the same ``FreemagazinesClient`` and therefore the same cookies,
-    request pacing, and challenge circuit. Returned batch results, never
-    callbacks, are the source of download counters.
-
-    ``subscriptions`` is the cycle's subscription snapshot (defaults to
-    ``cfg.subscriptions``); the daemon loop passes a freshly re-read snapshot
-    each cycle so config-file edits take effect without restart. Every phase —
-    indexing, refresh claiming, download claiming — uses this exact snapshot.
-    ``config_failure_reason`` marks the cycle degraded when the loop had to
-    fall back to a stale snapshot.
-    """
-
-    from magsync.core.batch import download_batch, refresh_due_links
-    from magsync.core.diagnostics import sanitize_external_error
-    from magsync.core.models import CycleReport, PipelineStatus, SourceFailureKind
-    from magsync.core.notify import send_download_summary
-    from magsync.core.scraper import FreemagazinesClient
-    from magsync.core.urls import URLValidationError, normalize_download_url
-
-    daemon_logger = logger or logging.getLogger("magsync")
-    if subscriptions is None:
-        subscriptions = cfg.subscriptions
-    report = CycleReport(source_total=len(subscriptions))
-    started = clock()
-    cycle_at = now or datetime.now(timezone.utc)
-    source_expected = bool(subscriptions)
-    source_failed = False
-    source_reason: str | None = None
-    fatal_reason: str | None = None
-    downloaded_issues: list[dict] = []
-
-    factory = source_client_factory or FreemagazinesClient
-    try:
-        # Provenance backfill with this cycle's snapshot: promotes legacy or
-        # newly subscribed titles so the scoped claims below can see them.
-        # Idempotent, title-only (matching.py). Runs for dry runs too so the
-        # preview matches what a real cycle would claim.
-        promoted = idx.promote_subscribed(subscriptions)
-        if promoted:
-            daemon_logger.info(
-                "Promoted %d cataloged row(s) to subscription provenance", promoted
-            )
-
-        async with factory(scrape_delay=cfg.download.scrape_delay) as source_client:
-            # Phase 1: subscription indexing. A challenge result opens the
-            # client's circuit; no later subscription is even invoked.
-            for position, sub in enumerate(subscriptions):
-                if source_client.circuit_open:
-                    report.source_skipped += len(subscriptions) - position
-                    source_failed = True
-                    failure = source_client.circuit_failure
-                    if source_reason is None and failure is not None:
-                        source_reason = _source_failure_reason(failure)
-                    break
-
-                daemon_logger.info("Searching: %s", sub.query)
-                report.source_attempted += 1
-                source_result = await source_client.search_with_details(sub.query)
-                report.detail_failures += len(source_result.failures)
-                if (
-                    source_result.failure is not None
-                    and source_result.failure.operation == "detail"
-                ):
-                    # When every advertised detail fails, the scraper promotes
-                    # one detail failure to the operation-level failure and
-                    # retains the remaining siblings in ``failures``.
-                    report.detail_failures += 1
-                blocked_result = False
-
-                if source_result.failure is not None:
-                    report.source_failed += 1
-                    source_failed = True
-                    blocked_result = (
-                        source_result.failure.kind
-                        is SourceFailureKind.ACCESS_BLOCKED
-                    )
-                    if source_reason is None:
-                        source_reason = _source_failure_reason(source_result.failure)
-                    daemon_logger.warning(
-                        "Search failed for %s: %s",
-                        sanitize_external_error(sub.query, 120),
-                        _source_failure_reason(source_result.failure),
-                    )
-                else:
-                    if source_result.validated_empty:
-                        report.source_empty += 1
-                    else:
-                        report.source_succeeded += 1
-
-                    filtered = _filter_results(
-                        source_result.items, sub.query, sub.exact
-                    )
-                    new = 0
-                    if filtered:
-                        # Masked links are resolved before indexing, and only
-                        # for issues that actually need one.
-                        resolution = await _resolve_links_for_indexing(
-                            filtered, idx, source_client, subscription=sub
-                        )
-                        if resolution.failures:
-                            report.link_resolution_failures += len(
-                                resolution.failures
-                            )
-                            source_failed = True
-                            daemon_logger.warning(
-                                "%s: %d issue(s) advertised a download whose "
-                                "link could not be resolved",
-                                sanitize_external_error(sub.query, 120),
-                                len(resolution.failures),
-                            )
-                            if source_reason is None:
-                                source_reason = (
-                                    f"{len(resolution.failures)} download "
-                                    "link(s) could not be resolved"
-                                )
-                        outcome = _index_results(
-                            resolution.items, idx, cfg, subscription=sub
-                        )
-                        new = outcome.added
-                        report.issues_linkless += outcome.linkless
-
-                        # A link that resolved but is unusable is an expected
-                        # outcome, not a fault: park it on a schedule so it
-                        # stops costing a request every cycle, and count it
-                        # without degrading the cycle.
-                        unsupported, dead = _park_link_dispositions(resolution, idx)
-                        report.issues_unsupported_host += unsupported
-                        report.issues_dead_link += dead
-                        if unsupported:
-                            hosts = sorted(
-                                {host for _issue, host in resolution.unsupported_host}
-                            )
-                            daemon_logger.info(
-                                "  %s: %d issue(s) on unsupported host(s) %s "
-                                "- parked for later re-probe",
-                                sanitize_external_error(sub.query, 120),
-                                unsupported,
-                                ", ".join(hosts),
-                            )
-                        if dead:
-                            daemon_logger.info(
-                                "  %s: %d issue(s) with no available download "
-                                "link - parked for later re-probe",
-                                sanitize_external_error(sub.query, 120),
-                                dead,
-                            )
-                        if outcome.linkless:
-                            daemon_logger.warning(
-                                "  %s: %d issue(s) indexed with no usable "
-                                "download link",
-                                sanitize_external_error(sub.query, 120),
-                                outcome.linkless,
-                            )
-                    if new:
-                        daemon_logger.info("  %s: %d new issues indexed", sub.query, new)
-
-                    if source_result.failures:
-                        source_failed = True
-                        if source_reason is None:
-                            source_reason = (
-                                f"{len(source_result.failures)} source detail "
-                                "request(s) failed"
-                            )
-
-                if blocked_result:
-                    report.source_skipped += len(subscriptions) - position - 1
-                    break
-
-                # A detail request can open the circuit while still preserving
-                # valid siblings, so check again after the structured result.
-                if source_client.circuit_open:
-                    remaining = len(subscriptions) - position - 1
-                    report.source_skipped += remaining
-                    source_failed = True
-                    failure = source_client.circuit_failure
-                    if source_reason is None and failure is not None:
-                        source_reason = _source_failure_reason(failure)
-                    break
-
-            # Phase 2: claim source-only refresh actions before downloads. This
-            # path never invokes the known-dead stored LimeWire URL. A circuit
-            # opened above is reused and short-circuits these source calls.
-            if not dry_run:
-                due_refreshes = idx.claim_due_link_refreshes(
-                    subscriptions, now=cycle_at
-                )
-                if due_refreshes:
-                    source_expected = True
-                    refresh_results = await refresh_due_links(
-                        due_refreshes, idx, source_client
-                    )
-                    for refresh_result in refresh_results:
-                        outcome = refresh_result.get("outcome")
-                        failure = getattr(outcome, "failure", None)
-                        if failure is not None:
-                            source_failed = True
-                            if source_reason is None:
-                                source_reason = _source_failure_reason(failure)
-                        if refresh_result.get("failure_kind") is not None:
-                            source_failed = True
-                            if source_reason is None:
-                                source_reason = "Unable to persist source refresh result"
-
-            # Phase 3: wanted pending and due transient downloads are claimed
-            # every cycle, even if source indexing was blocked. The dry-run
-            # preview shares the claim's exact predicates so it can never show
-            # a set the real claim would not take (or hide one it would).
-            dry_run_due_refreshes = 0
-            if dry_run:
-                claimed, dry_run_due_refreshes = idx.preview_claimable_downloads(
-                    subscriptions, now=cycle_at
-                )
-            else:
-                claimed = idx.claim_pending_and_due_downloads(
-                    subscriptions, now=cycle_at
-                )
-
-            report.downloads_queued = len(claimed)
-            identities: set[str] = set()
-            for issue in claimed:
-                try:
-                    identities.add(
-                        normalize_download_url(issue.get("limewire_url") or "")
-                    )
-                except URLValidationError:
-                    identities.add(f"invalid-issue:{issue.get('id')}")
-            report.downloads_unique = len(identities)
-
-            if dry_run:
-                if claimed:
-                    daemon_logger.info("Dry run - would download %d issues", len(claimed))
-                if dry_run_due_refreshes:
-                    daemon_logger.info(
-                        "Dry run - %d due link refresh(es) would be attempted",
-                        dry_run_due_refreshes,
-                    )
-            elif claimed:
-                daemon_logger.info(
-                    "Downloading %d issues (%d unique URLs; max %d concurrent)...",
-                    len(claimed),
-                    report.downloads_unique,
-                    cfg.download.max_concurrent,
-                )
-
-                def on_start(issue: dict) -> None:
-                    title = sanitize_external_error(
-                        issue.get("title") or "Unknown issue", 120
-                    )
-                    daemon_logger.info("  Downloading: %s", title)
-
-                results = await download_batch(
-                    claimed,
-                    cfg,
-                    idx,
-                    on_start=on_start,
-                    source_client=source_client,
-                )
-                downloaded_issues = _reconcile_download_results(
-                    report, results, daemon_logger
-                )
-                missing_results = max(0, len(claimed) - len(results))
-                if missing_results:
-                    report.downloads_failed += missing_results
-                    source_reason = source_reason or (
-                        f"Batch omitted {missing_results} claimed result(s)"
-                    )
-
-            # An immediate dead-link refresh inside the batch may be the first
-            # operation to encounter a host-wide source challenge.
-            if source_client.circuit_open:
-                source_expected = True
-                source_failed = True
-                failure = source_client.circuit_failure
-                if source_reason is None and failure is not None:
-                    source_reason = _source_failure_reason(failure)
-
-        if downloaded_issues:
-            send_download_summary(downloaded_issues, cfg.notifications)
-        report.pending_refreshes = idx.count_pending_link_refreshes()
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        fatal_reason = sanitize_external_error(exc)
-
-    if fatal_reason is not None:
-        report.status = PipelineStatus.FAILED
-        report.reason = fatal_reason or "Local daemon cycle failure"
-    elif (
-        source_failed
-        or report.detail_failures
-        or report.downloads_failed
-        or config_failure_reason is not None
-    ):
-        report.status = PipelineStatus.DEGRADED
-        report.reason = source_reason
-        if report.reason is None and report.link_resolution_failures:
-            report.reason = (
-                f"{report.link_resolution_failures} download link(s) "
-                "could not be resolved"
-            )
-        if report.reason is None and report.detail_failures:
-            report.reason = f"{report.detail_failures} detail request(s) failed"
-        if report.reason is None and report.downloads_failed:
-            report.reason = f"{report.downloads_failed} download(s) failed"
-        if report.reason is None and config_failure_reason is not None:
-            report.reason = config_failure_reason
-    elif (
-        not dry_run
-        and report.issues_linkless
-        and report.downloads_queued == 0
-        and report.pending_refreshes == 0
-    ):
-        # Backstop for the next variant of this bug, whatever its cause:
-        # issues a subscription wanted were indexed, nothing was queued, and
-        # no pending action explains it. A cycle like that is not healthy even
-        # when every individual phase reported success.
-        report.status = PipelineStatus.DEGRADED
-        report.reason = (
-            f"{report.issues_linkless} wanted issue(s) indexed with no usable "
-            "download link and no download work queued"
-        )
-    else:
-        report.status = PipelineStatus.HEALTHY
-
-    report.reason = sanitize_external_error(report.reason) if report.reason else None
-    report.elapsed_seconds = max(0.0, clock() - started)
-
-    source_validated: bool | None
-    if not source_expected:
-        source_validated = None
-    else:
-        source_validated = not source_failed and report.detail_failures == 0
-
-    try:
-        idx.update_pipeline_state(
-            report.status,
-            cycle_at=cycle_at,
-            source_validated=source_validated,
-            source_check_at=cycle_at,
-            degraded_reason=report.reason,
-        )
-    except Exception as exc:
-        report.status = PipelineStatus.FAILED
-        report.reason = sanitize_external_error(exc) or "Unable to persist pipeline state"
-        daemon_logger.error("Unable to persist pipeline state: %s", report.reason)
-
-    _log_cycle_report(report, daemon_logger)
-    return report
-
-
 @app.command()
 def daemon(
     interval: str = typer.Option(
         None, "--interval", "-i",
         help="Time between cycles (e.g. 30m, 6h, 1d). Default: 6h",
     ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Run one cycle, show what would be downloaded, then exit"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Preview the cached downloads and due link refreshes the next cycle would claim, then exit (no source requests)",
+    ),
 ):
-    """Run magsync as a daemon, periodically fetching subscribed magazines."""
-    from magsync import __version__
+    """Run magsync as a daemon: scheduled discovery and downloads, no HTTP listener."""
+    from magsync.companion.cli import export_root, log_startup_banner, service_limits
+    from magsync.companion.runtime import Runtime, preview_claimable
 
-    # Resolve interval: CLI arg > env var > default
     interval_str = interval or os.environ.get("MAGSYNC_INTERVAL", "6h")
-    interval_secs = _parse_interval(interval_str)
-
+    try:
+        interval_secs = _parse_interval(interval_str)
+    except ValueError as exc:
+        console.print(str(exc), style="red", markup=False, highlight=False)
+        raise typer.Exit(2)
     cfg = load_config()
+    if dry_run:
+        issues, refreshes = preview_claimable(get_db_path(), cfg.subscriptions)
+        if issues:
+            _print_dry_run_table(issues, f"Next cycle would download {len(issues)} cached issues")
+        else:
+            console.print("No cached issues are ready to download.")
+        console.print(
+            f"{refreshes} due link refresh{'es' if refreshes != 1 else ''} would be attempted.",
+            markup=False, highlight=False,
+        )
+        console.print(f"\n[yellow]{_DRY_RUN_NOTE}[/yellow]")
+        return
 
-    # Setup logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -1600,92 +1215,42 @@ def daemon(
     )
     _configure_daemon_external_logging()
     logger = logging.getLogger("magsync")
+    log_startup_banner(logger, cfg, mode="daemon", interval_label=f"{interval_str} ({interval_secs}s)")
 
-    # Start background heartbeat for Docker health check
-    stop_heartbeat = _start_heartbeat(interval=30)
-
-    # Recover interrupted work only. Typed failure schedules and their UTC due
-    # times survive restarts and are claimed by ordinary cycles when eligible.
-    # Then run the idempotent provenance backfill: legacy rows matching a
-    # subscription become wanted; never-subscribed rows park as cataloged
-    # (requested_by NULL) and are permanently invisible to automatic claims.
-    startup_idx = MagazineIndex()
-    stuck = startup_idx.reset_stuck_downloads()
-    promoted = startup_idx.promote_subscribed(cfg.subscriptions)
-    startup_idx.close()
-    if stuck:
-        logger.info("Reset %d interrupted download(s) to pending", stuck)
-    if promoted:
-        logger.info(
-            "Promoted %d cataloged row(s) to subscription provenance", promoted
+    async def run() -> int:
+        idx = MagazineIndex()
+        runtime = Runtime(
+            idx, cfg, limits=service_limits(), exports=export_root(idx),
+            scan_seconds=interval_secs, require_initialized=False, notify=True, logger=logger,
         )
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(signum, runtime.request_stop)
+        try:
+            try:
+                await runtime.start_when_available(background=True)
+            except ProtocolError as exc:
+                if runtime.stopping:
+                    return 0
+                if exc.code == "runtime_unavailable":
+                    logger.error("Another magsync daemon or service already owns this library; not starting.")
+                else:
+                    logger.error("%s", exc.message)
+                return 1
+            await asyncio.gather(runtime.loop_task, return_exceptions=True)
+            return 1 if runtime.fatal else 0
+        finally:
+            if runtime.owner.generation is not None:
+                await runtime.stop()
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(signum)
+            idx.close()
+            logger.info("magsync daemon stopped.")
 
-    logger.info(f"magsync v{__version__} daemon starting")
-    logger.info(f"  Output directory: {cfg.output_dir}")
-    logger.info(f"  Subscriptions: {len(cfg.subscriptions)}")
-    logger.info(f"  Interval: {interval_str} ({interval_secs}s)")
-    logger.info(f"  Notifications: {'enabled' if cfg.notifications.enabled else 'disabled'}")
-    for sub in cfg.subscriptions:
-        since_str = f" (since {sub.since})" if sub.since else ""
-        logger.info(f"    - {sub.query}{since_str}")
-
-    if not cfg.subscriptions:
-        logger.warning("No subscriptions configured. Add with 'magsync subscribe' or MAGSYNC_SUBSCRIPTIONS env var.")
-
-    # SIGTERM handler
-    shutdown = False
-
-    def handle_sigterm(signum, frame):
-        nonlocal shutdown
-        logger.info("Received shutdown signal, finishing current work...")
-        shutdown = True
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    signal.signal(signal.SIGINT, handle_sigterm)
-
-    # Daemon loop. Each cycle gets exactly one asyncio.run(), so the source
-    # session, its circuit, due refreshes, and downloads share one event loop.
-    # Subscriptions are re-read every cycle so config-file edits (unsubscribe,
-    # since changes) take effect without a restart; a read failure falls back
-    # to the previous snapshot and degrades that cycle — never unscoped work.
-    subs_snapshot = cfg.subscriptions
     try:
-        while not shutdown:
-            logger.info("Starting cycle...")
-            config_failure_reason = None
-            try:
-                subs_snapshot = load_config().subscriptions
-            except Exception as exc:
-                config_failure_reason = (
-                    "Subscription config reload failed; previous snapshot in use"
-                )
-                logger.warning(
-                    "%s: %s", config_failure_reason, sanitize_external_error(exc)
-                )
-            idx = MagazineIndex()
-            try:
-                asyncio.run(
-                    _run_daemon_cycle(
-                        cfg,
-                        idx,
-                        dry_run=dry_run,
-                        logger=logger,
-                        subscriptions=subs_snapshot,
-                        config_failure_reason=config_failure_reason,
-                    )
-                )
-            finally:
-                idx.close()
-
-            if shutdown or dry_run:
-                break
-
-            # Sleep with interrupt support. The heartbeat's daemon thread keeps
-            # process liveness current regardless of pipeline health.
-            logger.info("Sleeping %s until next cycle...", interval_str)
-            sleep_end = time.time() + interval_secs
-            while time.time() < sleep_end and not shutdown:
-                time.sleep(min(5, sleep_end - time.time()))
-    finally:
-        stop_heartbeat()
-        logger.info("magsync daemon stopped.")
+        code = asyncio.run(run())
+    except ProtocolError as exc:
+        console.print(exc.message, style="red", markup=False, highlight=False)
+        raise typer.Exit(1) from None
+    if code:
+        raise typer.Exit(code)

@@ -1,59 +1,95 @@
-# magsync Docker Compose - Full Example
+# magsync Docker Compose - full example
 #
-# Copy this file to docker-compose.yml and customize.
-# See README.md for full documentation.
+# Copy this file to docker-compose.yml and customize, or use it directly with
+# `docker compose -f docker-compose.example.yml ...`. See README.md and
+# docs/companion-service.md.
+#
+# Only the daemon starts by default. The optional `companion` profile provides
+# the authenticated companion service (magsync-service). Both share the same
+# storage: run one of them at a time, never both.
+
+name: magsync
+
+x-storage: &storage
+  # Config directory holding config.toml (create it with your subscriptions).
+  # Mounting the directory lets configuration updates (subscribe, self-healing
+  # encryption constants) be replaced atomically. Mounting the single file
+  # (./config.toml:/config/config.toml) also works; updates are then rewritten
+  # in place. Mount read-only if you prefer: self-healing then works per session
+  # but won't survive container restarts, and subscribe/unsubscribe report the
+  # read-only configuration instead of saving.
+  - ./config:/config
+  # Persistent data (SQLite index and companion state survive restarts)
+  - data:/data
+  # Magazine output directory (bind mount to your host/NAS path)
+  - /path/to/your/magazines:/magazines
+  # For Synology NAS, use something like:
+  # - /volume1/magazines:/magazines
+  # Companion exports (used only when a remote library requests an issue)
+  - exports:/exports
+
+x-environment: &environment
+  # Output directory inside the container (matches the volume mount)
+  MAGSYNC_OUTPUT_DIR: /magazines
+
+  # How often to check for new issues (default: 6h); the service honors it too
+  MAGSYNC_INTERVAL: 6h
+
+  # Magazine subscriptions (comma-separated query:since pairs; prefix ! for exact)
+  # Overrides [[subscriptions]] in config.toml
+  # MAGSYNC_SUBSCRIPTIONS: "The New Yorker:2025-01,The Economist:2024-06,Science News:2025-01"
+
+  # Notification URLs (comma-separated Apprise URLs)
+  # See https://github.com/caronc/apprise/wiki for URL formats
+  # Examples:
+  #   Gotify:  gotify://hostname/token
+  #   Discord: discord://webhook_id/webhook_token
+  #   Slack:   slack://token_a/token_b/token_c
+  #   ntfy:    ntfy://topic
+  #   Email:   mailto://user:pass@gmail.com
+  # MAGSYNC_APPRISE_URLS: gotify://myserver:8080/token
+
+  # Download settings
+  # MAGSYNC_DOWNLOAD__MAX_CONCURRENT: "3"
+  # MAGSYNC_DOWNLOAD__SCRAPE_DELAY: "1.0"
+
+  # Override LimeWire encryption constants (rarely needed - auto-heals)
+  # MAGSYNC_LIMEWIRE__SHARING_SALT_B64: "..."
+  # MAGSYNC_LIMEWIRE__FILE_IV_B64: "..."
 
 services:
   magsync:
-    build: .
-    # Or use the pre-built image from GitHub Container Registry:
+    image: magsync:daemon
+    build:
+      context: .
+      target: daemon
+    # Or use the pre-built image from GitHub Container Registry
+    # (remove `build:` above):
     # image: ghcr.io/izzoa/magsync:latest
     container_name: magsync
-    volumes:
-      # Config file (create config.toml with your subscriptions)
-      # Writable so self-healing can persist updated encryption constants.
-      # Mount as :ro if you prefer — self-healing still works per-session but
-      # won't survive container restarts.
-      - ./config.toml:/config/config.toml
-      # Persistent data (SQLite index survives restarts)
-      - magsync_data:/data
-      # Magazine output directory (bind mount to your host/NAS path)
-      - /path/to/your/magazines:/magazines
-      # For Synology NAS, use something like:
-      # - /volume1/magazines:/magazines
-    environment:
-      # Output directory inside the container (matches the volume mount)
-      - MAGSYNC_OUTPUT_DIR=/magazines
-
-      # How often to check for new issues (default: 6h)
-      - MAGSYNC_INTERVAL=6h
-
-      # Magazine subscriptions (comma-separated query:since pairs)
-      # Overrides [[subscriptions]] in config.toml
-      - MAGSYNC_SUBSCRIPTIONS=The New Yorker:2025-01,The Economist:2024-06,Science News:2025-01
-
-      # Notification URLs (comma-separated Apprise URLs)
-      # See https://github.com/caronc/apprise/wiki for URL formats
-      # Examples:
-      #   Gotify:  gotify://hostname/token
-      #   Discord: discord://webhook_id/webhook_token
-      #   Slack:   slack://token_a/token_b/token_c
-      #   ntfy:    ntfy://topic
-      #   Email:   mailto://user:pass@gmail.com
-      # - MAGSYNC_APPRISE_URLS=gotify://myserver:8080/token
-
-      # Download settings
-      # - MAGSYNC_DOWNLOAD__MAX_CONCURRENT=3
-      # - MAGSYNC_DOWNLOAD__SCRAPE_DELAY=1.0
-
-      # Override LimeWire encryption constants (rarely needed - auto-heals)
-      # - MAGSYNC_LIMEWIRE__SHARING_SALT_B64=...
-      # - MAGSYNC_LIMEWIRE__FILE_IV_B64=...
-
+    volumes: *storage
+    environment: *environment
     restart: unless-stopped
-
+    # Let in-flight downloads finish on shutdown (runtime grace is 60s).
+    stop_grace_period: 70s
     # Optional: set user ID to match your host user (important for NAS)
     # user: "1000:1000"
 
+  magsync-service:
+    profiles: [companion]
+    image: magsync:service
+    build:
+      context: .
+      target: service
+    # Or the pre-built image: ghcr.io/izzoa/magsync-service:latest
+    volumes: *storage
+    environment: *environment
+    # Private Compose network only. For host access add a local override with
+    # ports: ["127.0.0.1:8765:8765"]; remote exposure requires a TLS proxy.
+    expose: ["8765"]
+    restart: unless-stopped
+    stop_grace_period: 70s
+
 volumes:
-  magsync_data:
+  data:
+  exports:

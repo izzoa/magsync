@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+
+class DownloadCapacityPaused(Exception):
+    """The owner has paused admission before another physical transfer."""
+
+
+download_admission = ContextVar('magsync_download_admission', default=None)
+
 import asyncio
 import inspect
 import logging
@@ -442,6 +451,9 @@ async def _perform_url_download(
             # Preserve the existing polite staggering between distinct
             # LimeWire operations. Exact aliases never reach this point twice.
             await asyncio.sleep(1)
+            admission = download_admission.get()
+            if admission is not None:
+                admission()
             try:
                 result = await download_and_decrypt(
                     url,
@@ -651,7 +663,7 @@ async def _download_one(
                 client,
                 flights,
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, DownloadCapacityPaused):
             raise
         except Exception:
             logger.error("Issue worker failed for %s", _safe_title(issue))
@@ -712,6 +724,16 @@ async def _batch_failure_results(
     return outcomes
 
 
+class BatchCoordinator:
+    """Transfer budgets and destination locks shared for a runtime lifetime."""
+
+    def __init__(self, max_concurrent: int):
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.rate_gate = RateLimitGate()
+        self.dest_locks = defaultdict(asyncio.Lock)
+        self.singleflight = _SingleFlightRegistry()
+
+
 async def download_batch(
     issues: list[dict],
     cfg: Config,
@@ -720,6 +742,7 @@ async def download_batch(
     on_complete: Callable[..., Any] | None = None,
     *,
     source_client: FreemagazinesClient | None = None,
+    coordinator: BatchCoordinator | None = None,
 ) -> list[dict]:
     """Download issues with typed isolation and exact-URL single-flight.
 
@@ -729,6 +752,35 @@ async def download_batch(
     """
     if not issues:
         return []
+
+    # Standalone terminal commands own the same locks as the service. Register
+    # their selected attempts so stale callbacks have the same fencing checks.
+    from magsync.companion.local import owner_context
+    local_owner = owner_context.get()
+    local_attempts = {}
+    if local_owner is not None:
+        from types import SimpleNamespace
+        from magsync.companion.runtime import FencedIndex
+        from magsync.companion.store import Store, timestamp, uid
+        store = Store(idx)
+        accepted_issues = []
+        with store.transaction():
+            local_owner.check()
+            for issue in issues:
+                if not store.issue_wanted(issue['id'], scope_id='local'):
+                    continue
+                existing = store.conn.execute("SELECT id FROM acquisition_attempts WHERE issue_id=? AND state='running'", (issue['id'],)).fetchone()
+                if existing:
+                    continue
+                attempt_id = uid()
+                store.conn.execute("INSERT INTO acquisition_attempts VALUES(?,?,?,?,'running',?)",
+                    (attempt_id, issue['id'], local_owner.owner_id, local_owner.generation, timestamp()))
+                local_attempts[issue['id']] = attempt_id
+                accepted_issues.append(issue)
+        issues = accepted_issues
+        if not issues:
+            return []
+        idx = FencedIndex(SimpleNamespace(owner=local_owner, store=store), local_attempts)
 
     # Overlapping subscriptions may enqueue one database row more than once.
     # Distinct ids are retained even when they share an exact full URL.
@@ -781,10 +833,14 @@ async def download_batch(
                 ),
             )
 
-    semaphore = asyncio.Semaphore(cfg.download.max_concurrent)
-    rate_gate = RateLimitGate()
-    dest_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-    singleflight = _SingleFlightRegistry()
+    shared = coordinator or BatchCoordinator(cfg.download.max_concurrent)
+    semaphore = shared.semaphore
+    rate_gate = shared.rate_gate
+    dest_locks = shared.dest_locks
+    singleflight = shared.singleflight
+    # Finished failures must be retryable in a later invocation. Active leaders
+    # stay shared if batches overlap on this runtime.
+    singleflight._tasks = {key: task for key, task in singleflight._tasks.items() if not task.done()}
 
     async def run(client: FreemagazinesClient) -> list[dict]:
         workers = [
@@ -805,7 +861,12 @@ async def download_batch(
             for issue in issues
         ]
         try:
-            return await asyncio.gather(*workers)
+            results = await asyncio.gather(*workers)
+            if local_attempts:
+                with store.transaction():
+                    local_owner.check()
+                    store.conn.executemany("UPDATE acquisition_attempts SET state='finished' WHERE id=?", [(id,) for id in local_attempts.values()])
+            return results
         except BaseException:
             for worker in workers:
                 if not worker.done():

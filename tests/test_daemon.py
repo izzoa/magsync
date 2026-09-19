@@ -432,7 +432,9 @@ async def test_local_cycle_failure_is_failed_and_reason_is_sanitized(
             "#fragment-secret"
         )
 
-    monkeypatch.setattr(idx, "claim_pending_and_due_downloads", broken_claim)
+    # The daemon claims through the runtime; a local failure there is fatal
+    # to the cycle (not the process) and its reason must be sanitized.
+    monkeypatch.setattr("magsync.companion.runtime.Runtime.claim", broken_claim)
     report = await cli._run_daemon_cycle(
         _config(tmp_path),
         idx,
@@ -488,32 +490,40 @@ async def test_pipeline_state_recovers_on_fresh_cycle_client(tmp_path, monkeypat
 async def test_heartbeat_remains_independent_during_degraded_cycle(
     tmp_path, monkeypatch
 ):
+    import asyncio
+
+    from magsync.companion import healthcheck
+    from magsync.companion.runtime import Runtime
+    from magsync.companion.store import Limits
+
     heartbeat = tmp_path / "magsync-healthy"
-    monkeypatch.setattr(cli, "HEALTH_CHECK_PATH", heartbeat)
-    stop = cli._start_heartbeat(interval=0.01)
+    monkeypatch.setattr(healthcheck, "HEALTH_CHECK_PATH", heartbeat)
     idx = MagazineIndex(tmp_path / "index.db")
+    cfg = _config(tmp_path, "Magazine")
+    runtime = Runtime(
+        idx, cfg,
+        limits=Limits(heartbeat_seconds=0.01, heartbeat_stale_seconds=1, minimum_free_bytes=1024),
+        exports=tmp_path / "exports",
+        source_factory=_source_factory(ScriptedSource([_blocked()])),
+        require_initialized=False,
+        subscription_loader=lambda: cfg.subscriptions,
+    )
+    await runtime.start(background=False)
     try:
-        report = await cli._run_daemon_cycle(
-            _config(tmp_path, "Magazine"),
-            idx,
-            source_client_factory=_source_factory(ScriptedSource([_blocked()])),
-        )
+        report = await runtime.discover()
         assert report.status is PipelineStatus.DEGRADED
-        deadline = time.monotonic() + 0.5
-        while not heartbeat.exists() and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert heartbeat.exists()
+        await asyncio.sleep(0.03)
         first_mtime = heartbeat.stat().st_mtime_ns
-        time.sleep(0.03)
-        assert heartbeat.stat().st_mtime_ns >= first_mtime
-        stop()
-        time.sleep(0.03)
-        stopped_mtime = heartbeat.stat().st_mtime_ns
-        time.sleep(0.03)
-        assert heartbeat.stat().st_mtime_ns == stopped_mtime
+        await asyncio.sleep(0.05)
+        # Pipeline degradation never suppresses process liveness.
+        assert heartbeat.stat().st_mtime_ns > first_mtime
+        assert runtime.live()
     finally:
-        stop()
-        idx.close()
+        await runtime.stop()
+    stopped_mtime = heartbeat.stat().st_mtime_ns
+    await asyncio.sleep(0.05)
+    assert heartbeat.stat().st_mtime_ns == stopped_mtime
+    idx.close()
 
 
 @pytest.mark.asyncio

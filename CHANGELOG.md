@@ -3,6 +3,56 @@
 All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.9.0] - 2026-09-18
+
+Adds an optional authenticated **companion service**, so a trusted backend such as Polyreader can manage independent library subscriptions and receive verified PDFs. The daemon, the service and every terminal/TUI command now share **one acquisition runtime** per library. The daemon keeps its established cycle: health classification, parking, notifications and per-issue logs all run through that runtime, and the existing daemon-cycle tests exercise it directly.
+
+> **Upgrading to 0.9.0:** stop every CLI/TUI/daemon writer and upgrade them together. Back up the database with its adjacent identity marker, the configuration and your files first. Never run an older binary against the migrated store; roll back by restoring the matched pre-upgrade backup. The checked-in `docker-compose.yml` is unchanged; the companion profile lives in `docker-compose.example.yml`.
+
+### Added
+- **Optional companion service** (`service` extra, `magsync serve`):
+  - authenticated protocol 1 with generated OpenAPI
+  - client-owned library scopes and independent subscriptions
+  - durable idempotent operations with revision checks
+  - bounded search and control routes
+
+  `serve` honors `--interval`/`MAGSYNC_INTERVAL` like the daemon and sends the same download notifications.
+- **Verified PDF deliveries for remote libraries:**
+  - immutable export generations with HTTP ranges and per-request receipts
+  - client-scoped events and consistent recovery snapshots
+  - retention pins, capacity controls and optional isolated trusted mount views
+
+  Exports are created only for remote demand; local downloads are never copied.
+- **Operator commands:** explicit initialization, client provisioning/rotation/revocation, status, export purge and recovery-epoch rotation. Credentials are stored only as verifiers.
+- **Docker:**
+  - separate daemon and service targets
+  - multi-architecture release images `ghcr.io/izzoa/magsync` and `ghcr.io/izzoa/magsync-service`
+  - `docker-compose.example.yml` with a private-network `companion` profile
+- **Dry runs:** `magsync daemon --dry-run` lists the cached downloads and due link refreshes the next cycle would claim. `magsync fetch --dry-run` lists the cached issues a fetch would download. Both read a private snapshot: no source requests and no changes.
+
+### Changed
+- **One shared runtime.** Ownership locks, fenced attempts and bounded shutdown keep a single owner per library.
+  - While a daemon or service runs, terminal commands are executed by it within about a second, beside discovery and downloads, and print the same results as standalone commands.
+  - Read-only commands (viewing configuration, listing subscriptions, dry runs) never involve it.
+- **Terminal commands are never run behind your back.**
+  - A second terminal command waits up to 60 seconds for another one, then reports that it is busy without queuing anything.
+  - Ctrl-C or closing the terminal before a submitted command starts cancels it.
+  - A command interrupted mid-run is recorded as interrupted and never run later.
+- **Failures stay contained.** A failing command ends only itself. A briefly locked database never stops the runtime. A service whose runtime dies exits so its supervisor can restart it.
+- **Demand is tracked per library**, separately from physical downloads. Local retries require current local intent and exclude remote-only, lapsed-only, unsupported and never-requested work. Explicit selections remain independent of subscriptions.
+- **Reconciliation is incremental and bounded.** At 50,000 issues and 25 subscriptions, a terminal command adds about 15 ms and a full discovery cycle's bookkeeping takes under a second. Local demand is exempt from the remote client's admission limits.
+- **Configuration writes merge** only the fields a command changed and detect conflicting external edits. The file is replaced atomically, or rewritten in place under the same lock when `config.toml` is a single-file bind mount. Environment-managed or read-only settings produce a clear message instead of a traceback.
+- **Terminal and TUI output.**
+  - Commands handled by a daemon name each issue with its outcome.
+  - The TUI shows per-issue progress and the number of newly indexed issues.
+  - `repair-titles` removes emptied folders however it is run.
+- **Container health.** The health check uses a five-second runtime heartbeat with a 30-second stale threshold, independent of source health and the discovery interval. Protocol version `1` is independent of the package version.
+
+### Fixed
+- `magsync config <section.key> <value>` parses boolean settings such as `notifications.enabled` and comma-separated lists such as `notifications.apprise_urls`. Previously booleans failed to parse and lists were stored as a single string.
+- Content deduplication no longer records a new download as a copy of a previously downloaded file that has since been deleted.
+
 ## [0.8.2] - 2026-09-09
 
 Fixes duplicate `[PDF] …` library folders that appeared as soon as 0.8.0/0.8.1 made the legacy back catalogue downloadable — and the quieter half of the same bug, which had been silently skipping every `exact` subscription's back catalogue.

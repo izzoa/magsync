@@ -26,10 +26,16 @@ grouping, and organizer paths are unchanged.
 
 from __future__ import annotations
 
+import functools
 import re
+from dataclasses import dataclass
 from typing import Iterable, Mapping, Protocol
 
 from magsync.core.organizer import normalize_title, strip_accents
+
+# Part of every stored materialization fingerprint: bump it whenever the
+# matching rules below change so persisted incremental state re-evaluates.
+MATCHER_VERSION = 1
 
 
 class SubscriptionLike(Protocol):
@@ -104,7 +110,12 @@ def passes_since(year: int | None, month: int | None, sub: SubscriptionLike) -> 
     comparisons excluded it pre-0.6.0); year-only issues fail a year+month
     floor unless their year is strictly greater.
     """
-    floor = parse_since(sub.since)
+    return _passes_floor(year, month, parse_since(sub.since))
+
+
+def _passes_floor(
+    year: int | None, month: int | None, floor: tuple[int, int | None] | None
+) -> bool:
     if floor is None:
         return True
     since_year, since_month = floor
@@ -115,6 +126,50 @@ def passes_since(year: int | None, month: int | None, sub: SubscriptionLike) -> 
     if year > since_year:
         return True
     return year == since_year and month is not None and month >= since_month
+
+
+@functools.lru_cache(maxsize=100_000)
+def canonical_issue_title(issue_title: str | None) -> str:
+    """The canonical form of an issue's own title that matching compares.
+
+    Normalization dominates matching cost, so bulk callers compute it once per
+    issue (and long-lived processes reuse it) instead of once per pair.
+    """
+    if not issue_title:
+        return ""
+    return canonicalize_for_match(normalize_title(issue_title))
+
+
+@dataclass(frozen=True)
+class CompiledSubscription:
+    """A subscription pre-folded for repeated matching against many issues.
+
+    Equivalent to :func:`matches_subscription`/:func:`title_match` over the
+    issue's :func:`canonical_issue_title`; only the per-pair work is cheaper.
+    """
+
+    query: str
+    exact: bool
+    floor: tuple[int, int | None] | None
+
+    def matches_title(self, canonical_title: str) -> bool:
+        if not canonical_title or not self.query:
+            return False
+        if self.exact:
+            return canonical_title == self.query
+        return self.query in canonical_title
+
+    def matches(self, canonical_title: str, year: int | None, month: int | None) -> bool:
+        return self.matches_title(canonical_title) and _passes_floor(year, month, self.floor)
+
+
+def compile_subscription(sub: SubscriptionLike) -> CompiledSubscription:
+    """Fold a subscription once for bulk matching (see :class:`CompiledSubscription`)."""
+    return CompiledSubscription(
+        query=canonicalize_for_match(sub.query) if sub.query else "",
+        exact=bool(sub.exact),
+        floor=parse_since(sub.since),
+    )
 
 
 def matches_subscription(issue: Mapping, sub: SubscriptionLike) -> bool:

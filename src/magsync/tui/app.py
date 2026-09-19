@@ -22,14 +22,14 @@ from textual.widgets import (
 from magsync.config import load_config
 from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.index import MagazineIndex
+from magsync.companion.local import CoordinatorBusy, submit_local
+from magsync.companion.protocol import ProtocolError
 from magsync.core.models import (
     DownloadFailureKind,
     SourceFailure,
     SourceFailureKind,
 )
-from magsync.core.organizer import normalize_title, parse_date
 from magsync.core.policy import get_download_failure_policy
-from magsync.core.scraper import search_with_details_result
 
 
 def _is_queueable(issue: dict, selected: set[int]) -> bool:
@@ -57,6 +57,39 @@ def _source_failure_status(failure: SourceFailure) -> str:
     if detail and detail.casefold() not in prefix.casefold():
         return f"{prefix}: {detail}"
     return prefix
+
+
+# Marker per terminal label; ``_download_outcome_label`` supplies the label.
+_OUTCOME_MARKERS = {"downloaded": "✓", "unavailable": "○", "unsupported": "⊘", "failed": "✗"}
+# Physical status -> outcome label, for results observed in the shared store.
+_STATUS_LABELS = {
+    "complete": "downloaded",
+    "unavailable": "unavailable",
+    "unsupported": "unsupported",
+    "failed": "failed",
+}
+
+
+def _search_failure_status(result: dict) -> str:
+    """Typed, sanitized guidance for a search operation that did not validate."""
+    failure = result.get("failure") or {}
+    kind = failure.get("kind") or result.get("failure_kind")
+    if kind is None and result.get("outcome") == "blocked":
+        kind = SourceFailureKind.ACCESS_BLOCKED.value
+    try:
+        return _source_failure_status(SourceFailure(SourceFailureKind(kind), failure.get("message") or ""))
+    except (TypeError, ValueError):
+        code = result.get("code")
+        return f"Search failed ({code}); retry later" if code else "Search failed; retry later"
+
+
+def _outcome_line(title: str, status: str, failure_kind: str | None) -> str | None:
+    """``✓ Title``-style line for a terminal physical status, else None."""
+    label = _STATUS_LABELS.get(status)
+    if label is None:
+        return None
+    detail = f" ({failure_kind})" if failure_kind and label != "downloaded" else ""
+    return f"{_OUTCOME_MARKERS[label]} {sanitize_external_error((title or 'Unknown issue')[:60])}{detail}"
 
 
 def _download_outcome_label(
@@ -157,56 +190,36 @@ class MagSyncApp(App):
     @work(thread=True)
     def _do_search(self, query: str) -> None:
         self._update_status(f"Searching for '{query}'...")
-        source_result = asyncio.run(
-            search_with_details_result(
-                query,
-                scrape_delay=self.cfg.download.scrape_delay,
-            )
-        )
-
-        if source_result.failure is not None:
-            # A source failure is not an empty result. Keep the prior table and
-            # selection intact so a blocked search cannot erase useful state.
-            self._update_status(_source_failure_status(source_result.failure))
+        try:
+            operation = asyncio.run(submit_local(
+                'search', {'query': query}, self.cfg, self.idx.db_path, status=self._update_status))
+        except (ProtocolError, CoordinatorBusy) as exc:
+            self._update_status(getattr(exc, 'message', None) or str(exc))
             return
-
-        results = source_result.items
-        if source_result.validated_empty:
+        result = operation.get('result') or {}
+        if result.get('outcome') in ('blocked', 'failed') or operation['state'] in ('failed', 'suspended', 'blocked'):
+            # A failure is not an empty result: keep the prior table and selection.
+            self._update_status(_search_failure_status(result) + '. Previous results kept.')
+            return
+        if result.get('outcome') == 'empty':
             self.search_results = []
             self.selected_issues.clear()
             self.app.call_from_thread(self._populate_empty_results, query)
             return
-
-        # Index results
-        norm = normalize_title(results[0].title) if results[0].title else query
-        mag_id = self.idx.get_or_create_magazine(query, norm)
-        issues_data = []
-        for r in results:
-            parsed = parse_date(r.title, r.page_url)
-            issues_data.append({
-                "title": r.title,
-                "page_url": r.page_url,
-                "limewire_url": r.limewire_url,
-                "year": parsed.year,
-                "month": parsed.month,
-                "date_raw": r.title,
-                "genre": r.genre,
-                "file_size": r.file_size,
-                "cover_image_url": r.cover_image_url,
-            })
-        new_count = self.idx.add_issues(mag_id, issues_data).added
-
-        # Get indexed issues
-        all_issues = self.idx.get_issues(magazine_title=norm)
-        self.search_results = all_issues
+        # Each worker owns its SQLite connection; Textual's UI connection stays
+        # on its creating thread. The command result bounds the displayed set.
+        index = MagazineIndex(self.idx.db_path)
+        try:
+            from magsync.companion.store import Store
+            store = Store(index)
+            ids = [store.internal_issue(item['id']) for item in result.get('items', [])]
+            rows = index.get_issues_by_ids(ids)
+        finally:
+            index.close()
+        self.search_results = rows
         self.selected_issues.clear()
-
-        self.app.call_from_thread(
-            self._populate_table,
-            all_issues,
-            new_count,
-            len(source_result.failures),
-        )
+        self.app.call_from_thread(self._populate_table, rows, result.get('added') or 0,
+                                  result.get('detail_failures') or 0)
 
     def _populate_empty_results(self, query: str) -> None:
         self.query_one("#results-table", DataTable).clear()
@@ -285,49 +298,55 @@ class MagSyncApp(App):
 
     @work(thread=True)
     def _do_download(self) -> None:
-        from magsync.core.batch import download_batch
-
         issues = [i for i in self.search_results if _is_queueable(i, self.selected_issues)]
-
         if not issues:
             self._update_status("No downloadable issues selected.")
             return
+        total = len(issues)
+        titles = {issue['id']: issue.get('title') or 'Unknown issue' for issue in issues}
+        first_seen: dict[int, tuple] = {}
+        lines: dict[int, str] = {}
 
-        # Confirmed selection is explicit intent: promote to manual provenance
-        # (including strengthening 'subscription') so these rows survive a
-        # later unsubscribe and stay eligible for automatic and manual retry.
-        self.idx.mark_manual([i["id"] for i in issues])
+        def show() -> None:
+            self.app.call_from_thread(self._update_download_log, "\n".join(lines.values()))
+            self._update_status(f"Processed {len(lines)}/{total} selected issues...")
 
-        max_c = self.cfg.download.max_concurrent
-        self._update_status(f"Downloading {len(issues)} issues (max {max_c} concurrent)...")
-        log_lines: list[str] = []
-        completed = [0]
+        def progress(update: dict) -> None:
+            issue_id = update['issue_id']
+            observed = (update['status'], update.get('failure_kind'))
+            if issue_id not in first_seen:
+                first_seen[issue_id] = observed  # Its state when the command started.
+                return
+            line = _outcome_line(titles.get(issue_id, update.get('title')), *observed)
+            if line and observed != first_seen[issue_id]:
+                lines[issue_id] = line
+                show()
 
-        def on_start(issue):
-            pass
-
-        def on_complete(issue, success, error, failure_kind=None):
-            completed[0] += 1
-            outcome = _download_outcome_label(success, failure_kind)
-            marker = {
-                "downloaded": "✓",
-                "unavailable": "○",
-                "unsupported": "⊘",
-                "failed": "✗",
-            }[outcome]
-            if success:
-                log_lines.append(f"{marker} {issue['title']}")
-            else:
-                safe_error = sanitize_external_error(error or "Download failed")
-                log_lines.append(f"{marker} {issue['title']}: {safe_error}")
-            self.app.call_from_thread(
-                self._update_download_log, "\n".join(log_lines)
-            )
-            self._update_status(f"Processed {completed[0]}/{len(issues)}...")
-
-        asyncio.run(download_batch(issues, self.cfg, self.idx, on_start, on_complete))
-
-        self._update_status(f"Done! {len(issues)} issues processed.")
+        self._update_status(f"Queued {total} selected issues...")
+        try:
+            operation = asyncio.run(submit_local(
+                'download', {'issue_ids': [i['id'] for i in issues]}, self.cfg, self.idx.db_path,
+                progress=progress, status=self._update_status))
+        except (ProtocolError, CoordinatorBusy) as exc:
+            self._update_status(getattr(exc, 'message', None) or str(exc))
+            return
+        result = operation.get('result') or {}
+        # The final state of every selected issue, read back from the store.
+        index = MagazineIndex(self.idx.db_path)
+        try:
+            final = {row['id']: row for row in index.get_issues_by_ids(list(titles))}
+        finally:
+            index.close()
+        for issue_id, title in titles.items():
+            row = final.get(issue_id) or {}
+            line = _outcome_line(title, row.get('download_status'), row.get('last_error_kind'))
+            lines[issue_id] = line or f"· {sanitize_external_error(title[:60])}: not downloaded"
+        self.app.call_from_thread(self._update_download_log, "\n".join(lines.values()))
+        attempts = result.get('physical_attempts', 0)
+        message = f"Done: {total} selected issues processed; {attempts} physical transfer{'s' if attempts != 1 else ''} started."
+        if operation['state'] == 'failed':
+            message = f"Download did not complete ({result.get('code', 'failed')})."
+        self._update_status(message)
         self.app.call_from_thread(self._refresh_library)
 
     def _update_download_log(self, text: str) -> None:

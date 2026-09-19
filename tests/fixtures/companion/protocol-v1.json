@@ -1,0 +1,240 @@
+{
+  "routes": {
+    "/v1/info": [
+      "GET"
+    ],
+    "/v1/searches": [
+      "POST"
+    ],
+    "/v1/operations/{id}": [
+      "GET"
+    ],
+    "/v1/issues/{id}": [
+      "GET"
+    ],
+    "/v1/scopes": [
+      "GET",
+      "POST"
+    ],
+    "/v1/scopes/{id}": [
+      "PATCH"
+    ],
+    "/v1/scopes/{id}/subscriptions": [
+      "GET",
+      "POST"
+    ],
+    "/v1/subscriptions/{id}": [
+      "PATCH",
+      "DELETE"
+    ],
+    "/v1/scopes/{id}/requests": [
+      "GET",
+      "POST"
+    ],
+    "/v1/requests/{id}": [
+      "GET"
+    ],
+    "/v1/requests/{id}/retry": [
+      "POST"
+    ],
+    "/v1/requests/{id}/cancel": [
+      "POST"
+    ],
+    "/v1/events": [
+      "GET"
+    ],
+    "/v1/snapshots": [
+      "POST"
+    ],
+    "/v1/snapshots/{id}": [
+      "GET"
+    ],
+    "/v1/deliveries/{id}": [
+      "GET"
+    ],
+    "/v1/deliveries/{id}/content": [
+      "GET"
+    ],
+    "/v1/deliveries/{id}/ack": [
+      "PUT"
+    ],
+    "/health/live": [
+      "GET"
+    ],
+    "/health/ready": [
+      "GET"
+    ]
+  },
+  "request_states": [
+    "queued",
+    "acquiring",
+    "fulfilled",
+    "canceled",
+    "suspended"
+  ],
+  "operation_states": [
+    "queued",
+    "running",
+    "succeeded",
+    "empty",
+    "partial",
+    "blocked",
+    "failed",
+    "suspended"
+  ],
+  "delivery_states": [
+    "ready",
+    "acknowledged",
+    "unavailable",
+    "canceled"
+  ],
+  "errors": {
+    "unauthorized": 401,
+    "not_found": 404,
+    "invalid_request": 422,
+    "incompatible_protocol": 400,
+    "revision_conflict": 409,
+    "idempotency_conflict": 409,
+    "configuration_managed": 409,
+    "receipt_conflict": 409,
+    "scope_disabled": 409,
+    "unsupported": 409,
+    "resync_required": 410,
+    "content_unavailable": 410,
+    "capacity_exhausted": 429,
+    "rate_limited": 429,
+    "runtime_unavailable": 503,
+    "store_uninitialized": 503,
+    "schema_incompatible": 503,
+    "integrity_failed": 409
+  },
+  "resources": {
+    "client": {
+      "id": "client",
+      "label": "Polyreader",
+      "enabled": true
+    },
+    "scope": {
+      "id": "scope",
+      "client_id": "client",
+      "external_id": "library",
+      "label": "Library",
+      "enabled": true,
+      "revision": 1
+    },
+    "subscription": {
+      "id": "subscription",
+      "scope_id": "scope",
+      "query": "Science News",
+      "exact": false,
+      "since": null,
+      "enabled": true,
+      "tombstone": false,
+      "revision": 1
+    },
+    "request": {
+      "id": "request",
+      "scope_id": "scope",
+      "issue_id": "issue",
+      "origin": "explicit",
+      "subscription_id": null,
+      "state": "queued",
+      "revision": 1,
+      "physical_status": "pending",
+      "failure_kind": null,
+      "retryable": false,
+      "next_action": null,
+      "next_retry_at": null,
+      "fulfillment_error": null,
+      "cancellation_reason": null,
+      "created_at": ""
+    },
+    "operation": {
+      "id": "operation",
+      "kind": "request.create",
+      "state": "queued",
+      "resource_id": null,
+      "result": {},
+      "created_at": "",
+      "updated_at": ""
+    },
+    "delivery": {
+      "id": "delivery",
+      "instance_id": "instance",
+      "recovery_epoch": "epoch",
+      "client_id": "client",
+      "scope_id": "scope",
+      "request_id": "request",
+      "issue_id": "issue",
+      "content_generation": "generation",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 12345,
+      "title": "Science News",
+      "source": "freemagazines.top",
+      "year": null,
+      "month": null,
+      "state": "ready",
+      "media_type": "application/pdf",
+      "transfer": {
+        "http": "/v1/deliveries/delivery/content"
+      },
+      "receipt": null
+    }
+  },
+  "pagination": {
+    "resources": {
+      "request": [
+        "after",
+        "limit"
+      ],
+      "response": [
+        "items",
+        "next"
+      ]
+    },
+    "operations": {
+      "request": [
+        "offset",
+        "limit"
+      ],
+      "response": [
+        "next_offset"
+      ]
+    },
+    "events": {
+      "request": [
+        "cursor",
+        "scope",
+        "limit"
+      ],
+      "response": [
+        "items",
+        "cursor",
+        "has_more"
+      ]
+    },
+    "snapshots": {
+      "request": [
+        "cursor",
+        "limit"
+      ],
+      "response": [
+        "items",
+        "next",
+        "handoff_cursor",
+        "expires_at"
+      ]
+    }
+  },
+  "headers": {
+    "authentication": "Authorization: Bearer <token>",
+    "creation": "Idempotency-Key",
+    "mutation": "If-Match",
+    "protocol": "X-MagSync-Protocol: 1",
+    "ranges": [
+      "Range",
+      "If-Range",
+      "If-None-Match"
+    ]
+  }
+}

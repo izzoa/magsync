@@ -10,7 +10,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from magsync.config import get_db_path
-from magsync.core.matching import eligible_for_any, title_match
+from magsync.core.matching import (
+    canonical_issue_title,
+    compile_subscription,
+    eligible_for_any,
+    title_match,
+)
 from magsync.core.models import DownloadStatus, IndexOutcome, RequestedBy
 from magsync.core.urls import (
     is_valid_download_url,
@@ -22,6 +27,10 @@ logger = logging.getLogger("magsync")
 # The only provenance values that make a row wanted. Anything else non-null is
 # unrecognized (corruption/external writes) and MUST fail closed at claim time.
 _WANTED_PROVENANCE = (RequestedBy.MANUAL.value, RequestedBy.SUBSCRIPTION.value)
+
+# Default for ``add_issues(provenance=...)``: record provenance for the same
+# subscription that gates link-less counting (the historical behaviour).
+_SAME_SUBSCRIPTION = object()
 
 
 def _enum_value(value: Any) -> Any:
@@ -124,6 +133,12 @@ CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);
 class MagazineIndex:
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or get_db_path()
+        from magsync.companion.local import snapshot_context
+        if snapshot_context.get() is not None:
+            self.db_path = snapshot_context.get()
+        if not self.db_path.exists() and Path(str(self.db_path) + ".identity.json").exists():
+            from magsync.companion.protocol import ProtocolError
+            raise ProtocolError("store_uninitialized")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
@@ -132,8 +147,16 @@ class MagazineIndex:
         self._init_schema()
 
     def _init_schema(self):
+        from magsync.companion.schema import SCHEMA_VERSION, migrate
+        # Reject newer stores before any legacy migration can alter them.
+        if self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='companion_schema'").fetchone():
+            row = self.conn.execute("SELECT version FROM companion_schema").fetchone()
+            if row is None or row[0] != SCHEMA_VERSION:
+                from magsync.companion.protocol import ProtocolError
+                raise ProtocolError("schema_incompatible")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        migrate(self.conn)
 
     def _migrate(self):
         """Apply schema migrations for existing databases."""
@@ -199,6 +222,12 @@ class MagazineIndex:
     def close(self):
         self.conn.close()
 
+    def _require_no_transaction(self) -> None:
+        """Methods that commit (or begin) their own transaction must never run
+        inside a caller's transaction, where they would silently end it early."""
+        if self.conn.in_transaction:
+            raise RuntimeError("index method would end the caller's transaction")
+
     def get_or_create_magazine(self, title: str, normalized_title: str) -> int:
         """Get or create a magazine record. Returns the magazine ID."""
         row = self.conn.execute(
@@ -221,7 +250,8 @@ class MagazineIndex:
         return cursor.lastrowid
 
     def add_issues(
-        self, magazine_id: int, issues: list[dict], *, subscription: Any = None
+        self, magazine_id: int, issues: list[dict], *, subscription: Any = None,
+        provenance: Any = _SAME_SUBSCRIPTION,
     ) -> int:
         """Upsert issues for a magazine. Returns count of *new* issues added.
 
@@ -252,13 +282,23 @@ class MagazineIndex:
         given ``subscription``, or every link-less row when no subscription
         context is supplied. Stranger results are cataloged by design, so
         counting them would report a healthy cycle as broken.
+
+        ``provenance`` (default: ``subscription``) is the subscription whose
+        title matches record ``requested_by='subscription'``; ``None`` records
+        no provenance while ``subscription`` still drives link-less counts.
         """
+        self._require_no_transaction()
+        if provenance is _SAME_SUBSCRIPTION:
+            provenance = subscription
         added = 0
         linkless = 0
         backfill_columns = ("genre", "file_size", "cover_image_url")
         for issue in issues:
             sub_wants = subscription is not None and title_match(
                 issue.get("title") or "", subscription
+            )
+            records_provenance = provenance is not None and title_match(
+                issue.get("title") or "", provenance
             )
             # Only rows that could ever become work are counted link-less.
             # A fuzzy-search stranger is cataloged and never claimed by
@@ -345,7 +385,7 @@ class MagazineIndex:
                     updates.get("limewire_url") or existing["limewire_url"]
                 ):
                     linkless += 1
-                if sub_wants:
+                if records_provenance:
                     # Promotion on re-encounter: heals rows cataloged before
                     # this subscription existed. Guarded to NULL so manual (or
                     # any recorded) intent is never overwritten here.
@@ -388,7 +428,7 @@ class MagazineIndex:
                 (
                     cursor.lastrowid,
                     DownloadStatus.PENDING.value,
-                    RequestedBy.SUBSCRIPTION.value if sub_wants else None,
+                    RequestedBy.SUBSCRIPTION.value if records_provenance else None,
                 ),
             )
             added += 1
@@ -543,11 +583,16 @@ class MagazineIndex:
 
     def find_by_hash(self, sha256: str) -> str | None:
         """Find an existing download with the same SHA-256 hash. Returns file_path or None."""
-        row = self.conn.execute(
-            "SELECT file_path FROM downloads WHERE sha256 = ? AND status = 'complete' LIMIT 1",
+        rows = self.conn.execute(
+            "SELECT file_path FROM downloads WHERE sha256 = ? AND status = 'complete'",
             (sha256,),
-        ).fetchone()
-        return row["file_path"] if row else None
+        ).fetchall()
+        # A deleted file cannot stand in for new bytes: deduplicating against
+        # it would record a completion that points at nothing.
+        for row in rows:
+            if row["file_path"] and Path(row["file_path"]).exists():
+                return row["file_path"]
+        return None
 
     def get_issues(
         self,
@@ -710,12 +755,16 @@ class MagazineIndex:
         the derived date fields and magazine association, so a repair has to
         set all of them in one write rather than rewriting the title alone.
         """
+        self._require_no_transaction()
         cursor = self.conn.execute(
             """UPDATE issues
                SET title = ?, magazine_id = ?, year = ?, month = ?, date_raw = ?
                WHERE id = ?""",
             (title, magazine_id, year, month, date_raw, issue_id),
         )
+        # Titles and dates drive subscription matching: every incremental
+        # materialization watermark is stale once one changes.
+        self.conn.execute("DELETE FROM companion_materialized")
         self.conn.commit()
         return cursor.rowcount == 1
 
@@ -781,6 +830,7 @@ class MagazineIndex:
         could never revive rows left NULL under the tighter one. Safe to run
         every startup and every cycle — repeat runs change nothing.
         """
+        self._require_no_transaction()
         if not subscriptions:
             return 0
         rows = self.conn.execute(
@@ -789,10 +839,13 @@ class MagazineIndex:
                JOIN issues i ON i.id = d.issue_id
                WHERE d.requested_by IS NULL"""
         ).fetchall()
+        # Equivalent to title_match() per pair, but each title is normalized
+        # once (and cached across calls) instead of once per subscription.
+        matchers = [compile_subscription(sub) for sub in subscriptions]
         promote_ids = [
             row["issue_id"]
             for row in rows
-            if any(title_match(row["title"] or "", sub) for sub in subscriptions)
+            if any(m.matches_title(canonical_issue_title(row["title"] or "")) for m in matchers)
         ]
         if not promote_ids:
             return 0
@@ -810,6 +863,7 @@ class MagazineIndex:
         Strengthens ``subscription`` provenance too — an explicit request must
         survive a later unsubscribe. Top of the ladder; never demoted.
         """
+        self._require_no_transaction()
         if not issue_ids:
             return 0
         marked = 0
@@ -824,6 +878,13 @@ class MagazineIndex:
             )
             marked += cursor.rowcount
         self.conn.commit()
+        from magsync.companion.local import local_request, owner_context
+        if owner_context.get() is not None:
+            from magsync.companion.store import Store
+            store = Store(self)
+            with store.transaction():
+                for issue_id in issue_ids:
+                    local_request(store, issue_id)
         return marked
 
     def _eligible_download_candidates(
@@ -1123,6 +1184,11 @@ class MagazineIndex:
         try:
             rows = self.conn.execute(query, params).fetchall()
             wanted = [row for row in rows if row["requested_by"] in _WANTED_PROVENANCE]
+            from magsync.companion.local import owner_context
+            if owner_context.get() is not None:
+                from magsync.companion.store import Store, LOCAL_SCOPE
+                store = Store(self)
+                wanted = [row for row in rows if store.issue_wanted(row['id'], scope_id=LOCAL_SCOPE)]
             excluded = len(rows) - len(wanted)
             linked = [row for row in wanted if row["limewire_url"]]
             skipped = len(wanted) - len(linked)
@@ -1241,6 +1307,7 @@ class MagazineIndex:
 
     def rotate_limewire_url(self, issue_id: int, limewire_url: str) -> bool:
         """Atomically store a validated different URL and clear old identity."""
+        self._require_no_transaction()
         if not _plausible_download_url(limewire_url):
             raise ValueError("invalid LimeWire share URL")
         limewire_url = normalize_download_url(limewire_url)
@@ -1514,6 +1581,7 @@ class MagazineIndex:
         failures. ``False`` increments once for the cycle. ``None`` means the
         cycle performed no authoritative source check and preserves both.
         """
+        self._require_no_transaction()
         from magsync.core.diagnostics import sanitize_external_error
 
         cycle_timestamp = _utc_timestamp(cycle_at)

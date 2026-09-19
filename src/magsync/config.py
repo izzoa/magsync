@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import logging
+import copy
+import errno
+import hashlib
+import json
+import tempfile
 import os
 import tomllib
-from dataclasses import dataclass, field, fields
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from magsync.core.locking import lock as _lock_fd
 from magsync.core.models import Subscription
 
 logger = logging.getLogger("magsync")
@@ -73,7 +80,7 @@ class NotificationSettings:
 
 @dataclass
 class Config:
-    output_dir: str = str(Path.home() / "Magazines")
+    output_dir: str = field(default_factory=lambda: str(Path.home() / "Magazines"))
     download: DownloadSettings = field(default_factory=DownloadSettings)
     limewire: LimeWireConstants = field(default_factory=LimeWireConstants)
     notifications: NotificationSettings = field(default_factory=NotificationSettings)
@@ -172,7 +179,10 @@ def load_config() -> Config:
                     )
                 )
 
+    cfg._file_values = copy.deepcopy(asdict(cfg))
     _apply_env_overrides(cfg)
+    cfg._loaded_values = copy.deepcopy(asdict(cfg))
+    cfg._file_revision = hashlib.sha256(config_path.read_bytes() if config_path.exists() else b"").hexdigest()
 
     global _warned_no_retries
     if cfg.download.retry_attempts < 1 and not _warned_no_retries:
@@ -186,58 +196,250 @@ def load_config() -> Config:
     return cfg
 
 
+class ConfigurationConflict(OSError):
+    """A configuration change could not be made durably effective.
+
+    Raised when a field is environment-managed, changed externally, or the
+    configuration cannot be written. The message is a complete sentence safe
+    to show to the user.
+    """
+
+
+# Renames onto a mount point fail with EBUSY (EXDEV across filesystems); an
+# unwritable directory prevents creating the temporary file next to the target.
+_RENAME_IMPOSSIBLE = {errno.EBUSY, errno.EXDEV}
+_DIRECTORY_UNWRITABLE = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+def _toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    return str(value)
+
+
+def _read_only() -> ConfigurationConflict:
+    return ConfigurationConflict("Configuration file is read-only; the change was not saved.")
+
+
+def _changed_externally() -> ConfigurationConflict:
+    return ConfigurationConflict(
+        "Configuration file changed while saving; the change was not saved. Try again."
+    )
+
+
+@contextmanager
+def _writer_lock(path: Path):
+    """Serialize writers; yield the config file handle when it is the lock.
+
+    The lock normally lives beside the configuration. When that directory is
+    not writable (for example a single file bind-mounted into a container's
+    read-only directory), writers serialize on the configuration file itself.
+    """
+    try:
+        handle = path.with_suffix(".lock").open("a")
+        own = None
+    except OSError as exc:
+        if exc.errno not in _DIRECTORY_UNWRITABLE:
+            raise
+        if not path.exists():
+            raise ConfigurationConflict(
+                "Configuration directory is read-only; the change was not saved."
+            ) from None
+        try:
+            handle = own = path.open("r+b")
+        except OSError as inner:
+            if inner.errno in _DIRECTORY_UNWRITABLE:
+                raise _read_only() from None
+            raise
+    with handle:
+        _lock_fd(handle.fileno(), blocking=True)
+        yield own
+
+
+def _rewrite_in_place(path: Path, payload: bytes, prior: bytes, handle=None) -> None:
+    """Rewrite the existing file (same inode) when it cannot be replaced.
+
+    Not crash-atomic; used only when replacement is impossible, under the
+    writer lock and after re-checking that nobody changed the file.
+    """
+    try:
+        stream = handle or open(path, "r+b" if path.exists() else "w+b")
+    except OSError as exc:
+        if exc.errno in _DIRECTORY_UNWRITABLE:
+            raise _read_only() from None
+        raise
+    try:
+        stream.seek(0)
+        if stream.read() != prior:
+            raise _changed_externally()
+        stream.seek(0)
+        stream.write(payload)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+    except OSError as exc:
+        if isinstance(exc, ConfigurationConflict):
+            raise
+        if exc.errno in _DIRECTORY_UNWRITABLE:
+            raise _read_only() from None
+        raise
+    finally:
+        if handle is None:
+            stream.close()
+
+
+def _commit(path: Path, payload: bytes, prior: bytes, handle=None) -> None:
+    """Atomically replace the configuration, falling back to an in-place rewrite."""
+    try:
+        stream = tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=".config-", suffix=".tmp", delete=False
+        )
+    except OSError as exc:
+        if exc.errno not in _DIRECTORY_UNWRITABLE:
+            raise
+        _rewrite_in_place(path, payload, prior, handle)
+        return
+    temporary = Path(stream.name)
+    try:
+        with stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if (path.read_bytes() if path.exists() else b"") != prior:
+            raise _changed_externally()
+        try:
+            os.replace(temporary, path)
+        except OSError as exc:
+            if exc.errno not in _RENAME_IMPOSSIBLE:
+                raise
+            _rewrite_in_place(path, payload, prior, handle)
+            return
+        try:
+            fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return  # Directory handles are not openable on every platform.
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def save_config(cfg: Config) -> None:
-    """Save config to config.toml."""
-    app_dir = _get_app_dir()
-    app_dir.mkdir(parents=True, exist_ok=True)
-    config_path = _get_config_path()
+    """Merge changed fields against the loaded revision under one writer lock.
 
-    lines = [
-        "[general]",
-        f'output_dir = "{cfg.output_dir}"',
-        "",
-        "[download]",
-        f"max_concurrent = {cfg.download.max_concurrent}",
-        f"retry_attempts = {cfg.download.retry_attempts}",
-        f"scrape_delay = {cfg.download.scrape_delay}",
-        "",
-    ]
+    Only fields this ``cfg`` changed since it was loaded are written; they are
+    merged into the file's current content, so concurrent writers (a
+    subscription edit and self-healing constants) never discard each other.
+    The file is replaced atomically when possible and rewritten in place when
+    it is a mount point or its directory is read-only.
+    """
+    path = _get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    intended = asdict(cfg)
+    baseline = getattr(cfg, "_loaded_values", asdict(Config()))
+    original_file = getattr(cfg, "_file_values", asdict(Config()))
+    changes = {}
+    for section, value in intended.items():
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if item != baseline[section][key]:
+                    changes[(section, key)] = item
+        elif value != baseline[section]:
+            changes[(section, None)] = value
+    if not changes and path.exists():
+        return
+    with _writer_lock(path) as handle:
+        if path.exists() and not path.stat().st_mode & 0o222:
+            raise _read_only()
+        prior = path.read_bytes() if path.exists() else b""
+        data = tomllib.loads(prior.decode("utf-8")) if prior else {}
+        fresh = load_config()
+        if (path.read_bytes() if path.exists() else b"") != prior:
+            raise _changed_externally()
+        fresh_file = fresh._file_values
+        for (section, key), value in changes.items():
+            env = 'MAGSYNC_' + (section.upper() if key is None else section.upper() + '__' + key.upper())
+            if section == 'notifications':
+                env = 'MAGSYNC_APPRISE_URLS'
+            if env in os.environ and os.environ[env]:
+                raise ConfigurationConflict(
+                    f"{env} is set in the environment and controls this setting; "
+                    "the change was not saved."
+                )
+            previous = original_file[section][key] if key else original_file[section]
+            current = fresh_file[section][key] if key else fresh_file[section]
+            if current != previous and current != value:
+                raise ConfigurationConflict(
+                    "This setting was changed outside magsync since it was loaded; "
+                    "the change was not saved."
+                )
+            if key:
+                data.setdefault(section, {})[key] = value
+            elif section == 'output_dir':
+                data.setdefault('general', {})['output_dir'] = value
+            else:
+                data[section] = value
+        # Keep all unrelated TOML sections, including operator extension keys.
+        lines = []
+        for section, value in data.items():
+            if isinstance(value, dict):
+                lines.append('[' + section + ']')
+                lines.extend(key + ' = ' + _toml_value(item) for key, item in value.items() if item is not None)
+                lines.append('')
+            elif isinstance(value, list) and (not value or isinstance(value[0], dict)):
+                for item in value:
+                    lines.append('[[' + section + ']]')
+                    lines.extend(key + ' = ' + _toml_value(val) for key, val in item.items() if val is not None)
+                    lines.append('')
+            else:
+                lines.append(section + ' = ' + _toml_value(value))
+        _commit(path, ('\n'.join(lines) + '\n').encode("utf-8"), prior, handle)
+    fresh = load_config()
+    cfg._file_values = fresh._file_values
+    cfg._loaded_values = copy.deepcopy(asdict(cfg))
+    cfg._file_revision = fresh._file_revision
 
-    # Only write [limewire] when constants have been populated (via auto-extraction or manual config)
-    if cfg.limewire.file_iv_b64:
-        lines += [
-            "[limewire]",
-            f'sharing_salt_b64 = "{cfg.limewire.sharing_salt_b64}"',
-            f'sharing_iv_b64 = "{cfg.limewire.sharing_iv_b64}"',
-            f'file_iv_b64 = "{cfg.limewire.file_iv_b64}"',
-            f'file_name_iv_b64 = "{cfg.limewire.file_name_iv_b64}"',
-            f'file_sha1_iv_b64 = "{cfg.limewire.file_sha1_iv_b64}"',
-            f'preview_iv_b64 = "{cfg.limewire.preview_iv_b64}"',
-            f"pbkdf2_iterations = {cfg.limewire.pbkdf2_iterations}",
-            "",
-        ]
 
-    lines += [
-        "[notifications]",
-        f"enabled = {'true' if cfg.notifications.enabled else 'false'}",
-        f"apprise_urls = [{', '.join(repr(u) for u in cfg.notifications.apprise_urls)}]",
-        "",
-    ]
-
-    for sub in cfg.subscriptions:
-        lines.append("[[subscriptions]]")
-        lines.append(f'query = "{sub.query}"')
-        if sub.since:
-            lines.append(f'since = "{sub.since}"')
-        if sub.exact:
-            lines.append("exact = true")
-        lines.append("")
-
-    config_path.write_text("\n".join(lines))
+def _parse_setting(key: str, current, value: str):
+    """Parse a CLI string for a typed setting; raise ValueError with a sentence."""
+    if isinstance(current, bool):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"{key} must be true or false.")
+    if isinstance(current, int):
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a whole number.") from None
+    if isinstance(current, float):
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a number.") from None
+    if isinstance(current, list):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return value
 
 
 def set_config_value(key: str, value: str) -> Config:
-    """Set a single config value by dotted key (e.g., 'output_dir', 'download.max_concurrent')."""
+    """Set a single config value by dotted key (e.g., 'output_dir', 'download.max_concurrent').
+
+    Raises ``ValueError`` (a user-facing sentence) for a missing value or an
+    unknown/invalid key, and ``ConfigurationConflict`` when it cannot be saved.
+    """
+    if value is None:
+        raise ValueError(f"A value is required to set {key}.")
     cfg = load_config()
     parts = key.split(".")
     if len(parts) == 1:
@@ -248,18 +450,43 @@ def set_config_value(key: str, value: str) -> Config:
     elif len(parts) == 2:
         section, name = parts
         target = getattr(cfg, section, None)
-        if target is None:
+        if target is None or isinstance(target, (list, str)):
             raise ValueError(f"Unknown config section: {section}")
-        if not hasattr(target, name):
+        if name.startswith("_") or not hasattr(target, name):
             raise ValueError(f"Unknown config key: {key}")
-        current = getattr(target, name)
-        if isinstance(current, int):
-            setattr(target, name, int(value))
-        elif isinstance(current, float):
-            setattr(target, name, float(value))
-        else:
-            setattr(target, name, value)
+        setattr(target, name, _parse_setting(key, getattr(target, name), value))
     else:
         raise ValueError(f"Invalid config key format: {key}")
     save_config(cfg)
     return cfg
+
+
+def _same_title(left: str, right: str) -> bool:
+    from magsync.core.organizer import strip_accents
+
+    return strip_accents(left).lower() == strip_accents(right).lower()
+
+
+def add_subscription(query: str, *, since: str | None = None, exact: bool = False) -> bool:
+    """Subscribe the local configuration to ``query``.
+
+    Returns False (and writes nothing) when an accent-insensitive match is
+    already subscribed. Raises ``ConfigurationConflict`` when it cannot be saved.
+    """
+    cfg = load_config()
+    if any(_same_title(sub.query, query) for sub in cfg.subscriptions):
+        return False
+    cfg.subscriptions.append(Subscription(query=query, since=since, exact=exact))
+    save_config(cfg)
+    return True
+
+
+def remove_subscription(query: str) -> bool:
+    """Unsubscribe ``query``; returns False (writing nothing) when not subscribed."""
+    cfg = load_config()
+    remaining = [sub for sub in cfg.subscriptions if not _same_title(sub.query, query)]
+    if len(remaining) == len(cfg.subscriptions):
+        return False
+    cfg.subscriptions = remaining
+    save_config(cfg)
+    return True
