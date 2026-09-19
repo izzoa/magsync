@@ -735,22 +735,47 @@ async def test_per_issue_download_lines_and_startup_banner(tmp_path, caplog):
         assert expected in caplog.text
 
 
-async def test_service_honors_the_discovery_interval(tmp_path):
-    from magsync.companion.api import create_app
+def test_serve_runs_discovery_at_the_configured_interval(tmp_path, monkeypatch):
+    """`magsync serve` parses --interval / MAGSYNC_INTERVAL into the service runtime."""
+    import uvicorn
     from typer.testing import CliRunner
 
+    import magsync.cli as cli_module
+    import magsync.companion.api as api
+    import magsync.companion.safety as safety
     from magsync.cli import app as cli_app
 
+    monkeypatch.setenv("MAGSYNC_DB_PATH", str(tmp_path / "index.db"))
+    monkeypatch.setenv("MAGSYNC_EXPORT_DIR", str(tmp_path / "exports"))
+    monkeypatch.setenv("MAGSYNC_OUTPUT_DIR", str(tmp_path / "out"))
+    monkeypatch.setenv("MAGSYNC_SERVICE__MINIMUM_FREE_BYTES", "1024")
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
     idx = MagazineIndex(tmp_path / "index.db")
     Store(idx).initialize()
     idx.close()
-    app = create_app(db_path=tmp_path / "index.db", config=Config(output_dir=str(tmp_path / "out")),
-                     limits=Limits(minimum_free_bytes=1024), exports=tmp_path / "exports",
-                     background=False, scan_seconds=1800, notify=True)
-    async with app.router.lifespan_context(app):
-        runtime = app.state.runtime
-        assert runtime.scan_seconds == 1800 and runtime.notify and runtime._accepting
-    assert "--interval" in CliRunner().invoke(cli_app, ["serve", "--help"]).output
+    # Keep the process-wide logging configuration untouched by the command.
+    monkeypatch.setattr(safety, "configure_service_logging", lambda: None)
+    monkeypatch.setattr(cli_module, "_configure_daemon_external_logging", lambda: None)
+    real_create_app = api.create_app
+    # The service's loops would contact the source; the lifespan alone builds the runtime.
+    monkeypatch.setattr(api, "create_app", lambda **kwargs: real_create_app(**{**kwargs, "background": False}))
+    runtimes = []
+
+    def run(app, **_options):
+        async def serve_once():
+            async with app.router.lifespan_context(app):
+                runtime = app.state.runtime
+                runtimes.append((runtime.scan_seconds, runtime.notify, runtime._accepting))
+        asyncio.run(serve_once())
+
+    monkeypatch.setattr(uvicorn, "run", run)
+    runner = CliRunner()
+    monkeypatch.setenv("MAGSYNC_INTERVAL", "30m")
+    assert runner.invoke(cli_app, ["serve"]).exit_code == 0
+    assert runner.invoke(cli_app, ["serve", "--interval", "45m"]).exit_code == 0
+    assert runtimes == [(1800, True, True), (2700, True, True)]
+    rejected = runner.invoke(cli_app, ["serve", "--interval", "soon"])
+    assert rejected.exit_code == 2 and len(runtimes) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +880,8 @@ def test_termination_signal_withdraws_a_queued_command(tmp_path):
     idx = MagazineIndex(tmp_path / "index.db")
     store = Store(idx, Limits())
     with store.transaction():  # A live, accepting owner that never starts the command.
-        store.conn.execute("UPDATE runtime_state SET accepting=1,heartbeat_at=? WHERE id=1", (timestamp(),))
+        store.conn.execute("UPDATE runtime_state SET accepting=1,owner_id='daemon',heartbeat_at=? WHERE id=1",
+                           (timestamp(),))
     operation = accept_local(store, "update", {})
     threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGHUP)).start()
     with pytest.raises(KeyboardInterrupt):

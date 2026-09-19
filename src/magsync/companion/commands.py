@@ -46,7 +46,8 @@ async def execute_local(runtime, kind: str, body: dict, operation_id: str) -> di
             return {**summary, 'outcome': 'empty', 'pending': 0, 'outcomes': []}
         since_year, since_month = _since(body.get('since'))
         # Same scope as the standalone fetch: every non-complete row matching
-        # the query becomes explicit local intent; pending rows download now.
+        # the query becomes explicit local intent; pending rows download now,
+        # and rows another task is downloading are joined for their outcome.
         index.promote_subscribed(runtime._local_snapshot)
         rows = index.get_issues(magazine_title=strip_accents(body['query']).lower(),
                                since_year=since_year, since_month=since_month)
@@ -58,7 +59,7 @@ async def execute_local(runtime, kind: str, body: dict, operation_id: str) -> di
                 request_id = local_request(store, row['id'])
                 store.conn.execute("UPDATE downloads SET requested_by='manual' WHERE issue_id=?", (row['id'],))
                 store.conn.execute('INSERT OR IGNORE INTO operation_requests VALUES(?,?)', (operation_id, request_id))
-                if row['download_status'] == DownloadStatus.PENDING.value:
+                if row['download_status'] in (DownloadStatus.PENDING.value, DownloadStatus.DOWNLOADING.value):
                     requests.append(request_id)
                 elif row['download_status'] in ('failed', 'unavailable'):
                     recoverable += 1

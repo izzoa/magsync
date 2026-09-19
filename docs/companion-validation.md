@@ -1,10 +1,10 @@
 # Companion protocol 1 validation
 
-Validated on 2026-09-18 for package version 0.9.0, protocol 1, on one development machine (macOS, arm64, Docker Desktop). These are local acceptance results, not a statement about upstream magazine-provider availability.
+Validated on 2026-09-19 for package version 0.9.0, protocol 1, on one development machine (macOS, arm64, Docker Desktop). These are local acceptance results, not a statement about upstream magazine-provider availability.
 
 ## Test suite
 
-`python -m pytest -q`: **504 passed**.
+`python -m pytest -q`: **523 passed**.
 
 - **Daemon behavior on the production path.** The 31 established daemon-cycle tests (`tests/test_daemon.py`, `tests/test_intent_scoping.py`, `tests/test_external_failure_cycle.py`) drive the shared runtime through `_run_daemon_cycle`, a one-cycle wrapper over `Runtime.discover()`. They cover source circuits, parking, health classification, notifications, secret-safe logs and intent scoping.
 - **Contract.** The generated OpenAPI equals `docs/companion-openapi-v1.json`. The base CLI imports without FastAPI/Uvicorn and without `fcntl`.
@@ -16,13 +16,20 @@ Validated on 2026-09-18 for package version 0.9.0, protocol 1, on one developmen
   - bounded remote recovery
   - one failing command never stops the runtime
   - transient database locks and a dead service loop are handled
-- **Configuration.** Single-file bind mounts (in-place rewrite), read-only directories, concurrent external edits and environment-managed settings.
+  - a terminal waiting on a command keeps waiting while the daemon drains during a graceful stop, past the liveness threshold
+  - a terminal fetch joins a download the daemon already started: one transfer, and the issue is reported downloaded
+- **Configuration.** Single-file bind mounts (in-place rewrite), read-only directories, concurrent external edits and environment-managed settings. Writers reaching one file through two directories share one lock, a writer that waited through an atomic replace locks the new file, and a top-level `output_dir` is honored.
 - **Exports and claims.**
   - Local-only demand is never exported.
   - Capacity is decided per issue.
   - A failed publication leaves no stuck attempts.
   - Missing originals are reacquired; corrupt ones are not.
   - Unpublishable content is retried once per discovery cycle.
+  - Two concurrent publication passes over one issue stage one export.
+  - Requests go from `acquiring` straight to `fulfilled`; a failed publication returns them to `queued`.
+  - Requests and retries for an issue in flight complete with that transfer's outcome.
+  - A content lease ends when the client disconnects before the first byte.
+  - No transaction is open at any worker-thread hop or batch await during acquisition and publication.
 
 ## Scale
 
@@ -66,7 +73,7 @@ The daemon image was also run with a single-file `config.toml` bind mount, as on
 
 | Target | Platform | Image size (bytes) |
 |---|---|---:|
-| Daemon | linux/arm64 | 183,711,801 |
-| Service | linux/arm64 | 230,954,426 |
+| Daemon | linux/arm64 | 183,724,410 |
+| Service | linux/arm64 | 230,979,644 |
 
 amd64 images are built by the release workflow; they were not executed in this validation.

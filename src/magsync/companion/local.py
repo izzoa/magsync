@@ -135,6 +135,18 @@ def live_owner(store, limits) -> bool:
                 and row['heartbeat_at'] >= timestamp(-limits.heartbeat_stale_seconds))
 
 
+def owner_alive(store, limits) -> bool:
+    """True while an owner holds the store and its heartbeat is fresh.
+
+    Acceptance gates only new submissions. An owner that stopped accepting
+    (draining before it stops, or after repeated work failures) still owns,
+    and may still finish, the commands already submitted to it.
+    """
+    row = store.conn.execute('SELECT owner_id,heartbeat_at FROM runtime_state WHERE id=1').fetchone()
+    return bool(row and row['owner_id'] and row['heartbeat_at']
+                and row['heartbeat_at'] >= timestamp(-limits.heartbeat_stale_seconds))
+
+
 def _busy(store) -> CoordinatorBusy:
     row = store.conn.execute('SELECT accepting FROM runtime_state WHERE id=1').fetchone()
     # An owner that advertises acceptance but stopped heartbeating is hung,
@@ -197,7 +209,8 @@ class LocalWaiter:
     While the operation is queued the waiter refreshes ``updated_at`` (the
     owner abandons queued local operations whose waiter went quiet), prints
     how many operations are ahead once, and withdraws the operation if it
-    stops waiting before the owner starts it.
+    stops waiting before the owner starts it. It keeps waiting while the
+    owner is alive, whether or not that owner still accepts new commands.
     """
 
     def __init__(self, store, operation_id: str, limits, *, notice=None):
@@ -230,7 +243,7 @@ class LocalWaiter:
         state = operation['state']
         if state not in ('queued', 'running'):
             return operation
-        if not live_owner(self.store, self.limits):
+        if not owner_alive(self.store, self.limits):
             if state == 'queued' and self.withdraw('runtime_unavailable'):
                 raise ProtocolError('runtime_unavailable')
             if state == 'running':

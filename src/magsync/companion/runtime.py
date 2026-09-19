@@ -230,6 +230,10 @@ class Runtime:
         self._logged: dict = {}
         self._inflight_operations: set[str] = set()
         self._retired_sources: list = []
+        # Attempts this runtime's tasks are executing (issue -> attempt), and
+        # per-issue publication locks with their user counts.
+        self._active_attempts: dict[int, str] = {}
+        self._publishing: dict[int, list] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -347,9 +351,12 @@ class Runtime:
 
         Only loss of ownership or of the database file is fatal. A transient
         error (for example a briefly locked database) is retried on the next
-        interval; if it persists, liveness lapses on its own threshold.
+        interval; if it persists, liveness lapses on its own threshold. A
+        graceful stop keeps the heartbeat, without acceptance, until ``stop()``
+        ends it after the loops drain, so terminals waiting for commands that
+        are still finishing keep seeing a live owner.
         """
-        while not (self.stopping or self.fatal):
+        while not self.fatal:
             try:
                 if not self.store.index.db_path.exists():
                     raise ProtocolError('runtime_unavailable')
@@ -361,8 +368,10 @@ class Runtime:
                 return
             except (sqlite3.Error, OSError) as exc:
                 self._log_once('heartbeat', 'Runtime heartbeat deferred: %s', exc)
-            if await self._wait_stop(self.store.limits.heartbeat_seconds):
-                return
+            if self.stopping:
+                await asyncio.sleep(self.store.limits.heartbeat_seconds)
+            else:
+                await self._wait_stop(self.store.limits.heartbeat_seconds)
 
     def _touch_health_file(self):
         try:
@@ -867,16 +876,20 @@ class Runtime:
                 attempts[row[0]] = attempt
         if not attempts:
             return []
+        self._active_attempts.update(attempts)
         try:
-            results = await batch_module.refresh_due_links(
-                self.store.index.get_issues_by_ids(list(attempts)), FencedIndex(self, attempts), self.source)
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
+            try:
+                results = await batch_module.refresh_due_links(
+                    self.store.index.get_issues_by_ids(list(attempts)), FencedIndex(self, attempts), self.source)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                self._finish_attempts(attempts)
+                raise
             self._finish_attempts(attempts)
-            raise
-        self._finish_attempts(attempts)
-        return results
+            return results
+        finally:
+            self._forget_attempts(attempts)
 
     def _finish_attempts(self, attempts: dict[int, str]):
         with self.store.transaction():
@@ -992,8 +1005,11 @@ class Runtime:
             selected = [row[0] for row in self.store.conn.execute(
                 'SELECT request_id FROM operation_requests WHERE operation_id=?', (operation_id,))]
             if accepted.get('attached'):
-                result = {'physical_attempts': 0, 'attached': True,
-                          'outcomes': [self.store.request(client_id, id) for id in selected]}
+                # Accepted while its issue was downloading: that transfer's
+                # outcome is this operation's outcome, never an early success.
+                await self._await_attempts(self._selected_issues(selected))
+                await self._publish_retained(selected)
+                result = {'physical_attempts': 0, 'attached': True, 'outcomes': self._selected_outcomes(selected)}
             else:
                 result = await self.acquire(selected, retry='selected' if kind == 'local.download' else kind.endswith('retry'))
             if kind == 'local.retry':
@@ -1103,20 +1119,58 @@ class Runtime:
         issue can never be left with a running attempt that blocks future
         claims. Only cancellation (shutdown past its grace) leaves attempts
         running, for the next owner's recovery.
+
+        A selected acquisition (a command) joins selected issues that another
+        task is already transferring instead of skipping them: it waits for
+        those transfers, claims any they left pending, and reports one outcome
+        per selected issue, whoever performed the transfer.
         """
         now_text = _utc_timestamp(now or self.utcnow())
         self._export_pass_blocked = False
         # Fulfill retained bytes first; a late request does not need upstream work.
         await self._publish_retained(selected, include_errored=include_errored)
         self._set_capacity(export=self._export_pass_blocked)
+        result, joined = await self._claim_and_transfer(selected, retry=retry, now_text=now_text, report=report)
+        if selected is None:
+            return result
+        if joined:
+            await self._await_attempts(joined)
+            await self._publish_retained(selected)
+            # A joined transfer can end without an outcome (a capacity pause,
+            # or a link refresh that found a new link): claim those once more.
+            resumable = self._pending_requests(selected, joined)
+            if resumable:
+                again, _ = await self._claim_and_transfer(resumable, retry=False, now_text=now_text, report=None)
+                result['physical_attempts'] += again['physical_attempts']
+                result['missing_results'] += again['missing_results']
+                if again['outcome'] == 'capacity_exhausted':
+                    result['outcome'] = 'capacity_exhausted'
+        result['outcomes'] = self._selected_outcomes(selected)
+        return result
+
+    async def _claim_and_transfer(self, selected: list[str] | None, *, retry: bool | str, now_text: str,
+                                  report: CycleReport | None) -> tuple[dict, list[int]]:
+        """Claim and transfer eligible work; also return the selected issues to join."""
         claimed, attempts = self.claim(selected, retry=retry, now=now_text)
         blocked = self._last_claim_blocked
+        # Selected issues that another task is transferring right now.
+        joined = self._joined(selected, attempts) if selected is not None else []
         identities = self._identities(claimed)
         if report is not None:
             report.downloads_queued = len(claimed)
             report.downloads_unique = len(identities)
         if not claimed:
-            return {'physical_attempts': 0, 'outcomes': [], 'outcome': 'capacity_exhausted' if blocked else 'succeeded'}
+            return {'physical_attempts': 0, 'outcomes': [], 'missing_results': 0,
+                    'outcome': 'capacity_exhausted' if blocked else 'succeeded'}, joined
+        self._active_attempts.update(attempts)
+        try:
+            return await self._transfer(claimed, attempts, identities, report), joined
+        finally:
+            # Joiners wake once this task has settled and published its claims.
+            self._forget_attempts(attempts)
+
+    async def _transfer(self, claimed: list[dict], attempts: dict[int, str], identities: set[str],
+                        report: CycleReport | None) -> dict:
         self.logger.info('Downloading %d issues (%d unique URLs; max %d concurrent)...',
                          len(claimed), len(identities), self.config.download.max_concurrent)
         fenced = FencedIndex(self, attempts)
@@ -1158,27 +1212,31 @@ class Runtime:
         if paused:
             self._set_capacity(download=True)
         rows = self._settle_claims(claimed, attempts)
-        for issue in claimed:
-            if (rows.get(issue['id']) or {}).get('status') == 'complete':
-                await self._publish(issue['id'])
+        complete = [issue['id'] for issue in claimed if (rows.get(issue['id']) or {}).get('status') == 'complete']
+        try:
+            for issue_id in complete:
+                await self._publish(issue_id)
+        finally:
+            # Requests publication could not fulfill wait for a later pass.
+            for issue_id in complete:
+                self._release_unpublished(issue_id)
         downloaded = _reconcile_download_results(report if report is not None else CycleReport(), results, self.logger)
         missing = 0 if paused else max(0, len(claimed) - len(results))
         if report is not None and missing:
             report.downloads_failed += missing
         self._queue_notifications(downloaded)
-        safe_results = []
-        for issue in claimed:
-            row = rows.get(issue['id']) or {}
-            safe_results.append({'issue_id': self.store.provider_issue(issue['id']), 'status': row.get('status'),
-                                 'failure_kind': row.get('last_error_kind'), 'next_action': row.get('next_action'),
-                                 'next_retry_at': row.get('next_retry_at')})
+        safe_results = [self._outcome(issue['id'], rows.get(issue['id']) or {}) for issue in claimed]
         await self.exports.sync_views_async()
         return {'physical_attempts': started_transfers if self.batch is None else len(identities),
                 'outcomes': safe_results, 'missing_results': missing,
                 'outcome': 'capacity_exhausted' if paused else 'succeeded'}
 
     def _settle_claims(self, claimed: list[dict], attempts: dict[int, str]) -> dict[int, dict]:
-        """Finish each claimed attempt and release its requests, one issue at a time."""
+        """Finish each claimed attempt and release its requests, one issue at a time.
+
+        Requests of a completed transfer stay ``acquiring`` until publication
+        fulfills them, so consumers never see them fall back to ``queued``.
+        """
         rows: dict[int, dict] = {}
         for issue in claimed:
             issue_id = issue['id']
@@ -1194,17 +1252,81 @@ class Runtime:
                         row = conn.execute('SELECT * FROM downloads WHERE issue_id=?', (issue_id,)).fetchone()
                     conn.execute("UPDATE acquisition_attempts SET state='finished' WHERE id=? AND state='running'",
                                  (attempts[issue_id],))
-                    for req in conn.execute("""SELECT r.id,s.client_id FROM acquisition_requests r JOIN scopes s ON s.id=r.scope_id
-                            WHERE r.issue_id=? AND r.state='acquiring'""", (issue_id,)).fetchall():
-                        conn.execute("UPDATE acquisition_requests SET state='queued',revision=revision+1 WHERE id=?", (req['id'],))
-                        self.store.event(req['client_id'], 'request.updated', req['id'],
-                                         lambda req=req: self.store.request(req['client_id'], req['id']))
+                    if row is None or row['status'] != 'complete':
+                        self._requeue_acquiring(issue_id)
                 rows[issue_id] = dict(row) if row is not None else {}
             except ProtocolError:
                 raise
             except sqlite3.Error as exc:
                 self._log_once(('settle', issue_id), 'Unable to settle a claimed download; recovery will: %s', exc)
         return rows
+
+    def _requeue_acquiring(self, issue_id: int) -> None:
+        """Return an issue's acquiring requests to queued (within a transaction)."""
+        conn = self.store.conn
+        for req in conn.execute("""SELECT r.id,s.client_id FROM acquisition_requests r JOIN scopes s ON s.id=r.scope_id
+                WHERE r.issue_id=? AND r.state='acquiring'""", (issue_id,)).fetchall():
+            conn.execute("UPDATE acquisition_requests SET state='queued',revision=revision+1 WHERE id=?", (req['id'],))
+            self.store.event(req['client_id'], 'request.updated', req['id'],
+                             lambda req=req: self.store.request(req['client_id'], req['id']))
+
+    def _release_unpublished(self, issue_id: int) -> None:
+        """Requeue what publication left acquiring (a capacity pause, a typed failure, ineligible)."""
+        try:
+            with self.store.transaction():
+                self.owner.check()
+                if self.store.conn.execute("SELECT 1 FROM acquisition_attempts WHERE issue_id=? AND state='running'",
+                                           (issue_id,)).fetchone():
+                    return  # A newer attempt owns these requests now.
+                self._requeue_acquiring(issue_id)
+        except sqlite3.Error as exc:
+            self._log_once(('release', issue_id), 'Unable to release unpublished requests; recovery will: %s', exc)
+
+    def _selected_issues(self, selected: list[str]) -> list[int]:
+        """Distinct issues of the selected requests, in selection order."""
+        if not selected:
+            return []
+        rows = self.store.conn.execute('SELECT id,issue_id FROM acquisition_requests WHERE id IN ('
+                                       + ','.join('?' for _ in selected) + ')', selected).fetchall()
+        issue_of = {row['id']: row['issue_id'] for row in rows}
+        return list(dict.fromkeys(issue_of[id] for id in selected if id in issue_of))
+
+    def _joined(self, selected: list[str], attempts: dict[int, str]) -> list[int]:
+        """Selected issues whose transfer another task of this runtime is executing."""
+        return [issue_id for issue_id in self._selected_issues(selected)
+                if issue_id in self._active_attempts and issue_id not in attempts]
+
+    async def _await_attempts(self, issue_ids: list[int]) -> None:
+        """Wait until the attempts other tasks are executing for these issues end."""
+        while any(issue_id in self._active_attempts for issue_id in issue_ids):
+            await asyncio.sleep(self.store.limits.command_poll_seconds)
+
+    def _forget_attempts(self, attempts: dict[int, str]) -> None:
+        for issue_id, attempt_id in attempts.items():
+            if self._active_attempts.get(issue_id) == attempt_id:
+                del self._active_attempts[issue_id]
+
+    def _pending_requests(self, selected: list[str], issue_ids: list[int]) -> list[str]:
+        """Selected requests for these issues whose download is pending again."""
+        wanted = set(issue_ids)
+        rows = self.store.conn.execute("""SELECT r.id,r.issue_id FROM acquisition_requests r
+            JOIN downloads d ON d.issue_id=r.issue_id WHERE d.status='pending' AND r.id IN ("""
+            + ','.join('?' for _ in selected) + ')', selected).fetchall()
+        return [row['id'] for row in rows if row['issue_id'] in wanted]
+
+    def _selected_outcomes(self, selected: list[str]) -> list[dict]:
+        """One outcome per selected issue, read from its current download row."""
+        issues = self._selected_issues(selected)
+        if not issues:
+            return []
+        rows = {row['issue_id']: dict(row) for row in self.store.conn.execute(
+            'SELECT * FROM downloads WHERE issue_id IN (' + ','.join('?' for _ in issues) + ')', issues)}
+        return [self._outcome(issue_id, rows.get(issue_id) or {}) for issue_id in issues]
+
+    def _outcome(self, issue_id: int, row: dict) -> dict:
+        return {'issue_id': self.store.provider_issue(issue_id), 'status': row.get('status'),
+                'failure_kind': row.get('last_error_kind'), 'next_action': row.get('next_action'),
+                'next_retry_at': row.get('next_retry_at')}
 
     async def _publish_retained(self, selected: list[str] | None = None, *, include_errored: bool = False):
         sql = """SELECT DISTINCT r.issue_id FROM acquisition_requests r JOIN downloads d ON d.issue_id=r.issue_id
@@ -1220,22 +1342,38 @@ class Runtime:
         sql += ' LIMIT ?'
         args.append(len(selected) if selected is not None else 100)
         for row in self.store.conn.execute(sql, args).fetchall():
+            if selected is None and row[0] in self._publishing:
+                continue  # That publication fulfills every queued request when it commits.
             await self._publish(row[0])
 
     async def _publish(self, issue_id: int):
-        """Publish one issue's exports; failures are recorded for that issue only."""
+        """Publish one issue's exports; failures are recorded for that issue only.
+
+        One task at a time publishes an issue. Otherwise the work loop and a
+        command could both stage an export copy while the first is still
+        exporting; a later publisher finds the requests already fulfilled.
+        """
+        entry = self._publishing.setdefault(issue_id, [asyncio.Lock(), 0])
+        entry[1] += 1
         try:
-            await self.exports.publish_async(issue_id)
-        except ProtocolError as exc:
-            if self._is_fatal(exc):
-                raise
-            if exc.code == 'capacity_exhausted':
-                self._export_pass_blocked = True
-                self._set_capacity(export=True)
-                return
-            self.record_export_error(issue_id, exc.code, missing_original=getattr(exc, 'missing_original', False))
-        except OSError:
-            self.record_export_error(issue_id, 'content_unavailable')
+            async with entry[0]:
+                try:
+                    await self.exports.publish_async(issue_id)
+                except ProtocolError as exc:
+                    if self._is_fatal(exc):
+                        raise
+                    if exc.code == 'capacity_exhausted':
+                        self._export_pass_blocked = True
+                        self._set_capacity(export=True)
+                        return
+                    self.record_export_error(issue_id, exc.code,
+                                             missing_original=getattr(exc, 'missing_original', False))
+                except OSError:
+                    self.record_export_error(issue_id, 'content_unavailable')
+        finally:
+            entry[1] -= 1
+            if not entry[1]:
+                del self._publishing[issue_id]
 
     def record_export_error(self, issue_id: int, code: str, *, missing_original: bool = False):
         """Record why publication was withheld, logging only when it changes.

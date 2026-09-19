@@ -118,6 +118,40 @@ class BodyLimit:
         await self.app(scope, bounded_receive, send)
 
 
+class ContentLease:
+    """An open delivery file and its durable read lease, released exactly once."""
+
+    def __init__(self, lease):
+        self._lease = lease
+        self.stream, self.metadata = lease.__enter__()
+        self._held = True
+
+    def release(self) -> None:
+        if self._held:
+            self._held = False
+            self._lease.__exit__(None, None, None)
+
+
+class LeasedStreamingResponse(StreamingResponse):
+    """Stream leased content; the lease ends with the response, however it ends.
+
+    Starlette never iterates the body when the client disconnects before the
+    response starts, and on ASGI 2.4 servers it raises before background tasks
+    run, so neither the body generator nor a background task can own the
+    release.
+    """
+
+    def __init__(self, lease: ContentLease, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lease = lease
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.lease.release()
+
+
 def _terminate_service() -> None:
     """Ask the server to shut down gracefully so a supervisor can restart it."""
     os.kill(os.getpid(), signal.SIGTERM)
@@ -401,50 +435,55 @@ def create_app(*, runtime: Runtime | None = None, db_path: Path | None = None, c
                       if_range: Annotated[str | None, Header(alias='If-Range')] = None,
                       if_none_match: Annotated[str | None, Header(alias='If-None-Match')] = None):
         rt = current(request)
-        lease = rt.exports.open_content(client, id)
-        stream, metadata = lease.__enter__()
-        size = metadata['size']
-        etag = '"' + metadata['content_generation'] + ':' + metadata['sha256'] + '"'
-        headers = {'ETag':etag, 'Accept-Ranges':'bytes','Cache-Control':'private, no-cache',
-                   'Content-Disposition':f'attachment; filename="{id}.pdf"'}
-        if if_none_match == etag:
-            lease.__exit__(None,None,None)
-            return Response(status_code=304, headers=headers)
-        start, end, status = 0, size-1, 200
-        if range_header and (if_range is None or if_range == etag):
-            match = re.fullmatch(r'bytes=(\d*)-(\d*)', range_header)
-            try:
-                if not match or not any(match.groups()):
-                    raise ValueError
-                first, last = match.groups()
-                if first:
-                    start = int(first)
-                    end = min(int(last), size-1) if last else size-1
-                else:
-                    suffix = int(last)
-                    if suffix <= 0:
+        lease = ContentLease(rt.exports.open_content(client, id))
+        try:
+            stream, metadata = lease.stream, lease.metadata
+            size = metadata['size']
+            etag = '"' + metadata['content_generation'] + ':' + metadata['sha256'] + '"'
+            headers = {'ETag':etag, 'Accept-Ranges':'bytes','Cache-Control':'private, no-cache',
+                       'Content-Disposition':f'attachment; filename="{id}.pdf"'}
+            if if_none_match == etag:
+                lease.release()
+                return Response(status_code=304, headers=headers)
+            start, end, status = 0, size-1, 200
+            if range_header and (if_range is None or if_range == etag):
+                match = re.fullmatch(r'bytes=(\d*)-(\d*)', range_header)
+                try:
+                    if not match or not any(match.groups()):
                         raise ValueError
-                    start = max(0, size-suffix)
-                if start > end or start >= size:
-                    raise ValueError
-            except ValueError:
-                lease.__exit__(None,None,None)
-                return Response(status_code=416, headers={**headers, 'Content-Range':f'bytes */{size}'})
-            status = 206
-            headers['Content-Range'] = f'bytes {start}-{end}/{size}'
-        headers['Content-Length'] = str(end-start+1)
-        async def chunks():
-            try:
-                stream.seek(start)
-                remaining = end-start+1
-                while remaining:
-                    data = await asyncio.to_thread(stream.read, min(1024*1024,remaining))
-                    if not data:
-                        break
-                    remaining -= len(data)
-                    yield data
-            finally:
-                lease.__exit__(None,None,None)
-        return StreamingResponse(chunks(), status_code=status, media_type='application/pdf', headers=headers)
+                    first, last = match.groups()
+                    if first:
+                        start = int(first)
+                        end = min(int(last), size-1) if last else size-1
+                    else:
+                        suffix = int(last)
+                        if suffix <= 0:
+                            raise ValueError
+                        start = max(0, size-suffix)
+                    if start > end or start >= size:
+                        raise ValueError
+                except ValueError:
+                    lease.release()
+                    return Response(status_code=416, headers={**headers, 'Content-Range':f'bytes */{size}'})
+                status = 206
+                headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+            headers['Content-Length'] = str(end-start+1)
+            async def chunks():
+                try:
+                    stream.seek(start)
+                    remaining = end-start+1
+                    while remaining:
+                        data = await asyncio.to_thread(stream.read, min(1024*1024,remaining))
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+                finally:
+                    lease.release()
+            return LeasedStreamingResponse(lease, chunks(), status_code=status, media_type='application/pdf',
+                                           headers=headers)
+        except BaseException:
+            lease.release()
+            raise
 
     return app

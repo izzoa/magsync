@@ -4,7 +4,7 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.9.0] - 2026-09-18
+## [0.9.0] - 2026-09-19
 
 Adds an optional authenticated **companion service**, so a trusted backend such as Polyreader can manage independent library subscriptions and receive verified PDFs. The daemon, the service and every terminal/TUI command now share **one acquisition runtime** per library. The daemon keeps its established cycle: health classification, parking, notifications and per-issue logs all run through that runtime, and the existing daemon-cycle tests exercise it directly.
 
@@ -23,7 +23,7 @@ Adds an optional authenticated **companion service**, so a trusted backend such 
   - client-scoped events and consistent recovery snapshots
   - retention pins, capacity controls and optional isolated trusted mount views
 
-  Exports are created only for remote demand; local downloads are never copied.
+  Exports are created only for remote demand; local downloads are never copied. Each issue is published by one task at a time, so concurrent passes never stage a duplicate export. Requests go from `acquiring` straight to `fulfilled`. A client that disconnects before a transfer starts releases its read lease at once instead of pinning the export until restart.
 - **Operator commands:** explicit initialization, client provisioning/rotation/revocation, status, export purge and recovery-epoch rotation. Credentials are stored only as verifiers.
 - **Docker:**
   - separate daemon and service targets
@@ -35,14 +35,16 @@ Adds an optional authenticated **companion service**, so a trusted backend such 
 - **One shared runtime.** Ownership locks, fenced attempts and bounded shutdown keep a single owner per library.
   - While a daemon or service runs, terminal commands are executed by it within about a second, beside discovery and downloads, and print the same results as standalone commands.
   - Read-only commands (viewing configuration, listing subscriptions, dry runs) never involve it.
+  - A command for an issue that is already downloading waits for that download and reports its result, instead of reporting nothing or "already downloaded". Remote requests and retries for such an issue complete with that transfer's outcome.
 - **Terminal commands are never run behind your back.**
   - A second terminal command waits up to 60 seconds for another one, then reports that it is busy without queuing anything.
   - Ctrl-C or closing the terminal before a submitted command starts cancels it.
   - A command interrupted mid-run is recorded as interrupted and never run later.
+  - A command the daemon has started keeps its terminal waiting until it finishes, even while the daemon drains during a graceful stop or has stopped accepting new commands.
 - **Failures stay contained.** A failing command ends only itself. A briefly locked database never stops the runtime. A service whose runtime dies exits so its supervisor can restart it.
 - **Demand is tracked per library**, separately from physical downloads. Local retries require current local intent and exclude remote-only, lapsed-only, unsupported and never-requested work. Explicit selections remain independent of subscriptions.
 - **Reconciliation is incremental and bounded.** At 50,000 issues and 25 subscriptions, a terminal command adds about 15 ms and a full discovery cycle's bookkeeping takes under a second. Local demand is exempt from the remote client's admission limits.
-- **Configuration writes merge** only the fields a command changed and detect conflicting external edits. The file is replaced atomically, or rewritten in place under the same lock when `config.toml` is a single-file bind mount. Environment-managed or read-only settings produce a clear message instead of a traceback.
+- **Configuration writes merge** only the fields a command changed and detect conflicting external edits. The file is replaced atomically, or rewritten in place under the same lock when `config.toml` is a single-file bind mount. Every writer locks `config.toml` itself, so writers that reach one file through different directories (a host process and a container that bind-mounts only the file) still take turns. Environment-managed or read-only settings produce a clear message instead of a traceback.
 - **Terminal and TUI output.**
   - Commands handled by a daemon name each issue with its outcome.
   - The TUI shows per-issue progress and the number of newly indexed issues.
@@ -52,6 +54,7 @@ Adds an optional authenticated **companion service**, so a trusted backend such 
 ### Fixed
 - `magsync config <section.key> <value>` parses boolean settings such as `notifications.enabled` and comma-separated lists such as `notifications.apprise_urls`. Previously booleans failed to parse and lists were stored as a single string.
 - Content deduplication no longer records a new download as a copy of a previously downloaded file that has since been deleted.
+- A top-level `output_dir` in `config.toml` is honored when `[general]` does not set one; previously it was silently ignored. `magsync config output_dir …` stores the value under `[general]` and removes the top-level key.
 
 ## [0.8.2] - 2026-09-09
 

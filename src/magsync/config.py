@@ -153,9 +153,11 @@ def load_config() -> Config:
     if config_path.exists():
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
-        if "general" in data:
-            if "output_dir" in data["general"]:
-                cfg.output_dir = data["general"]["output_dir"]
+        if "general" in data and "output_dir" in data["general"]:
+            cfg.output_dir = data["general"]["output_dir"]
+        elif isinstance(data.get("output_dir"), str):
+            # Hand-written configs may set it at the top level; [general] wins.
+            cfg.output_dir = data["output_dir"]
         if "download" in data:
             for key in ("max_concurrent", "retry_attempts", "scrape_delay"):
                 if key in data["download"]:
@@ -231,33 +233,75 @@ def _changed_externally() -> ConfigurationConflict:
     )
 
 
-@contextmanager
-def _writer_lock(path: Path):
-    """Serialize writers; yield the config file handle when it is the lock.
-
-    The lock normally lives beside the configuration. When that directory is
-    not writable (for example a single file bind-mounted into a container's
-    read-only directory), writers serialize on the configuration file itself.
-    """
+def _open_for_lock(path: Path):
+    """Open the configuration to lock it, creating it (private) when absent."""
     try:
-        handle = path.with_suffix(".lock").open("a")
-        own = None
+        return open(path, "r+b")
+    except FileNotFoundError:
+        pass
     except OSError as exc:
-        if exc.errno not in _DIRECTORY_UNWRITABLE:
+        if exc.errno == errno.EROFS:
+            raise _read_only() from None
+        if exc.errno not in (errno.EACCES, errno.EPERM):
             raise
-        if not path.exists():
-            raise ConfigurationConflict(
-                "Configuration directory is read-only; the change was not saved."
-            ) from None
+        # Not writable by this process. Replacing it may still succeed in a
+        # writable directory, so a read handle serves as the lock.
         try:
-            handle = own = path.open("r+b")
+            return open(path, "rb")
         except OSError as inner:
             if inner.errno in _DIRECTORY_UNWRITABLE:
                 raise _read_only() from None
             raise
-    with handle:
-        _lock_fd(handle.fileno(), blocking=True)
-        yield own
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        if exc.errno in _DIRECTORY_UNWRITABLE:
+            raise ConfigurationConflict(
+                "Configuration directory is read-only; the change was not saved."
+            ) from None
+        raise
+    return os.fdopen(fd, "r+b")
+
+
+@contextmanager
+def _writer_lock(path: Path):
+    """Serialize every writer of one configuration file; yield the locked handle.
+
+    POSIX writers lock the configuration file itself. Writers that replace it
+    atomically, writers that must rewrite it in place and writers that see it
+    through another directory (a single file bind-mounted into a container)
+    therefore all exclude each other, which no lock file beside it can
+    guarantee. A replace swaps the file, so a writer that waited re-opens
+    until it holds the lock on the file currently at ``path``.
+
+    Windows locks are mandatory and an open file cannot be replaced there, so
+    a lock file beside the configuration serializes writers instead.
+    """
+    if os.name == "nt":  # pragma: no cover - Windows
+        try:
+            handle = path.with_suffix(".lock").open("a")
+        except OSError as exc:
+            if exc.errno in _DIRECTORY_UNWRITABLE:
+                raise ConfigurationConflict(
+                    "Configuration directory is read-only; the change was not saved."
+                ) from None
+            raise
+        with handle:
+            _lock_fd(handle.fileno(), blocking=True)
+            yield None
+        return
+    while True:
+        with _open_for_lock(path) as handle:
+            _lock_fd(handle.fileno(), blocking=True)
+            try:
+                current = os.stat(path)
+            except FileNotFoundError:
+                continue
+            locked = os.fstat(handle.fileno())
+            if (current.st_dev, current.st_ino) != (locked.st_dev, locked.st_ino):
+                continue
+            yield handle
+            return
 
 
 def _rewrite_in_place(path: Path, payload: bytes, prior: bytes, handle=None) -> None:
@@ -267,7 +311,10 @@ def _rewrite_in_place(path: Path, payload: bytes, prior: bytes, handle=None) -> 
     writer lock and after re-checking that nobody changed the file.
     """
     try:
-        stream = handle or open(path, "r+b" if path.exists() else "w+b")
+        if handle is not None and handle.writable():
+            stream = handle
+        else:
+            stream = open(path, "r+b" if path.exists() else "w+b")
     except OSError as exc:
         if exc.errno in _DIRECTORY_UNWRITABLE:
             raise _read_only() from None
@@ -288,7 +335,7 @@ def _rewrite_in_place(path: Path, payload: bytes, prior: bytes, handle=None) -> 
             raise _read_only() from None
         raise
     finally:
-        if handle is None:
+        if stream is not handle:
             stream.close()
 
 
@@ -384,6 +431,8 @@ def save_config(cfg: Config) -> None:
             if key:
                 data.setdefault(section, {})[key] = value
             elif section == 'output_dir':
+                # One source of truth: a hand-written top-level key moves under [general].
+                data.pop('output_dir', None)
                 data.setdefault('general', {})['output_dir'] = value
             else:
                 data[section] = value

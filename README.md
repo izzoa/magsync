@@ -144,7 +144,7 @@ magsync config output_dir ~/MyMagazines
 magsync daemon --dry-run
 ```
 
-**Running beside a daemon or service.** While a daemon or companion service owns the library, terminal commands are executed by it and print the same tables, messages and per-issue outcomes as standalone commands; commands never wait behind a discovery cycle. Read-only commands (`magsync config` without a value, `magsync subscribe` without a query, and every `--dry-run`) never involve it. If another terminal command is running, a new one waits up to 60 seconds and then reports that it is busy, queuing nothing. Pressing Ctrl-C (or closing the terminal) before the daemon starts a submitted command cancels it; a command is never run later behind your back.
+**Running beside a daemon or service.** While a daemon or companion service owns the library, terminal commands are executed by it and print the same tables, messages and per-issue outcomes as standalone commands; commands never wait behind a discovery cycle. Read-only commands (`magsync config` without a value, `magsync subscribe` without a query, and every `--dry-run`) never involve it. If another terminal command is running, a new one waits up to 60 seconds and then reports that it is busy, queuing nothing. Pressing Ctrl-C (or closing the terminal) before the daemon starts a submitted command cancels it; a command is never run later behind your back. A command for an issue the daemon is already downloading waits for that download and reports its result, and a command the daemon has started keeps its terminal waiting through a graceful stop until it finishes.
 
 **Batch output.** The live progress rendering described here applies to standalone commands. `fetch`, `retry`, and `backfill-urls` show one progress bar with live outcome counters (`downloaded`, `unavailable`, `unsupported`, and `failed`) on an interactive terminal, and fall back to periodic textual progress lines when output is piped or run under `docker exec` without a TTY. Expected per-issue unavailable/unsupported messages are hidden by default; use `-v/--verbose` to see them, `-q/--quiet` for the summary only, and `--no-progress` (or `MAGSYNC_NO_PROGRESS=1`) to disable the live bar in scripts. The `daemon` is unaffected — it keeps its structured, timestamped logs.
 
@@ -314,7 +314,7 @@ apprise_urls = ["gotify://myserver:8080/token"]
 
 ## Configuration
 
-Config lives at `~/.magsync/config.toml` (or `$MAGSYNC_CONFIG_DIR/config.toml`):
+Config lives at `~/.magsync/config.toml` (or `$MAGSYNC_CONFIG_DIR/config.toml`). A top-level `output_dir` is also accepted when `[general]` does not set one:
 
 ```toml
 [general]

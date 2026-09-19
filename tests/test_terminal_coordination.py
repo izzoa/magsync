@@ -72,21 +72,21 @@ def _operations(paths):
         idx.close()
 
 
-@pytest.fixture
-def live_runtime(paths):
-    """A background runtime owning the store from another thread."""
+def _complete(paths, issues, index):
+    results = []
+    for issue in issues:
+        target = paths / f"{issue['id']}.pdf"
+        target.write_bytes(PDF)
+        index.update_download_status(issue["id"], DownloadStatus.COMPLETE, str(target), len(PDF),
+                                     hashlib.sha256(PDF).hexdigest())
+        results.append({"issue": issue, "success": True, "error": None, "failure_kind": None})
+    return results
+
+
+def _start_live_runtime(paths, downloads):
+    """Run a background runtime in its own thread; return its state and thread."""
     state: dict = {}
     ready = threading.Event()
-
-    async def downloads(issues, _cfg, index, **_kwargs):
-        results = []
-        for issue in issues:
-            target = paths / f"{issue['id']}.pdf"
-            target.write_bytes(PDF)
-            index.update_download_status(issue["id"], DownloadStatus.COMPLETE, str(target), len(PDF),
-                                         hashlib.sha256(PDF).hexdigest())
-            results.append({"issue": issue, "success": True, "error": None, "failure_kind": None})
-        return results
 
     def run():
         async def main():
@@ -113,6 +113,16 @@ def live_runtime(paths):
         if accepting:
             break
         time.sleep(0.05)
+    return state, thread
+
+
+@pytest.fixture
+def live_runtime(paths):
+    """A background runtime owning the store from another thread."""
+    async def downloads(issues, _cfg, index, **_kwargs):
+        return _complete(paths, issues, index)
+
+    state, thread = _start_live_runtime(paths, downloads)
     yield state
     state["loop"].call_soon_threadsafe(state["runtime"].request_stop)
     thread.join(20)
@@ -178,6 +188,80 @@ def test_commands_executed_by_the_daemon_render_like_standalone(paths, live_runt
     assert "{" not in fetched.output  # Never a raw operation document.
     states = _operations(paths)
     assert [kind for kind, state in states if state != "succeeded"] == ["local.config"]  # the invalid value
+
+
+def _gated_downloads(paths, entered: threading.Event, release: threading.Event, calls: list):
+    async def downloads(issues, _cfg, index, **_kwargs):
+        calls.append([issue["id"] for issue in issues])
+        entered.set()
+        await asyncio.to_thread(release.wait, 15)
+        return _complete(paths, issues, index)
+    return downloads
+
+
+def _operation_state(paths, kind):
+    idx = MagazineIndex(paths / "data" / "index.db")
+    try:
+        row = idx.conn.execute("SELECT state FROM operations WHERE kind=?", (kind,)).fetchone()
+        return row[0] if row else None
+    finally:
+        idx.close()
+
+
+def test_waiting_terminal_sees_its_command_finish_while_the_daemon_stops(paths, monkeypatch):
+    # SIGTERM requests a stop and the daemon drains before releasing the store.
+    # The drain outlasts the liveness threshold, so the heartbeat must go on.
+    monkeypatch.setenv("MAGSYNC_SERVICE__HEARTBEAT_STALE_SECONDS", "1")
+    entered, release, calls = threading.Event(), threading.Event(), []
+    state, thread = _start_live_runtime(paths, _gated_downloads(paths, entered, release, calls))
+
+    def stop_mid_download():
+        if entered.wait(15):
+            state["loop"].call_soon_threadsafe(state["runtime"].request_stop)
+            time.sleep(2.5)
+        release.set()
+
+    stopper = threading.Thread(target=stop_mid_download, daemon=True)
+    stopper.start()
+    try:
+        result = runner.invoke(app, ["fetch", "Science News"])
+    finally:
+        release.set()
+        stopper.join(20)
+        thread.join(20)
+    assert result.exit_code == 0, result.output
+    assert "✓ Science News - June 2025: downloaded" in result.output
+    assert not thread.is_alive()
+
+
+def test_fetch_joins_the_download_the_daemon_is_running(paths):
+    with open(paths / "cfg" / "config.toml", "a") as config:
+        config.write('\n[[subscriptions]]\nquery = "Science News"\n')
+    entered, release, calls = threading.Event(), threading.Event(), []
+    state, thread = _start_live_runtime(paths, _gated_downloads(paths, entered, release, calls))
+
+    def release_once_fetch_waits():
+        if entered.wait(15):
+            deadline = time.monotonic() + 15
+            while _operation_state(paths, "local.fetch") != "running" and time.monotonic() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.3)  # The fetch has joined the daemon's transfer and is waiting on it.
+        release.set()
+
+    releaser = threading.Thread(target=release_once_fetch_waits, daemon=True)
+    releaser.start()
+    try:
+        assert entered.wait(15)  # Discovery claimed the subscribed issue first.
+        result = runner.invoke(app, ["fetch", "Science News"])
+    finally:
+        release.set()
+        releaser.join(20)
+        state["loop"].call_soon_threadsafe(state["runtime"].request_stop)
+        thread.join(20)
+    assert result.exit_code == 0, result.output
+    assert "✓ Science News - June 2025: downloaded" in result.output
+    assert "Fetched 1 issue: 1 downloaded." in result.output
+    assert len(calls) == 1  # One physical transfer, shared.
 
 
 # ---------------------------------------------------------------------------

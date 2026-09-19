@@ -228,3 +228,58 @@ assert result.exit_code==2
 assert 'magsync[service]' in result.output
 '''
     subprocess.run([sys.executable, '-c', code], check=True, capture_output=True, text=True)
+
+
+async def test_leased_response_releases_even_if_its_body_never_starts():
+    from magsync.companion.api import LeasedStreamingResponse
+
+    released = []
+
+    class Lease:
+        def release(self):
+            released.append(True)
+
+    async def body():
+        yield b'never sent'
+
+    async def receive():
+        return {'type': 'http.disconnect'}
+
+    async def send(_message):
+        raise OSError('client connection closed')
+
+    response = LeasedStreamingResponse(Lease(), body(), media_type='application/pdf')
+    with pytest.raises(Exception):
+        await response({'type': 'http', 'asgi': {'spec_version': '2.4'}}, receive, send)
+    assert released == [True]  # While the response object is still referenced.
+
+
+async def test_content_lease_ends_when_the_client_leaves_before_streaming(api):
+    client, rt, first, _second, _transfers, _source = api
+    scope = await create_scope(client, 'A')
+    issue = await discover_issue(client, rt)
+    response = await client.post(f"/v1/scopes/{scope['id']}/requests", json={'issue_id': issue['id']},
+                                 headers={'Idempotency-Key': 'one'})
+    assert response.status_code == 202, response.text
+    await rt.tick(scan=False)
+    events = (await client.get('/v1/events')).json()['items']
+    delivery = next(event['resource'] for event in events if event['kind'] == 'delivery.ready')
+    path = delivery['transfer']['http']
+    pending = [{'type': 'http.request', 'body': b'', 'more_body': False}]
+
+    async def receive():
+        return pending.pop(0) if pending else {'type': 'http.disconnect'}
+
+    async def send(_message):
+        raise OSError('client connection closed')  # Gone before the response starts.
+
+    asgi_scope = {'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.4'}, 'http_version': '1.1',
+                  'method': 'GET', 'scheme': 'http', 'path': path, 'raw_path': path.encode(), 'query_string': b'',
+                  'root_path': '', 'client': ('127.0.0.1', 50000), 'server': ('test', 80),
+                  'headers': [(b'host', b'test'), (b'authorization', ('Bearer ' + first['token']).encode())]}
+    failure = None
+    try:
+        await client._transport.app(asgi_scope, receive, send)
+    except Exception as exc:  # The server sees the disconnect; its traceback keeps the response alive.
+        failure = exc
+    assert not rt.store.conn.execute('SELECT 1 FROM transfer_leases').fetchone(), failure
