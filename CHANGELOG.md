@@ -4,6 +4,29 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1] - 2026-10-04
+
+Restores downloads. Since freemagazines.top's latest template change, the daemon has queued **nothing**. Every cycle logged `0 queued`, `0 unsupported host` and `0 dead link`, while the `link-less` count kept growing.
+
+The site dropped the masked download button that 0.8.0 relied on, and posts link their download inline again. New posts link VK on its **`vk.ru`** domain, which magsync did not recognize as VK. Twin posts of the same issue link **easyupload.us**, which has no backend. Both were silently discarded as "no link". That is also why no log line ever named the cause.
+
+### Fixed
+- **VK links on `vk.ru` are accepted.** `vk.ru` and `www.vk.ru` are VK hosts, validated under the same strict document forms as `vk.com`. They are stored as the equivalent `vk.com` URL, so a document has one identity whichever domain the source used. Verified live: both domains serve the same file for the same token.
+  - The VK CDN allowlist also accepts VK's `.vkuserphoto.ru` file servers.
+  - **Recovery is automatic.** Indexing fills a missing link when it sees the page again, so the next cycle stores links for the backlog and queues it.
+- **A download link on an unsupported host is reported by name, not as "no link".** When a post's only labelled download link is on a host magsync has no backend for, the issue gets the same treatment as a masked link resolving to such a host:
+  - it is parked as `unsupported` with the 30-day re-probe;
+  - it is counted under `unsupported host`;
+  - the cycle log names the host.
+
+  Only the hostname is kept; the unvalidated URL is never stored or logged. A link refresh of such a page re-parks it instead of clearing it as having no link, and a page that later links a supported host recovers on the next cycle. Fuzzy-search strangers are not parked or counted, and a parked row is not re-reported every cycle.
+- **The source's current title suffix (`… | Magazine PDF`) is stripped.**
+  - On titles with no other separator, it had become part of the magazine's name (`GQ USA Fall 2026 | Magazine PDF`). That split the library into new folders and kept `exact` subscriptions from matching.
+  - Elsewhere it ended up in the filename's issue detail.
+  - The scraper now strips it, and title normalization removes it from titles already stored. `magsync repair-titles` consolidates those stored titles and any affected files, as it does for the legacy `[PDF] ` tag.
+
+> **Upgrading from 0.9.0:** no schema change and no migration; rolling back to 0.9.0 stays clean. After upgrading, run `magsync repair-titles --dry-run` once, then `magsync repair-titles`, to tidy titles stored with the suffix.
+
 ## [0.9.0] - 2026-09-19
 
 Adds an optional authenticated **companion service**, so a trusted backend such as Polyreader can manage independent library subscriptions and receive verified PDFs. The daemon, the service and every terminal/TUI command now share **one acquisition runtime** per library. The daemon keeps its established cycle: health classification, parking, notifications and per-issue logs all run through that runtime, and the existing daemon-cycle tests exercise it directly.

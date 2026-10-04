@@ -20,7 +20,9 @@ from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 LIMEWIRE_HOSTS = frozenset({"limewire.com", "www.limewire.com"})
-VK_HOSTS = frozenset({"vk.com", "www.vk.com"})
+# VK serves the same documents from its .ru domain, which the source switched
+# to for new posts. Both normalize to vk.com, so a document has one identity.
+VK_HOSTS = frozenset({"vk.com", "www.vk.com", "vk.ru", "www.vk.ru"})
 SOURCE_HOSTS = frozenset({"freemagazines.top", "www.freemagazines.top"})
 
 # VK names a document two ways, and the source's endpoint returns both:
@@ -150,12 +152,13 @@ def limewire_sharing_id(url: str) -> str:
 def normalize_vk_document_url(url: str) -> str:
     """Validate and return the canonical VK document URL.
 
-    Strict form: HTTPS, exact ``vk.com``/``www.vk.com`` host, a path naming
-    exactly one document - either ``/doc<owner>_<id>`` or a signed
-    ``/s/v<n>/doc/<token>`` viewer link - and no query beyond an optional
-    ``hash`` access token.  Any fragment is dropped: it is not part of a
-    document's identity, and rejecting one would risk misclassifying an
-    otherwise valid link as an unsupported host.
+    Strict form: HTTPS, exact ``vk.com``/``vk.ru`` host (optionally ``www.``,
+    always canonicalized to ``vk.com``), a path naming exactly one document -
+    either ``/doc<owner>_<id>`` or a signed ``/s/v<n>/doc/<token>`` viewer
+    link - and no query beyond an optional ``hash`` access token.  Any
+    fragment is dropped: it is not part of a document's identity, and
+    rejecting one would risk misclassifying an otherwise valid link as an
+    unsupported host.
     """
 
     parsed = _split_https_url(url, allowed_hosts=VK_HOSTS)

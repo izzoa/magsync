@@ -959,7 +959,7 @@ def _parse_retry_after(response: httpx.Response) -> int:
 # allowlist of VK-operated domains keeps that from becoming "follow any URL
 # the page names": each entry begins with a dot, so "evil-userapi.com" and
 # "userapi.com.evil.test" are both rejected.
-_VK_CDN_HOST_SUFFIXES = (".userapi.com", ".vk-cdn.net", ".vkuser.net")
+_VK_CDN_HOST_SUFFIXES = (".userapi.com", ".vk-cdn.net", ".vkuser.net", ".vkuserphoto.ru")
 _VK_DOC_URL_KEY_RE = re.compile(r'"docUrl"\s*:\s*(?=")')
 
 

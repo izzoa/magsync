@@ -137,6 +137,27 @@ def strip_format_tag(title: str) -> str:
     return _FORMAT_TAG_RE.sub("", title, count=1)
 
 
+# The source's site-name suffix on page titles ("... | Magazine PDF", earlier
+# "... | Download Magazine PDF"). Issues indexed while the scraper did not
+# strip the current spelling still carry it in their stored title.
+_SOURCE_SUFFIX_RE = re.compile(
+    r"\s+\|\s+(?:Download\s+)?Magazine\s+PDF\s*$", re.IGNORECASE
+)
+
+
+def strip_source_decorations(title: str) -> str:
+    """Remove source presentation from a title: format tag and site suffix.
+
+    Neither is part of the publication's name or issue. A trailing suffix is
+    worse than a tag: on a title with no other separator it becomes part of
+    the magazine name, splitting the library and blocking ``exact`` matches,
+    and elsewhere it ends up in the issue detail of the filename.
+    """
+    if not title:
+        return title
+    return _SOURCE_SUFFIX_RE.sub("", strip_format_tag(title), count=1)
+
+
 def normalize_title(title: str) -> str:
     """Strip date/issue information and accents from a title to get the base magazine name.
 
@@ -144,9 +165,10 @@ def normalize_title(title: str) -> str:
     "Bon Appétit – March 2026" → "Bon Appetit"
     "Science News – Vol 208 No 05, May 2026" → "Science News"
     "[PDF] Airliner World – January 2024" → "Airliner World"
+    "GQ USA Fall 2026 | Magazine PDF" → "GQ USA Fall"
     """
-    # A leading source format tag is never part of the magazine's name.
-    title = strip_format_tag(title)
+    # Source presentation is never part of the magazine's name.
+    title = strip_source_decorations(title)
     # Remove everything after common separators (–, -, |, :) if followed by date-like content
     separators = [" – ", " - ", " | ", ": "]
     for sep in separators:
@@ -214,6 +236,7 @@ def organize_path(
     Flat structure for Komga/Kavita compatibility. Filenames are uniform
     and sort chronologically.
     """
+    title = strip_source_decorations(title)
     parsed = parse_date(title, page_url)
     norm_title = normalize_title(title)
 

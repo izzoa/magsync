@@ -24,6 +24,7 @@ from magsync.core.models import (
     SourceResult,
 )
 from magsync.core.urls import (
+    SOURCE_HOSTS,
     URLValidationError,
     is_supported_download_host,
     normalize_download_url,
@@ -74,6 +75,15 @@ _MASKED_KEY_ATTR = "data-key"
 # discovery, but page-controlled data must never be posted verbatim.
 _MASKED_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{8,128}")
 _MASKED_RESPONSE_TYPES = frozenset({"application/json", "text/json"})
+# A link the post labels as its download. Used only to *name* a host magsync
+# cannot retrieve from, never to accept a URL: acceptance stays with the
+# strict per-host validators, so a label change can only cost diagnostics.
+_DOWNLOAD_LABEL_RE = re.compile(r"\bdownload\b", re.IGNORECASE)
+# The post body, where the download link lives. Sidebars and ads stay out of
+# scope while the template provides these; otherwise the whole page is used.
+_POST_BODY_SELECTORS = (".entry-content", "article")
+# The source's og:title suffixes, current first.
+_TITLE_SUFFIXES = (" | Magazine PDF", " | Download Magazine PDF")
 _HTML_RESPONSE_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 
 
@@ -125,6 +135,10 @@ class ScrapedIssue:
     # Set only when the page advertises a masked download and no inline URL was
     # found: the caller decides whether this issue needs a resolution request.
     download_key: str | None = None
+    # Set only when neither a URL nor a key was found but the post labels a
+    # download on a host magsync has no backend for. The bare hostname alone:
+    # the unvalidated URL is never carried.
+    unsupported_host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -768,13 +782,42 @@ def _extract_download_key(soup: BeautifulSoup) -> str | None:
     return None
 
 
+def _extract_unsupported_download_host(soup: BeautifulSoup) -> str | None:
+    """Name the host of a labelled download link magsync cannot retrieve.
+
+    Called only once no usable URL and no masked key were found, so a page
+    that moved its downloads to a new host is reported by that host instead
+    of looking like a page with no download at all. Links back to the source,
+    links on a supported host (a malformed link there is not an unsupported
+    destination), and links without a download label are ignored.
+    """
+    scope = None
+    for selector in _POST_BODY_SELECTORS:
+        scope = soup.select_one(selector)
+        if scope is not None:
+            break
+    for anchor in (scope or soup).find_all("a", href=True):
+        if not _DOWNLOAD_LABEL_RE.search(anchor.get_text(" ", strip=True)):
+            continue
+        host = _safe_resolved_host(str(anchor["href"]).strip())
+        if host is None or host in SOURCE_HOSTS:
+            continue
+        if is_supported_download_host(host):
+            continue
+        return host
+    return None
+
+
 def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
     soup = BeautifulSoup(html, "html.parser")
 
     og_title = soup.find("meta", property="og:title")
     if og_title:
-        raw_title = str(og_title.get("content", ""))
-        title = raw_title.replace(" | Download Magazine PDF", "").strip()
+        title = str(og_title.get("content", "")).strip()
+        for suffix in _TITLE_SUFFIXES:
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].strip()
+                break
     else:
         title_tag = soup.find("title")
         title = title_tag.get_text().strip() if title_tag else ""
@@ -821,6 +864,11 @@ def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
     # An inline URL is authoritative and costs no extra request, so a key is
     # only surfaced when discovery would otherwise come up empty.
     download_key = None if limewire_url else _extract_download_key(soup)
+    unsupported_host = (
+        None
+        if limewire_url or download_key
+        else _extract_unsupported_download_host(soup)
+    )
 
     return ScrapedIssue(
         title=title,
@@ -830,6 +878,7 @@ def _parse_detail_page(html: str, page_url: str) -> ScrapedIssue:
         genre=genre,
         file_size=file_size,
         download_key=download_key,
+        unsupported_host=unsupported_host,
     )
 
 
@@ -871,7 +920,10 @@ async def resolve_masked_links(
     destination host and a rejected key are reported as dispositions for the
     caller to park, and only a structurally broken response is a typed
     failure.  A page with no download affordance at all is a legitimate
-    link-less outcome and is not a failure.
+    link-less outcome and is not a failure.  An inline download link on an
+    unsupported host costs no request but gets the same unsupported-host
+    disposition as a masked one, under the same ``needs_link`` gate, so a
+    source moving its downloads to a new host is reported by host name.
 
     Returned issues never carry a resolved-but-unvalidated URL: every resolved
     candidate has passed the strict supported-host validator.
@@ -884,8 +936,15 @@ async def resolve_masked_links(
     for issue in issues:
         # Nothing to resolve: an inline URL wins, and a page with no download
         # affordance is legitimately link-less.
-        if issue.limewire_url or not issue.download_key:
+        if issue.limewire_url:
             items.append(issue)
+            continue
+        if not issue.download_key:
+            items.append(issue)
+            # Gated like resolution, so a row already parked (or a stranger)
+            # is not re-disposed every cycle.
+            if issue.unsupported_host and (needs_link is None or needs_link(issue)):
+                batch.unsupported_host.append((issue, issue.unsupported_host))
             continue
         # Already has a usable stored URL; skipping is safe because indexing
         # treats an absent incoming URL as "no information" and never clears

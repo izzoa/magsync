@@ -1,4 +1,4 @@
-"""Tests for `magsync repair-titles` (legacy source format tags)."""
+"""Tests for `magsync repair-titles` (legacy tags and site suffixes)."""
 
 from __future__ import annotations
 
@@ -172,3 +172,45 @@ def test_untagged_library_is_left_alone(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["repair-titles"])
     assert "No titles need repair" in result.output
+
+
+SUFFIXED = "GQ USA Fall 2026 | Magazine PDF"
+
+
+def test_site_suffixed_title_is_repaired_and_its_file_relocated(tmp_path, monkeypatch):
+    # Issues indexed while the scraper missed the source's current og:title
+    # suffix: on a title with no other separator the suffix became part of the
+    # magazine name, so its file landed in a folder of its own.
+    db = tmp_path / "index.db"
+    out = tmp_path / "magazines"
+    monkeypatch.setattr(index_mod, "get_db_path", lambda: db)
+    monkeypatch.setattr(cli_mod, "load_config", lambda: Config(output_dir=str(out)))
+    idx = MagazineIndex(db_path=db)
+    mag = idx.get_or_create_magazine(SUFFIXED, SUFFIXED.lower())
+    idx.add_issues(
+        mag,
+        [{"title": SUFFIXED, "page_url": "https://freemagazines.top/gq-usa-fall-2026/",
+          "limewire_url": LW, "year": 2026}],
+    )
+    issue_id = idx.get_issues()[0]["id"]
+    idx.mark_manual([issue_id])
+    old_file = out / "GQ USA Fall 2026 Magazine PDF" / "GQ USA Fall 2026 Magazine PDF.pdf"
+    old_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"%PDF-1.6 payload")
+    idx.update_download_status(issue_id, DownloadStatus.COMPLETE, file_path=str(old_file))
+    idx.close()
+
+    result = runner.invoke(app, ["repair-titles"])
+    assert result.exit_code == 0, result.output
+
+    idx = MagazineIndex(db_path=db)
+    row = idx.get_issues()[0]
+    assert row["title"] == "GQ USA Fall 2026"
+    assert row["magazine_title"] == "GQ USA Fall"
+    new_file = Path(row["file_path"])
+    assert new_file.exists() and not old_file.exists()
+    assert new_file.parent.name == "GQ USA Fall"
+    assert "Magazine PDF" not in new_file.name
+    titles = [m["title"] for m in idx.get_tracked_magazines()]
+    assert SUFFIXED not in titles  # the emptied suffixed record is pruned
+    idx.close()

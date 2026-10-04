@@ -1497,6 +1497,36 @@ async def test_vk_direct_url_on_a_foreign_host_is_refused(tmp_path, vk_client):
     assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
 
 
+async def test_vk_direct_url_on_the_ru_cdn_is_accepted(tmp_path, vk_client):
+    # VK's .ru viewer names its CDN under vkuserphoto.ru (live, 2026-10).
+    vk_client(page_html=_vk_page_html(
+        "https://psv4.vkuserphoto.ru/s/v1/d/OPAQUE/Magazine.pdf"
+    ))
+
+    result = await dl._download_vk_once(VK_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.success, result.error
+
+
+@pytest.mark.parametrize(
+    "direct",
+    (
+        "https://vkuserphoto.ru.evil.test/steal.pdf",
+        "https://evilvkuserphoto.ru/steal.pdf",
+        "http://psv4.vkuserphoto.ru/s/v1/d/OPAQUE/Magazine.pdf",
+    ),
+)
+async def test_vk_direct_url_ru_cdn_lookalikes_are_refused(
+    tmp_path, vk_client, direct
+):
+    vk_client(page_html=_vk_page_html(direct))
+
+    result = await dl._download_vk_once(VK_PAGE, tmp_path / "Issue.pdf")
+
+    assert not result.success
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+
+
 async def test_vk_resumes_from_local_partial_bytes(tmp_path, vk_client):
     requests: list = []
     vk_client(requests=requests)

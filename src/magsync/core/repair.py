@@ -1,4 +1,7 @@
-"""Repair stored titles that still carry a legacy source format tag.
+"""Repair stored titles that still carry source presentation.
+
+That is a legacy leading format tag (``[PDF] ...``) or the source's trailing
+site suffix (``... | Magazine PDF``).
 
 One implementation serves the standalone ``magsync repair-titles`` command and
 the same command executed by a running daemon or service, so both repair the
@@ -17,7 +20,7 @@ from magsync.core.organizer import (
     organize_path,
     parse_date,
     strip_accents,
-    strip_format_tag,
+    strip_source_decorations,
 )
 
 
@@ -45,7 +48,7 @@ class RepairReport:
 
 
 def repair_titles(index, output_dir: str | Path, *, dry_run: bool = False) -> RepairReport:
-    """Strip legacy tags, re-derive what titles determine, and relocate files.
+    """Strip source decorations, re-derive what titles determine, and relocate files.
 
     Never overwrites an occupied destination, never guesses between two
     files, and is safe to re-run. With ``dry_run`` nothing is written.
@@ -55,13 +58,13 @@ def repair_titles(index, output_dir: str | Path, *, dry_run: bool = False) -> Re
     candidates = [
         row
         for row in index.get_issues_with_tagged_titles()
-        if strip_format_tag(row["title"] or "") != (row["title"] or "")
+        if strip_source_decorations(row["title"] or "") != (row["title"] or "")
     ]
     report.candidates = len(candidates)
     touched_dirs: set[Path] = set()
 
     for row in candidates:
-        new_title = strip_format_tag(row["title"])
+        new_title = strip_source_decorations(row["title"])
         parsed = parse_date(new_title, row["page_url"] or "")
         norm = normalize_title(new_title)
         label = sanitize_external_error(new_title[:56])

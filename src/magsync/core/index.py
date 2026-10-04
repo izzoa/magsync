@@ -724,17 +724,18 @@ class MagazineIndex:
         return {url for url in wanted if url not in linked}
 
     def get_issues_with_tagged_titles(self) -> list[dict]:
-        """Return issues whose stored title still carries a legacy format tag.
+        """Return issues whose stored title may still carry source decorations.
 
-        ``[`` and ``]`` are literal in SQLite ``LIKE``, so this is a coarse
-        prefilter; the caller applies the anchored tag pattern to decide.
+        That is a legacy format tag or the source's site suffix. ``[`` and
+        ``]`` are literal in SQLite ``LIKE``, so this is a coarse prefilter;
+        the caller applies the anchored patterns to decide.
         """
         rows = self.conn.execute(
             """SELECT i.id, i.title, i.page_url, i.magazine_id,
                       d.status AS download_status, d.file_path
                FROM issues i
                LEFT JOIN downloads d ON d.issue_id = i.id
-               WHERE i.title LIKE '[%]%'
+               WHERE i.title LIKE '[%]%' OR i.title LIKE '%|%PDF%'
                ORDER BY i.id"""
         ).fetchall()
         return [dict(row) for row in rows]
@@ -782,17 +783,19 @@ class MagazineIndex:
         return cursor.rowcount == 1
 
     def prune_empty_tagged_magazines(self) -> list[str]:
-        """Delete legacy-tagged magazine rows that have no issues.
+        """Delete source-decorated magazine rows that have no issues.
 
-        Scoped to tagged titles on purpose: a repair should not quietly delete
-        unrelated empty records the user never asked about. Rows go empty
-        either because this repair moved their issues to the correctly-named
-        magazine, or because historical indexing created them and the issues
-        stayed attached elsewhere.
+        Scoped to tagged or site-suffixed titles on purpose: a repair should
+        not quietly delete unrelated empty records the user never asked
+        about. Rows go empty either because this repair moved their issues to
+        the correctly-named magazine, or because historical indexing created
+        them and the issues stayed attached elsewhere.
         """
         rows = self.conn.execute(
             """SELECT id, title FROM magazines
-               WHERE title LIKE '[%]%'
+               WHERE (title LIKE '[%]%'
+                      OR title LIKE '% | Magazine PDF'
+                      OR title LIKE '% | Download Magazine PDF')
                  AND id NOT IN (SELECT DISTINCT magazine_id FROM issues)"""
         ).fetchall()
         if not rows:

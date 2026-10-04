@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -482,6 +482,35 @@ async def test_due_refresh_resolves_masked_link_and_rotates(tmp_path, monkeypatc
     assert outcomes[0]["outcome"].kind is RefreshOutcomeKind.ROTATED
     assert stored["limewire_url"] == FRESH_A
     assert stored["download_status"] == DownloadStatus.PENDING.value
+
+
+async def test_inline_unsupported_host_on_refresh_reparks_on_the_long_backoff(
+    tmp_path, monkeypatch
+):
+    cfg, idx, by_page = _setup(
+        tmp_path,
+        [_row("Moved Host - January 2025", "moved-host-2025", SHARED)],
+    )
+    claimed = await _claim_due_refresh(idx, next(iter(by_page.values())))
+
+    async def fake_scrape(page_url, **kwargs):
+        return ScrapedIssue("Moved", page_url, unsupported_host="easyupload.us")
+
+    monkeypatch.setattr(batch_mod, "scrape_detail_page", fake_scrape)
+    async with FreemagazinesClient(scrape_delay=0) as source_client:
+        outcomes = await refresh_due_links(claimed, idx, source_client)
+
+    stored = idx.get_issues()[0]
+    idx.close()
+
+    # Not NO_LINK: the page does offer a download, just not one we can fetch,
+    # so it keeps a (long) schedule and recovers if the source rehosts.
+    assert outcomes[0]["outcome"].kind is RefreshOutcomeKind.UNSUPPORTED_HOST
+    assert stored["next_action"] == "REFRESH_LINK"
+    retry_at = datetime.fromisoformat(stored["next_retry_at"].replace("Z", "+00:00"))
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    assert retry_at - datetime.now(timezone.utc) > timedelta(days=7)
 
 
 async def test_rejected_key_on_refresh_reparks_as_dead_link(

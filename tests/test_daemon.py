@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -818,6 +819,100 @@ async def test_unsupported_host_is_parked_and_the_cycle_stays_healthy(
     # An unusable destination is an expected outcome, never a fault.
     assert report.status is PipelineStatus.HEALTHY
     assert "mega.example" in caplog.text
+    idx.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_link_on_an_unsupported_host_is_parked_and_named(
+    tmp_path, caplog
+):
+    # The 2026-10 production signature: the source moved downloads to a host
+    # magsync could not use, and every cycle reported only "link-less".
+    idx = MagazineIndex(tmp_path / "index.db")
+    moved = replace(_scraped(), unsupported_host="easyupload.us")
+    source = ScriptedSource(
+        [SourceResult(items=[moved]), SourceResult(items=[moved])]
+    )
+    caplog.set_level(logging.INFO, logger="magsync.daemon-test")
+    cfg = _config(tmp_path, "Magazine")
+
+    first = await cli._run_daemon_cycle(
+        cfg,
+        idx,
+        logger=logging.getLogger("magsync.daemon-test"),
+        source_client_factory=_source_factory(source),
+    )
+
+    row = idx.get_issues()[0]
+    assert row["download_status"] == "unsupported"
+    assert row["next_action"] == "REFRESH_LINK"
+    assert first.issues_unsupported_host == 1
+    assert source.resolutions == []  # inline: costs no resolution request
+    assert "easyupload.us" in caplog.text
+
+    second = await cli._run_daemon_cycle(
+        cfg, idx, source_client_factory=_source_factory(source)
+    )
+
+    # Parked, so not re-disposed (or re-logged) on every cycle.
+    assert second.issues_unsupported_host == 0
+    assert idx.get_issues()[0]["download_status"] == "unsupported"
+    idx.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_inline_row_recovers_when_its_page_links_a_supported_host(
+    tmp_path, monkeypatch
+):
+    idx = MagazineIndex(tmp_path / "index.db")
+    vk = "https://vk.com/s/v1/doc/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    source = ScriptedSource(
+        [
+            SourceResult(items=[replace(_scraped(), unsupported_host="easyupload.us")]),
+            SourceResult(items=[_scraped(url=vk)]),
+        ]
+    )
+    queued: list[str] = []
+
+    async def record_batch(issues, *_args, **_kwargs):
+        queued.extend(issue["limewire_url"] for issue in issues)
+        return []
+
+    monkeypatch.setattr("magsync.core.batch.download_batch", record_batch)
+    cfg = _config(tmp_path, "Magazine")
+
+    await cli._run_daemon_cycle(cfg, idx, source_client_factory=_source_factory(source))
+    assert idx.get_issues()[0]["download_status"] == "unsupported"
+
+    await cli._run_daemon_cycle(cfg, idx, source_client_factory=_source_factory(source))
+
+    # The rehosted link is stored and the parked row becomes claimable work.
+    assert idx.get_issues()[0]["limewire_url"] == vk
+    assert queued == [vk]
+    idx.close()
+
+
+@pytest.mark.asyncio
+async def test_stranger_on_an_unsupported_host_is_neither_parked_nor_counted(
+    tmp_path,
+):
+    idx = MagazineIndex(tmp_path / "index.db")
+    stranger = ScrapedIssue(
+        title="Totally Different Title June 2026",
+        page_url="https://freemagazines.top/stranger-june-2026/",
+        unsupported_host="easyupload.us",
+    )
+    source = ScriptedSource([SourceResult(items=[stranger])])
+
+    report = await cli._run_daemon_cycle(
+        _config(tmp_path, "Magazine"),
+        idx,
+        source_client_factory=_source_factory(source),
+    )
+
+    assert report.issues_unsupported_host == 0
+    assert idx.get_issues()[0]["download_status"] == "pending"
+    assert report.status is PipelineStatus.HEALTHY
     idx.close()
 
 

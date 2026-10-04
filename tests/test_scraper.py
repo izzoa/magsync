@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -174,6 +175,92 @@ def test_no_download_affordance_yields_neither_url_nor_key():
     issue = _parse_detail_page(html, PAGE_URL)
     assert issue.limewire_url is None
     assert issue.download_key is None
+
+
+# Live template as of 2026-10-04: the masked trigger is gone and the post body
+# links its download inline again - VK on its .ru domain for new posts, or
+# easyupload.us on a twin post of the same issue.
+VK_TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdEfGhIjKl"
+
+
+def _post(body: str, *, title: str = "Magazine – October 2026 | Magazine PDF") -> str:
+    return (
+        f'<html><head><meta property="og:title" content="{title}" /></head><body>'
+        '<a href="https://freemagazines.top/">Download Magazines PDF</a>'
+        f'<article><div class="entry-content"><p>Genre: News</p>{body}</div></article>'
+        "</body></html>"
+    )
+
+
+def test_inline_vk_ru_link_is_stored_as_its_vk_com_identity():
+    html = _post(
+        f'<p>Thank you!<br /><a href="https://vk.ru/s/v1/doc/{VK_TOKEN}" '
+        'target="_blank" rel="noopener noreferrer">Download</a></p>'
+    )
+    issue = _parse_detail_page(html, PAGE_URL)
+    assert issue.limewire_url == f"https://vk.com/s/v1/doc/{VK_TOKEN}"
+    assert issue.unsupported_host is None
+
+
+def test_inline_link_on_an_unsupported_host_is_named_by_host_only():
+    html = _post(
+        '<p><a href="https://easyupload.us/W9ENRtDPE9q7fUr/preview">Download PDF</a></p>'
+    )
+    issue = _parse_detail_page(html, PAGE_URL)
+    assert issue.limewire_url is None
+    assert issue.download_key is None
+    assert issue.unsupported_host == "easyupload.us"
+    # The unvalidated URL is never carried anywhere.
+    assert "W9ENRtDPE9q7fUr" not in repr(issue)
+
+
+def test_links_that_are_not_an_external_download_name_no_host():
+    html = _post(
+        '<p><a href="https://freemagazines.top/category/news/">Download more news</a>'
+        '<a href="https://example.org/about">About the publisher</a>'
+        '<a href="/relative/download/">Download</a>'
+        '<a href="mailto:x@example.org">Download by email</a></p>'
+    )
+    assert _parse_detail_page(html, PAGE_URL).unsupported_host is None
+
+
+def test_download_labels_outside_the_post_body_are_ignored():
+    # A sidebar or ad saying "Download" is not the post's download link.
+    html = _post("<p>File Removed</p>").replace(
+        "</body>",
+        '<aside><a href="https://ads.example/x">Download Now</a></aside></body>',
+    )
+    assert _parse_detail_page(html, PAGE_URL).unsupported_host is None
+
+
+def test_removed_file_page_stays_link_less():
+    issue = _parse_detail_page(_post("<p>File Removed</p>"), PAGE_URL)
+    assert issue.limewire_url is None
+    assert issue.download_key is None
+    assert issue.unsupported_host is None
+
+
+def test_malformed_link_on_a_supported_host_is_not_an_unsupported_host():
+    html = _post('<p><a href="https://vk.ru/s/v1/doc/short">Download</a></p>')
+    issue = _parse_detail_page(html, PAGE_URL)
+    assert issue.limewire_url is None
+    assert issue.unsupported_host is None
+
+
+def test_masked_key_wins_over_an_unsupported_inline_link():
+    html = _post(
+        '<p><a href="https://easyupload.us/W9ENRtDPE9q7fUr/preview">Download</a></p>'
+        f"{MASKED_TRIGGER}"
+    )
+    issue = _parse_detail_page(html, PAGE_URL)
+    assert issue.download_key == "dl_key_7d40aadd760489dfd1138c652765a2e8"
+    assert issue.unsupported_host is None
+
+
+@pytest.mark.parametrize("suffix", (" | Magazine PDF", " | Download Magazine PDF"))
+def test_source_title_suffix_is_stripped(suffix):
+    issue = _parse_detail_page(_post("", title=f"GQ USA Fall 2026{suffix}"), PAGE_URL)
+    assert issue.title == "GQ USA Fall 2026"
 
 
 def test_ai_share_data_url_attributes_are_not_mistaken_for_a_key():
@@ -852,6 +939,37 @@ async def test_unsupported_host_is_a_disposition_carrying_only_the_host():
     assert host == "mega.nz"
     # The unvalidated URL is never carried anywhere.
     assert result.items[0].limewire_url is None
+
+
+async def test_inline_unsupported_host_is_a_disposition_without_a_request():
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return _json_response(_ok_payload())
+
+    issue = replace(_issue("twin"), unsupported_host="easyupload.us")
+    async with _source(handler) as source:
+        result = await resolve_masked_links([issue], source)
+
+    assert requests == []
+    assert result.failures == []
+    assert result.unsupported_host == [(issue, "easyupload.us")]
+    # Still indexed, so it is countable and parkable.
+    assert [i.page_url for i in result.items] == [issue.page_url]
+    assert result.items[0].limewire_url is None
+
+
+async def test_inline_unsupported_host_respects_the_need_gate():
+    # A row already parked (or a stranger) must not be re-disposed each cycle.
+    issue = replace(_issue("parked"), unsupported_host="easyupload.us")
+    async with _source(lambda request: _json_response(_ok_payload())) as source:
+        result = await resolve_masked_links(
+            [issue], source, needs_link=lambda candidate: False
+        )
+
+    assert result.unsupported_host == []
+    assert [i.page_url for i in result.items] == [issue.page_url]
 
 
 async def test_malformed_link_on_a_supported_host_is_still_a_failure():

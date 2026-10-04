@@ -109,3 +109,32 @@ class TestEligibility:
             "normalized_title": "getaway",
         }
         assert not matches_subscription(issue, sub("Getaway"))
+
+
+class TestSourceTitleSuffix:
+    """The source's og:title suffix is presentation, never part of a name."""
+
+    SUFFIXED = "GQ USA Fall 2026 | Magazine PDF"
+
+    def test_suffix_never_enters_the_magazine_name(self):
+        from magsync.core.organizer import normalize_title
+
+        assert normalize_title(self.SUFFIXED) == "GQ USA Fall"
+        assert normalize_title("GQ USA Fall 2026 | Download Magazine PDF") == "GQ USA Fall"
+        # A pipe that is real issue detail is still handled as before.
+        assert normalize_title("Wired | May 2026") == "Wired"
+
+    def test_suffixed_stored_title_is_claimable_by_an_exact_subscription(self):
+        # Claim eligibility compares the stored title, which indexing never
+        # rewrites: the suffix must not block an exact subscription.
+        assert title_match(self.SUFFIXED, sub("GQ USA Fall", exact=True))
+
+    def test_suffix_never_enters_the_file_path(self):
+        from magsync.core.organizer import organize_path
+
+        suffixed = organize_path(
+            "The Economist USA – October 3 2026 | Magazine PDF", "", "/lib"
+        )
+        clean = organize_path("The Economist USA – October 3 2026", "", "/lib")
+        assert suffixed == clean
+        assert "Magazine PDF" not in str(suffixed)

@@ -162,6 +162,11 @@ VK_SIGNED = "https://vk.com/s/v1/doc/IYhNWdakfNcTozOeCSozNjjRzWNjANjlupNRyVggSMi
         (VK_SIGNED, VK_SIGNED),
         ("https://www.vk.com/s/v2/doc/hENiSnBiNVGcayUVNk-tNmiDwUHNPyKNnWxEUuYndOcODbo",
          "https://vk.com/s/v2/doc/hENiSnBiNVGcayUVNk-tNmiDwUHNPyKNnWxEUuYndOcODbo"),
+        # The source links new posts on VK's .ru domain (live, 2026-10). It
+        # serves the same document, so it shares the one vk.com identity.
+        (VK_SIGNED.replace("vk.com", "vk.ru"), VK_SIGNED),
+        (VK_SIGNED.replace("vk.com", "www.vk.ru"), VK_SIGNED),
+        ("https://VK.RU:443/doc711807114_676564963", VK_DOC),
     ),
 )
 def test_vk_normalization_accepts_only_canonical_forms(candidate, normalized):
@@ -200,6 +205,15 @@ def test_vk_normalization_accepts_only_canonical_forms(candidate, normalized):
         "https://psv4.userapi.com/s/v1/d/abc/File.pdf",
         " https://vk.com/doc1_2",
         "",
+        # The .ru domain gets exactly the same strictness.
+        "http://vk.ru/doc1_2",
+        "https://notvk.ru/doc1_2",
+        "https://vk.ru.evil.test/doc1_2",
+        "https://vk.ru./doc1_2",
+        "https://m.vk.ru/doc1_2",
+        "https://vk.ru/s/v1/doc/short",
+        "https://vk.ru/s/v1/d/abcdefghijklmnopqrst/File.pdf",
+        "https://psv4.vkuserphoto.ru/s/v1/d/abc/File.pdf",
     ),
 )
 def test_vk_validation_rejects_unsafe_or_ambiguous_forms(candidate):
@@ -212,6 +226,7 @@ def test_vk_validation_rejects_unsafe_or_ambiguous_forms(candidate):
 def test_download_host_dispatch_selects_the_right_backend():
     assert download_host_of("https://limewire.com/d/AbC12#key") is DownloadHost.LIMEWIRE
     assert download_host_of(VK_DOC) is DownloadHost.VK
+    assert download_host_of(VK_SIGNED.replace("vk.com", "vk.ru")) is DownloadHost.VK
 
 
 @pytest.mark.parametrize(

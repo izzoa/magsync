@@ -171,6 +171,16 @@ async def _refresh_link_from_page(
             return RefreshOutcome(RefreshOutcomeKind.DEAD_LINK)
         detail.limewire_url = resolution.url
 
+    if not detail.limewire_url and detail.unsupported_host:
+        # An inline link on a host we cannot retrieve from: re-park on the
+        # long backoff, exactly as for a masked link resolving there.
+        logger.info(
+            "Link refresh for %s found a download on unsupported host %s",
+            title,
+            detail.unsupported_host,
+        )
+        return RefreshOutcome(RefreshOutcomeKind.UNSUPPORTED_HOST)
+
     if not detail.limewire_url:
         logger.info("Link refresh found no download link for %s", title)
         return RefreshOutcome(RefreshOutcomeKind.NO_LINK)
