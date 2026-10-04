@@ -829,7 +829,7 @@ async def test_inline_link_on_an_unsupported_host_is_parked_and_named(
     # The 2026-10 production signature: the source moved downloads to a host
     # magsync could not use, and every cycle reported only "link-less".
     idx = MagazineIndex(tmp_path / "index.db")
-    moved = replace(_scraped(), unsupported_host="easyupload.us")
+    moved = replace(_scraped(), unsupported_host="files.example")
     source = ScriptedSource(
         [SourceResult(items=[moved]), SourceResult(items=[moved])]
     )
@@ -848,7 +848,7 @@ async def test_inline_link_on_an_unsupported_host_is_parked_and_named(
     assert row["next_action"] == "REFRESH_LINK"
     assert first.issues_unsupported_host == 1
     assert source.resolutions == []  # inline: costs no resolution request
-    assert "easyupload.us" in caplog.text
+    assert "files.example" in caplog.text
 
     second = await cli._run_daemon_cycle(
         cfg, idx, source_client_factory=_source_factory(source)
@@ -861,14 +861,22 @@ async def test_inline_link_on_an_unsupported_host_is_parked_and_named(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "link",
+    (
+        "https://vk.com/s/v1/doc/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+        # Rows 0.9.1 parked on easyupload recover once it is supported.
+        "https://easyupload.us/W9ENRtDPE9q7fUr/preview",
+    ),
+)
 async def test_parked_inline_row_recovers_when_its_page_links_a_supported_host(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, link
 ):
     idx = MagazineIndex(tmp_path / "index.db")
-    vk = "https://vk.com/s/v1/doc/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    vk = link
     source = ScriptedSource(
         [
-            SourceResult(items=[replace(_scraped(), unsupported_host="easyupload.us")]),
+            SourceResult(items=[replace(_scraped(), unsupported_host="files.example")]),
             SourceResult(items=[_scraped(url=vk)]),
         ]
     )
@@ -900,7 +908,7 @@ async def test_stranger_on_an_unsupported_host_is_neither_parked_nor_counted(
     stranger = ScrapedIssue(
         title="Totally Different Title June 2026",
         page_url="https://freemagazines.top/stranger-june-2026/",
-        unsupported_host="easyupload.us",
+        unsupported_host="files.example",
     )
     source = ScriptedSource([SourceResult(items=[stranger])])
 

@@ -9,12 +9,14 @@ from magsync.core.urls import (
     DownloadHost,
     URLValidationError,
     download_host_of,
+    easyupload_file_id,
     is_valid_download_url,
     is_valid_limewire_share_url,
     is_valid_source_url,
     is_valid_vk_document_url,
     limewire_sharing_id,
     normalize_download_url,
+    normalize_easyupload_url,
     normalize_limewire_share_url,
     normalize_source_url,
     normalize_vk_document_url,
@@ -243,6 +245,62 @@ def test_unsupported_host_is_refused_by_dispatch(candidate):
     assert not is_valid_download_url(candidate)
     with pytest.raises(URLValidationError):
         download_host_of(candidate)
+
+
+# ---------------------------------------------------------------------------
+# easyupload preview URLs
+# ---------------------------------------------------------------------------
+
+EU_PAGE = "https://easyupload.us/W9ENRtDPE9q7fUr/preview"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        EU_PAGE,
+        "https://www.easyupload.us/W9ENRtDPE9q7fUr/preview",
+        "https://EASYUPLOAD.US:443/W9ENRtDPE9q7fUr/preview",
+        # The same page under its alias, and a fragment, share one identity.
+        "https://easyupload.us/W9ENRtDPE9q7fUr/preview-pro",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/preview#page=2",
+    ),
+)
+def test_easyupload_preview_forms_normalize_to_one_identity(candidate):
+    assert normalize_easyupload_url(candidate) == EU_PAGE
+    assert normalize_download_url(candidate) == EU_PAGE
+    assert download_host_of(candidate) is DownloadHost.EASYUPLOAD
+    assert easyupload_file_id(candidate) == "W9ENRtDPE9q7fUr"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        # Not a preview page: a 404, a page without the handshake, and the
+        # ephemeral signed file URL.
+        "https://easyupload.us/W9ENRtDPE9q7fUr",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/file",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/preview/",
+        "https://easyupload.us/download/abcdef/ghijkl/File.pdf",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/download/create",
+        # Unsafe or ambiguous ids, queries, and transport.
+        "https://easyupload.us/short/preview",
+        "https://easyupload.us/W9EN-RtDPE9q7fUr/preview",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/preview?dl=1",
+        "http://easyupload.us/W9ENRtDPE9q7fUr/preview",
+        "https://user@easyupload.us/W9ENRtDPE9q7fUr/preview",
+        "https://easyupload.us:8443/W9ENRtDPE9q7fUr/preview",
+        "https://easyupload.us./W9ENRtDPE9q7fUr/preview",
+        # Lookalike hosts never select the backend.
+        "https://easyupload.us.evil.test/W9ENRtDPE9q7fUr/preview",
+        "https://noteasyupload.us/W9ENRtDPE9q7fUr/preview",
+        "https://cdn.easyupload.us/W9ENRtDPE9q7fUr/preview",
+    ),
+)
+def test_easyupload_rejects_unsafe_or_non_page_forms(candidate):
+    assert not is_valid_download_url(candidate)
+    with pytest.raises(URLValidationError):
+        normalize_download_url(candidate)
 
 
 def test_dispatch_still_enforces_each_hosts_strict_form():

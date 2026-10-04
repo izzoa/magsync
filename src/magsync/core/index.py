@@ -66,8 +66,11 @@ def _plausible_download_url(url: str) -> bool:
 
 def _sharing_id(url: str) -> str:
     """Best-effort sharing-ID extraction for log lines (never the fragment)."""
-    path = urlparse(url).path
-    return path.rstrip("/").rsplit("/", 1)[-1] or "?"
+    segments = [s for s in urlparse(url).path.split("/") if s]
+    # An easyupload page names its file id before the "/preview" page segment.
+    if len(segments) > 1 and segments[-1] == "preview":
+        segments.pop()
+    return segments[-1] if segments else "?"
 
 
 # Keep IN-clause parameter counts under SQLite's host-parameter limit

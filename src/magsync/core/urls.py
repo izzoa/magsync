@@ -5,6 +5,9 @@ access token.  Callers may use the normalized full URL as an internal
 retry/single-flight identity, but must never write that identity to logs or
 persisted diagnostic text.
 
+An easyupload preview URL names a public page and carries no secret, but is
+held to the same strict form.
+
 The source serves download links from more than one file host, so a stored
 download URL is validated against a *supported host* rather than one host: see
 :func:`normalize_download_url`.  Shared safety rules (HTTPS, no credentials, no
@@ -23,6 +26,7 @@ LIMEWIRE_HOSTS = frozenset({"limewire.com", "www.limewire.com"})
 # VK serves the same documents from its .ru domain, which the source switched
 # to for new posts. Both normalize to vk.com, so a document has one identity.
 VK_HOSTS = frozenset({"vk.com", "www.vk.com", "vk.ru", "www.vk.ru"})
+EASYUPLOAD_HOSTS = frozenset({"easyupload.us", "www.easyupload.us"})
 SOURCE_HOSTS = frozenset({"freemagazines.top", "www.freemagazines.top"})
 
 # VK names a document two ways, and the source's endpoint returns both:
@@ -40,6 +44,13 @@ _VK_SIGNED_DOC_PATH_RE = re.compile(r"^/s/v\d{1,3}/doc/[A-Za-z0-9_-]{16,128}$")
 # token and is treated as secret material.
 _VK_ALLOWED_QUERY_KEYS = frozenset({"hash"})
 
+# easyupload names a file by an opaque alphanumeric id. Only its preview pages
+# carry the token the download handshake needs, so only those are a stored
+# identity; "/preview-pro" is the same page and is canonicalized to it. A bare
+# "/<id>" is a 404, "/<id>/file" has no handshake, and "/download/..." is the
+# ephemeral signed file URL.
+_EASYUPLOAD_PAGE_PATH_RE = re.compile(r"^/([A-Za-z0-9]{8,64})/(?:preview|preview-pro)$")
+
 
 class DownloadHost(str, Enum):
     """A file host magsync can retrieve a payload from.
@@ -50,6 +61,7 @@ class DownloadHost(str, Enum):
 
     LIMEWIRE = "limewire"
     VK = "vk"
+    EASYUPLOAD = "easyupload"
 
 
 class URLValidationError(ValueError):
@@ -193,11 +205,37 @@ def is_valid_vk_document_url(url: str | None) -> bool:
     return True
 
 
+def normalize_easyupload_url(url: str) -> str:
+    """Validate and return the canonical easyupload preview URL.
+
+    Strict form: HTTPS, exact ``easyupload.us`` host (optionally ``www.``), a
+    path naming one file's preview page - ``/<id>/preview`` or its
+    ``/<id>/preview-pro`` alias - and no query. Canonicalized to
+    ``https://easyupload.us/<id>/preview``; any fragment is dropped.
+    """
+
+    parsed = _split_https_url(url, allowed_hosts=EASYUPLOAD_HOSTS)
+    match = _EASYUPLOAD_PAGE_PATH_RE.match(parsed.path)
+    if not match:
+        raise URLValidationError("easyupload path must be /<id>/preview")
+    if parsed.query:
+        raise URLValidationError("easyupload URL query is not allowed")
+    return urlunsplit(("https", "easyupload.us", f"/{match.group(1)}/preview", "", ""))
+
+
+def easyupload_file_id(url: str) -> str:
+    """Return the validated file id of an easyupload preview URL."""
+
+    normalized = normalize_easyupload_url(url)
+    return urlsplit(normalized).path.split("/")[1]
+
+
 # Per-host strict validators, in dispatch order. Adding a backend is an entry
 # here plus a downloader dispatch arm.
 _DOWNLOAD_HOSTS: tuple[tuple[DownloadHost, frozenset[str], object], ...] = (
     (DownloadHost.LIMEWIRE, LIMEWIRE_HOSTS, normalize_limewire_share_url),
     (DownloadHost.VK, VK_HOSTS, normalize_vk_document_url),
+    (DownloadHost.EASYUPLOAD, EASYUPLOAD_HOSTS, normalize_easyupload_url),
 )
 
 

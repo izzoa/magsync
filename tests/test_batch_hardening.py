@@ -494,7 +494,7 @@ async def test_inline_unsupported_host_on_refresh_reparks_on_the_long_backoff(
     claimed = await _claim_due_refresh(idx, next(iter(by_page.values())))
 
     async def fake_scrape(page_url, **kwargs):
-        return ScrapedIssue("Moved", page_url, unsupported_host="easyupload.us")
+        return ScrapedIssue("Moved", page_url, unsupported_host="files.example")
 
     monkeypatch.setattr(batch_mod, "scrape_detail_page", fake_scrape)
     async with FreemagazinesClient(scrape_delay=0) as source_client:

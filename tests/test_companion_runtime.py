@@ -144,7 +144,7 @@ async def test_capacity_pauses_without_evicting_and_resumes(api):
 
 async def test_unknown_size_stream_limit(tmp_path):
     import httpx
-    from magsync.core.downloader import _stream_vk_payload, download_byte_limit, DownloadPipelineError
+    from magsync.core.downloader import _stream_plain_payload, download_byte_limit, DownloadPipelineError
     class Bytes(httpx.AsyncByteStream):
         async def __aiter__(self):
             yield b'1234'
@@ -154,7 +154,7 @@ async def test_unknown_size_stream_limit(tmp_path):
     try:
         async with httpx.AsyncClient(transport=transport) as client:
             with pytest.raises(DownloadPipelineError):
-                await _stream_vk_payload(client,'https://vk.com/doc1_2',tmp_path/'part')
+                await _stream_plain_payload(client,'https://vk.com/doc1_2',tmp_path/'part')
         assert (tmp_path/'part').stat().st_size<=5
     finally:
         download_byte_limit.reset(token)

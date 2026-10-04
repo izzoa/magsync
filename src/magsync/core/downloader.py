@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -36,6 +37,7 @@ from magsync.core.urls import (
     DownloadHost,
     URLValidationError,
     download_host_of,
+    easyupload_file_id,
     is_supported_download_host,
     normalize_download_url,
     normalize_limewire_share_url,
@@ -1050,14 +1052,18 @@ async def _resolve_vk_direct_url(client: httpx.AsyncClient, page_url: str) -> st
     return direct
 
 
-async def _stream_vk_payload(
+async def _stream_plain_payload(
     client: httpx.AsyncClient,
     direct_url: str,
     part_path: Path,
     *,
     on_progress: callable | None = None,
+    host: str = "VK",
 ) -> int | None:
-    """Stream a VK payload into ``part_path``, resuming from local bytes.
+    """Stream a plain (unencrypted) payload into ``part_path``, resuming.
+
+    Shared by every host whose file needs no decryption; ``host`` only labels
+    diagnostics.
 
     Returns the object's own reported total when the host provides one, which
     is the only authority for judging completeness. The response status is
@@ -1073,13 +1079,13 @@ async def _stream_vk_payload(
         if status == 429:
             raise DownloadPipelineError(
                 DownloadFailureKind.TRANSIENT,
-                "VK payload request was rate limited",
+                f"{host} payload request was rate limited",
                 retry_after=_parse_retry_after(stream),
             )
         if status >= 500:
             raise DownloadPipelineError(
                 DownloadFailureKind.TRANSIENT,
-                f"VK payload returned HTTP {status}",
+                f"{host} payload returned HTTP {status}",
             )
         if status == 416:
             # The local partial already covers the whole object. Trust the
@@ -1102,14 +1108,14 @@ async def _stream_vk_payload(
                 # A mis-offset splice would silently corrupt the file.
                 raise DownloadPipelineError(
                     DownloadFailureKind.TRANSIENT,
-                    "VK range response offset did not match the local partial file",
+                    f"{host} range response offset did not match the local partial file",
                 )
             mode = "ab"
             written = existing
         else:
             raise DownloadPipelineError(
                 DownloadFailureKind.SHARE_UNAVAILABLE,
-                f"VK payload returned HTTP {status}",
+                f"{host} payload returned HTTP {status}",
             )
 
         _check_download_size(total or 0)
@@ -1134,15 +1140,15 @@ def _int_or_none(value: str | None) -> int | None:
         return None
 
 
-def _finalize_vk_download(
-    part_path: Path, dest: Path, expected_total: int | None
+def _finalize_plain_download(
+    part_path: Path, dest: Path, expected_total: int | None, *, host: str = "VK"
 ) -> DownloadResult:
-    """Validate, deduplicate, and place a completed VK payload."""
+    """Validate, deduplicate, and place a completed plain payload."""
     if not part_path.exists():
         return DownloadResult(
             success=False,
             failure_kind=DownloadFailureKind.INTERNAL,
-            error="VK download produced no file",
+            error=f"{host} download produced no file",
         )
 
     size = part_path.stat().st_size
@@ -1151,7 +1157,7 @@ def _finalize_vk_download(
         return DownloadResult(
             success=False,
             failure_kind=DownloadFailureKind.TRANSIENT,
-            error="VK download was incomplete",
+            error=f"{host} download was incomplete",
         )
 
     with part_path.open("rb") as handle:
@@ -1225,7 +1231,7 @@ async def _download_vk_once(
             headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
             direct_url = await _resolve_vk_direct_url(client, page_url)
-            expected_total = await _stream_vk_payload(
+            expected_total = await _stream_plain_payload(
                 client, direct_url, part_path, on_progress=on_progress
             )
     except DownloadPipelineError as exc:
@@ -1247,7 +1253,202 @@ async def _download_vk_once(
             error=sanitize_external_error(f"VK download could not be written: {exc}"),
         )
 
-    return _finalize_vk_download(part_path, dest, expected_total)
+    return _finalize_plain_download(part_path, dest, expected_total)
+
+
+# easyupload hands out its file URL only through a session-bound, CSRF-checked
+# handshake on the file's own preview page. The request target is built from
+# the validated stored id - never read from the page - and the file URL it
+# returns must stay on easyupload's own origin under /download/.
+_EASYUPLOAD_ORIGIN = "https://easyupload.us"
+_EASYUPLOAD_FILE_HOSTS = frozenset({"easyupload.us", "www.easyupload.us"})
+_EASYUPLOAD_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_.:-]{16,256}")
+# A 419 means the session and its token went stale; one fresh handshake
+# within the attempt is cheap, and the retry budget covers anything beyond.
+_EASYUPLOAD_HANDSHAKES = 2
+
+
+def _extract_easyupload_token(html: str) -> str | None:
+    """Return the page's CSRF token, bounded to a safe charset, or ``None``."""
+    meta = BeautifulSoup(html, "html.parser").find("meta", attrs={"name": "csrf-token"})
+    raw = meta.get("content") if meta is not None else None
+    if isinstance(raw, str) and _EASYUPLOAD_TOKEN_RE.fullmatch(raw.strip()):
+        return raw.strip()
+    return None
+
+
+def _valid_easyupload_file_url(candidate: object) -> str | None:
+    """Return an https easyupload ``/download/...`` URL, or ``None``.
+
+    The signed URL is ephemeral and is never persisted or logged; this only
+    keeps a response-supplied value from redirecting retrieval elsewhere.
+    """
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme.lower() != "https" or port not in (None, 443):
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if (parsed.hostname or "").lower() not in _EASYUPLOAD_FILE_HOSTS:
+        return None
+    if not parsed.path.startswith("/download/"):
+        return None
+    return candidate
+
+
+def _raise_for_easyupload_status(response: httpx.Response, what: str) -> None:
+    """Map a non-success easyupload response onto a typed failure."""
+    status = response.status_code
+    if status == 429:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"easyupload {what} rate limited",
+            retry_after=_parse_retry_after(response),
+        )
+    if status >= 500:
+        raise DownloadPipelineError(
+            DownloadFailureKind.TRANSIENT,
+            f"easyupload {what} returned HTTP {status}",
+        )
+    if not 200 <= status < 300:
+        # Removed (404/410) or gated: terminal here, because magsync never
+        # authenticates to a file host.
+        raise DownloadPipelineError(
+            DownloadFailureKind.SHARE_UNAVAILABLE,
+            f"easyupload {what} returned HTTP {status}",
+        )
+
+
+async def _resolve_easyupload_direct_url(
+    client: httpx.AsyncClient, page_url: str
+) -> str:
+    """Derive the ephemeral file URL through the preview page's handshake.
+
+    Called on every attempt with an attempt-scoped client, so the session
+    cookie lives exactly as long as the attempt and the signed URL's lifetime
+    never has to be assumed or tracked.
+    """
+    create_url = f"{_EASYUPLOAD_ORIGIN}/{easyupload_file_id(page_url)}/download/create"
+    for handshake in range(1, _EASYUPLOAD_HANDSHAKES + 1):
+        try:
+            page = await client.get(page_url)
+        except httpx.RequestError as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                f"easyupload page request failed: {exc}",
+            ) from exc
+        _raise_for_easyupload_status(page, "page")
+        token = _extract_easyupload_token(page.text)
+        if token is None:
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "easyupload page advertised no download token",
+            )
+
+        try:
+            response = await client.post(
+                create_url,
+                data={"_token": token},
+                headers={
+                    "X-CSRF-TOKEN": token,
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": page_url,
+                },
+            )
+        except httpx.RequestError as exc:
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                f"easyupload download request failed: {exc}",
+            ) from exc
+        if response.status_code == 419:
+            if handshake < _EASYUPLOAD_HANDSHAKES:
+                continue
+            raise DownloadPipelineError(
+                DownloadFailureKind.TRANSIENT,
+                "easyupload download session expired",
+            )
+        _raise_for_easyupload_status(response, "download request")
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "easyupload download response was not a JSON object",
+            )
+        if payload.get("type") != "success":
+            raise DownloadPipelineError(
+                DownloadFailureKind.SHARE_UNAVAILABLE,
+                "easyupload reported the file as unavailable",
+            )
+        direct = _valid_easyupload_file_url(payload.get("download_link"))
+        if direct is None:
+            # A typed failure, never a silent skip, and no byte is requested
+            # from a link that left easyupload's own origin.
+            raise DownloadPipelineError(
+                DownloadFailureKind.METADATA_INVALID,
+                "easyupload download response named no usable file URL",
+            )
+        return direct
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def _download_easyupload_once(
+    page_url: str,
+    dest: Path,
+    *,
+    on_progress: callable | None = None,
+    rate_gate: RateLimitGate | None = None,
+) -> DownloadResult:
+    """One easyupload retrieval attempt: handshake, stream, validate, place.
+
+    A plain file like VK's: no key derivation and no decryption. The signed
+    file URL is derived fresh on every attempt and is never persisted or
+    logged.
+    """
+    part_path = _part_path_for(dest, page_url)
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=120.0,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            direct_url = await _resolve_easyupload_direct_url(client, page_url)
+            expected_total = await _stream_plain_payload(
+                client,
+                direct_url,
+                part_path,
+                on_progress=on_progress,
+                host="easyupload",
+            )
+    except DownloadPipelineError as exc:
+        if exc.kind is DownloadFailureKind.TRANSIENT and exc.retry_after and rate_gate:
+            await rate_gate.trigger(exc.retry_after, reason="easyupload rate limited (429)")
+        return DownloadResult(success=False, failure_kind=exc.kind, error=str(exc))
+    except httpx.RequestError as exc:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.TRANSIENT,
+            error=sanitize_external_error(f"easyupload download failed: {exc}"),
+        )
+    except OSError as exc:
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error=sanitize_external_error(
+                f"easyupload download could not be written: {exc}"
+            ),
+        )
+
+    return _finalize_plain_download(part_path, dest, expected_total, host="easyupload")
 
 
 async def download_and_decrypt(
@@ -1262,8 +1463,8 @@ async def download_and_decrypt(
     """Full pipeline: retrieve a payload from its file host and store it.
 
     The backend is selected from the stored URL's host: a LimeWire share goes
-    through key derivation and decryption, a VK document is a plain file that
-    needs neither. Everything around dispatch - the retry budget, the shared
+    through key derivation and decryption, while a VK document and an
+    easyupload file are plain files that need neither. Everything around dispatch - the retry budget, the shared
     rate gate, failure policy, deduplication, and placement - is shared.
 
     Retries transient errors with exponential backoff. 429 responses
@@ -1328,6 +1529,10 @@ async def download_and_decrypt(
 
         if host is DownloadHost.VK:
             result = await _download_vk_once(
+                normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate
+            )
+        elif host is DownloadHost.EASYUPLOAD:
+            result = await _download_easyupload_once(
                 normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate
             )
         else:

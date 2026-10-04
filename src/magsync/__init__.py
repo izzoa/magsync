@@ -1,3 +1,3 @@
 """magsync - CLI/TUI tool for indexing and downloading magazines."""
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"

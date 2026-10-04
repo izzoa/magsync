@@ -179,7 +179,7 @@ def test_no_download_affordance_yields_neither_url_nor_key():
 
 # Live template as of 2026-10-04: the masked trigger is gone and the post body
 # links its download inline again - VK on its .ru domain for new posts, or
-# easyupload.us on a twin post of the same issue.
+# easyupload.us (supported since 0.9.2) on a twin post of the same issue.
 VK_TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdEfGhIjKl"
 
 
@@ -204,14 +204,24 @@ def test_inline_vk_ru_link_is_stored_as_its_vk_com_identity():
 
 def test_inline_link_on_an_unsupported_host_is_named_by_host_only():
     html = _post(
-        '<p><a href="https://easyupload.us/W9ENRtDPE9q7fUr/preview">Download PDF</a></p>'
+        '<p><a href="https://files.example/W9ENRtDPE9q7fUr/get">Download PDF</a></p>'
     )
     issue = _parse_detail_page(html, PAGE_URL)
     assert issue.limewire_url is None
     assert issue.download_key is None
-    assert issue.unsupported_host == "easyupload.us"
+    assert issue.unsupported_host == "files.example"
     # The unvalidated URL is never carried anywhere.
     assert "W9ENRtDPE9q7fUr" not in repr(issue)
+
+
+def test_inline_easyupload_link_is_stored_in_its_canonical_form():
+    html = _post(
+        '<p><a href="https://www.easyupload.us/W9ENRtDPE9q7fUr/preview-pro">'
+        "Download PDF</a></p>"
+    )
+    issue = _parse_detail_page(html, PAGE_URL)
+    assert issue.limewire_url == "https://easyupload.us/W9ENRtDPE9q7fUr/preview"
+    assert issue.unsupported_host is None
 
 
 def test_links_that_are_not_an_external_download_name_no_host():
@@ -249,7 +259,7 @@ def test_malformed_link_on_a_supported_host_is_not_an_unsupported_host():
 
 def test_masked_key_wins_over_an_unsupported_inline_link():
     html = _post(
-        '<p><a href="https://easyupload.us/W9ENRtDPE9q7fUr/preview">Download</a></p>'
+        '<p><a href="https://files.example/W9ENRtDPE9q7fUr/get">Download</a></p>'
         f"{MASKED_TRIGGER}"
     )
     issue = _parse_detail_page(html, PAGE_URL)
@@ -948,13 +958,13 @@ async def test_inline_unsupported_host_is_a_disposition_without_a_request():
         requests.append(request.url.path)
         return _json_response(_ok_payload())
 
-    issue = replace(_issue("twin"), unsupported_host="easyupload.us")
+    issue = replace(_issue("twin"), unsupported_host="files.example")
     async with _source(handler) as source:
         result = await resolve_masked_links([issue], source)
 
     assert requests == []
     assert result.failures == []
-    assert result.unsupported_host == [(issue, "easyupload.us")]
+    assert result.unsupported_host == [(issue, "files.example")]
     # Still indexed, so it is countable and parkable.
     assert [i.page_url for i in result.items] == [issue.page_url]
     assert result.items[0].limewire_url is None
@@ -962,7 +972,7 @@ async def test_inline_unsupported_host_is_a_disposition_without_a_request():
 
 async def test_inline_unsupported_host_respects_the_need_gate():
     # A row already parked (or a stranger) must not be re-disposed each cycle.
-    issue = replace(_issue("parked"), unsupported_host="easyupload.us")
+    issue = replace(_issue("parked"), unsupported_host="files.example")
     async with _source(lambda request: _json_response(_ok_payload())) as source:
         result = await resolve_masked_links(
             [issue], source, needs_link=lambda candidate: False

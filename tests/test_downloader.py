@@ -1429,7 +1429,7 @@ def vk_client(monkeypatch):
 def _isolated_download_env(monkeypatch, tmp_path):
     """Keep VK finalization off the real user index and rate gate.
 
-    ``_finalize_vk_download`` consults the index for content deduplication, so
+    ``_finalize_plain_download`` consults the index for content deduplication, so
     without this the suite would read the developer's own ~/.magsync database.
     """
     import magsync.core.index as index_mod
@@ -1677,3 +1677,342 @@ async def test_dispatch_refuses_an_unsupported_host_without_requesting_bytes(
     assert result.failure_kind is DownloadFailureKind.UNSUPPORTED
     assert result.unsupported is True
     assert "mega.nz" in (result.error or "")
+
+
+
+# ---------------------------------------------------------------------------
+# easyupload backend: a session-bound CSRF handshake, then a plain file
+# ---------------------------------------------------------------------------
+
+EU_ID = "W9ENRtDPE9q7fUr"
+EU_PAGE = f"https://easyupload.us/{EU_ID}/preview"
+EU_TOKEN = "jpcVfEd6VbM1X80pFc4RzgmUIu1eygD4dJUEUUSU"
+EU_FILE = "https://easyupload.us/download/SIGNEDaaaa/SIGNEDbbbb/Magazine.pdf"
+
+
+def _eu_page_html(token: str | None = EU_TOKEN, create: str | None = None) -> str:
+    meta = f'<meta name="csrf-token" content="{token}">' if token else ""
+    script = (
+        f'<script>const CREATE_DOWNLOAD_URL = "{create}";</script>' if create else ""
+    )
+    return f"<html><head>{meta}</head><body>{script}</body></html>"
+
+
+def _eu_transport(
+    *,
+    page_status: int = 200,
+    page_html: str | None = None,
+    create_responses: list | None = None,
+    body: bytes = PDF_BODY,
+    honor_range: bool = True,
+    requests: list | None = None,
+):
+    """Script the preview page, the create handshake, and the signed file."""
+
+    html = _eu_page_html() if page_html is None else page_html
+    pending = list(create_responses or [])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
+        path = request.url.path
+        if request.method == "GET" and path == f"/{EU_ID}/preview":
+            return httpx.Response(
+                page_status,
+                text=html,
+                headers={
+                    "content-type": "text/html",
+                    "set-cookie": "filebob_user_session=sess123; path=/; httponly",
+                },
+            )
+        if request.method == "POST" and path == f"/{EU_ID}/download/create":
+            if pending:
+                return pending.pop(0)
+            return httpx.Response(
+                200, json={"type": "success", "download_link": EU_FILE}
+            )
+        if request.method == "GET" and path.startswith("/download/"):
+            rng = request.headers.get("range")
+            if rng and honor_range:
+                start = int(rng.split("=")[1].split("-")[0])
+                return httpx.Response(
+                    206,
+                    content=body[start:],
+                    headers={
+                        "content-type": "application/pdf",
+                        "content-range": f"bytes {start}-{len(body) - 1}/{len(body)}",
+                    },
+                )
+            return httpx.Response(
+                200,
+                content=body,
+                headers={
+                    "content-type": "application/pdf",
+                    "content-length": str(len(body)),
+                },
+            )
+        return httpx.Response(404, text="not found")
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.fixture
+def eu_client(monkeypatch):
+    """Route the downloader's own client at a scripted easyupload transport."""
+
+    def install(**kwargs):
+        transport = _eu_transport(**kwargs)
+        real = _REAL_ASYNC_CLIENT
+
+        def factory(*args, **client_kwargs):
+            client_kwargs.pop("transport", None)
+            return real(*args, transport=transport, **client_kwargs)
+
+        monkeypatch.setattr(dl.httpx, "AsyncClient", factory)
+        return transport
+
+    return install
+
+
+def _posts(requests: list) -> list:
+    return [r for r in requests if r.method == "POST"]
+
+
+async def test_easyupload_file_downloads_through_the_handshake(tmp_path, eu_client):
+    requests: list = []
+    eu_client(requests=requests)
+    dest = tmp_path / "Issue.pdf"
+
+    result = await dl._download_easyupload_once(EU_PAGE, dest)
+
+    assert result.success, result.error
+    assert dest.read_bytes() == PDF_BODY
+    assert result.sha256 == hashlib.sha256(PDF_BODY).hexdigest()
+    (create,) = _posts(requests)
+    # The CSRF token travels as header and form field, inside the session.
+    assert create.headers["x-csrf-token"] == EU_TOKEN
+    assert f"_token={EU_TOKEN}" in create.content.decode()
+    assert "filebob_user_session=sess123" in create.headers.get("cookie", "")
+    for request in requests:
+        assert "authorization" not in request.headers
+
+
+async def test_easyupload_create_target_is_built_from_the_id_not_the_page(
+    tmp_path, eu_client
+):
+    # A page-named endpoint is never followed: the target comes from the id
+    # that strict validation already accepted.
+    requests: list = []
+    eu_client(
+        requests=requests,
+        page_html=_eu_page_html(create="https://evil.test/steal/download/create"),
+    )
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.success, result.error
+    (create,) = _posts(requests)
+    assert str(create.url) == f"https://easyupload.us/{EU_ID}/download/create"
+    assert all(r.url.host == "easyupload.us" for r in requests)
+
+
+async def test_easyupload_signed_url_is_never_reported_or_logged(
+    tmp_path, eu_client, caplog
+):
+    eu_client()
+    caplog.set_level(logging.DEBUG, logger="magsync")
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.success
+    assert "SIGNED" not in caplog.text
+    assert "SIGNED" not in str(result.file_path)
+
+
+@pytest.mark.parametrize("status", (404, 410))
+async def test_easyupload_removed_page_is_unavailable_without_a_handshake(
+    tmp_path, eu_client, status
+):
+    requests: list = []
+    eu_client(page_status=status, requests=requests)
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.SHARE_UNAVAILABLE
+    assert _posts(requests) == []
+
+
+async def test_easyupload_stale_session_is_retried_once_within_the_attempt(
+    tmp_path, eu_client
+):
+    requests: list = []
+    eu_client(requests=requests, create_responses=[httpx.Response(419)])
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.success, result.error
+    assert len(_posts(requests)) == 2
+    pages = [r for r in requests if r.method == "GET" and r.url.path.endswith("/preview")]
+    assert len(pages) == 2  # a fresh token for the second handshake
+
+
+async def test_easyupload_repeated_stale_session_is_transient(tmp_path, eu_client):
+    requests: list = []
+    eu_client(
+        requests=requests,
+        create_responses=[httpx.Response(419), httpx.Response(419)],
+    )
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert len(_posts(requests)) == 2
+
+
+async def test_easyupload_rate_limit_is_transient_and_trips_the_gate(
+    tmp_path, eu_client
+):
+    triggered: list[int] = []
+
+    class RecordingGate:
+        async def trigger(self, retry_after, *, reason=""):
+            triggered.append(retry_after)
+
+    eu_client(create_responses=[httpx.Response(429, headers={"retry-after": "7"})])
+
+    result = await dl._download_easyupload_once(
+        EU_PAGE, tmp_path / "Issue.pdf", rate_gate=RecordingGate()
+    )
+
+    assert result.failure_kind is DownloadFailureKind.TRANSIENT
+    assert triggered == [7]  # every concurrent download pauses, not just this one
+
+
+async def test_easyupload_error_response_is_unavailable(tmp_path, eu_client):
+    eu_client(
+        create_responses=[
+            httpx.Response(200, json={"type": "error", "message": "File removed"})
+        ]
+    )
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.SHARE_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "link",
+    (
+        "https://evil.test/download/a/b/steal.pdf",
+        "https://easyupload.us.evil.test/download/a/b/x.pdf",
+        "http://easyupload.us/download/a/b/x.pdf",
+        "https://easyupload.us/W9ENRtDPE9q7fUr/preview",
+        None,
+    ),
+)
+async def test_easyupload_file_link_off_origin_is_refused(tmp_path, eu_client, link):
+    requests: list = []
+    eu_client(
+        requests=requests,
+        create_responses=[
+            httpx.Response(200, json={"type": "success", "download_link": link})
+        ],
+    )
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+    # Not one byte is requested from a refused link.
+    assert not [r for r in requests if r.url.path.startswith("/download/")]
+
+
+@pytest.mark.parametrize(
+    "page_html",
+    (
+        _eu_page_html(token=None),
+        _eu_page_html(token="has spaces in it, not a token"),
+        "<html><body>maintenance</body></html>",
+    ),
+)
+async def test_easyupload_page_without_a_token_is_a_typed_failure(
+    tmp_path, eu_client, page_html
+):
+    requests: list = []
+    eu_client(requests=requests, page_html=page_html)
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+    assert _posts(requests) == []
+
+
+async def test_easyupload_non_json_response_is_a_typed_failure(tmp_path, eu_client):
+    eu_client(create_responses=[httpx.Response(200, text="<html>oops</html>")])
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.METADATA_INVALID
+
+
+async def test_easyupload_resumes_from_local_partial_bytes(tmp_path, eu_client):
+    requests: list = []
+    eu_client(requests=requests)
+    dest = tmp_path / "Issue.pdf"
+    dl._part_path_for(dest, EU_PAGE).write_bytes(PDF_BODY[:100])
+
+    result = await dl._download_easyupload_once(EU_PAGE, dest)
+
+    assert result.success, result.error
+    assert dest.read_bytes() == PDF_BODY
+    ranged = [r.headers.get("range") for r in requests if r.url.path.startswith("/download/")]
+    assert ranged == ["bytes=100-"]
+
+
+async def test_easyupload_server_ignoring_range_restarts_cleanly(tmp_path, eu_client):
+    # Live: 2 of 5 easyupload files answered a Range request with 200 and the
+    # whole body. Appending that would corrupt the file.
+    eu_client(honor_range=False)
+    dest = tmp_path / "Issue.pdf"
+    dl._part_path_for(dest, EU_PAGE).write_bytes(b"%PDF-1.6 stale partial bytes")
+
+    result = await dl._download_easyupload_once(EU_PAGE, dest)
+
+    assert result.success, result.error
+    assert dest.read_bytes() == PDF_BODY
+
+
+async def test_easyupload_non_pdf_payload_is_terminally_unsupported(
+    tmp_path, eu_client
+):
+    eu_client(body=b"PK\x03\x04" + b"z" * 64)
+
+    result = await dl._download_easyupload_once(EU_PAGE, tmp_path / "Issue.pdf")
+
+    assert result.failure_kind is DownloadFailureKind.UNSUPPORTED
+    assert result.unsupported is True
+    assert not (tmp_path / "Issue.pdf").exists()
+
+
+async def test_dispatch_routes_easyupload_urls_to_their_backend(tmp_path, monkeypatch):
+    called: list[str] = []
+
+    async def fake_easyupload(page_url, dest, **kwargs):
+        called.append(page_url)
+        return DownloadResult(success=True, file_path=dest)
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("an easyupload URL must not reach another backend")
+
+    monkeypatch.setattr(dl, "_download_easyupload_once", fake_easyupload)
+    monkeypatch.setattr(dl, "_download_vk_once", forbidden)
+    monkeypatch.setattr(dl, "_download_and_decrypt_once", forbidden)
+
+    result = await dl.download_and_decrypt(
+        f"https://www.easyupload.us/{EU_ID}/preview-pro",
+        tmp_path / "a.pdf",
+        constants=LimeWireConstants(),
+        retry_attempts=0,
+    )
+
+    assert result.success
+    assert called == [EU_PAGE]  # canonicalized before dispatch

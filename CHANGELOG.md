@@ -4,6 +4,30 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.2] - 2026-10-04
+
+Adds **easyupload.us** as a third download host. The source began posting there on 2026-10-01, and some new issues are posted **only** there, for example Business Traveler USA October 2026 and DestinAsian October/November 2026. 0.9.1 parked them as `unsupported` and named the host; 0.9.2 downloads them.
+
+### Added
+- **easyupload.us downloads.** No account, no captcha, no cryptography.
+  - The stored identity is the file's public preview page, `https://easyupload.us/<id>/preview`; the `www.` and `/preview-pro` spellings are canonicalized to it.
+  - Each attempt runs a fresh handshake in its own short-lived session: read the page's CSRF token, request a download link, then stream the file.
+  - The request target is built from the validated file id, never read from the page.
+  - The returned link must be HTTPS on `easyupload.us` under `/download/`, or the attempt fails as metadata-invalid without requesting a byte. The link is regenerated every attempt and never stored or logged.
+  - Streaming, resume, size limits, `%PDF` validation, deduplication and placement are shared with VK. That includes a clean restart when a server ignores a resume request and resends the whole file, which 2 of 5 live samples did.
+- **Failure mapping:**
+  - a removed page (404/410) or a non-success response is unavailable;
+  - 429 pauses every download for its `Retry-After`;
+  - 5xx is transient;
+  - an expired session (419) is retried once within the attempt, then counts as transient;
+  - a page without a token is metadata-invalid.
+
+### Changed
+- **Rows that 0.9.1 parked on easyupload recover by themselves.** The next cycle that sees their page stores the now-valid link, resets the row to `pending`, and downloads it.
+- **No double downloads for twin posts.** When the same issue is posted on both VK and easyupload, both posts resolve to one organized path, and the second completes as already on disk.
+
+> **Upgrading from 0.9.1:** no schema change and no migration. Rolling back to 0.9.1 leaves stored easyupload links reported as `unsupported`, not as errors.
+
 ## [0.9.1] - 2026-10-04
 
 Restores downloads. Since freemagazines.top's latest template change, the daemon has queued **nothing**. Every cycle logged `0 queued`, `0 unsupported host` and `0 dead link`, while the `link-less` count kept growing.
