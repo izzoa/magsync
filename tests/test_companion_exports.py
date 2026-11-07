@@ -179,3 +179,50 @@ def test_alias_retained_export_survives_removed_original(delivery_setup):
     late = store.create_request(c['client_id'], scope['id'], {'issue_id': alias})
     third = exports.publish(alias_id)[0]
     assert third['request_id'] == late['id'] and third['content_generation'] == first['content_generation']
+
+
+def test_duplicate_alias_of_a_stamped_file_publishes(tmp_path):
+    """A duplicate records the stamped file's on-disk identity, so its export verifies."""
+    from pdf_factory import make_pdf
+
+    from magsync.companion.store import Limits, Store
+    from magsync.core import pdfmeta
+    from magsync.core.index import MagazineIndex
+    from magsync.core.models import DownloadResult
+
+    def sha(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    index = MagazineIndex(tmp_path / 'index.db')
+    library = Store(index, Limits(maximum_download_bytes=1024 * 1024, minimum_free_bytes=1024))
+    library.initialize()
+    owner = Ownership(library, tmp_path / 'out', tmp_path / 'exports').acquire()
+    try:
+        exports = Exports(library, owner)
+        leader = library.internal_issue(issue(library, title='Science News - May 2025', year=2024))
+        public = issue(library)
+        c, scope = client_scope(library)
+        library.create_request(c['client_id'], scope['id'], {'issue_id': public})
+        alias = library.internal_issue(public)
+
+        payload = make_pdf()
+        stamped = payload + pdfmeta.stamp_payload(payload, pdfmeta.stamp_spec_for({'title': 'Science News - May 2025'})).appended
+        original = tmp_path / 'stamped.pdf'
+        original.write_bytes(stamped)
+        library.index.update_download_status(
+            leader, DownloadStatus.COMPLETE, str(original), len(stamped), sha(stamped),
+            source_sha256=sha(payload), source_size=len(payload),
+        )
+        # The duplicate's lookup-time values describe the payload, not the stamped file.
+        library.index.record_download_result(alias, DownloadResult(
+            success=True, file_path=original, file_size_bytes=len(payload), sha256=sha(payload),
+            source_sha256=sha(payload), source_size=len(payload), duplicate=True,
+        ))
+        row = library.conn.execute('SELECT sha256, file_size_bytes FROM downloads WHERE issue_id=?', (alias,)).fetchone()
+        assert (row['sha256'], row['file_size_bytes']) == (sha(stamped), len(stamped))
+        deliveries = exports.publish(alias)
+        assert len(deliveries) == 1
+        assert library.conn.execute('SELECT fulfillment_error FROM acquisition_requests').fetchone()[0] is None
+    finally:
+        owner.release()
+        index.close()

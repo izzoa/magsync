@@ -25,6 +25,30 @@ SEASON_MONTHS = {
 class ParsedDate:
     year: int | None = None
     month: int | None = None
+    # Only set when the title states a day of the month; never used for paths.
+    day: int | None = None
+    # (year, month, day) where a date range starts, when it starts in an
+    # earlier month than ``month`` ("March 28th-April 3rd"): the issue date.
+    # Paths keep using ``month``, so existing filenames never move.
+    start: tuple[int, int, int] | None = None
+
+
+def _day(token: str) -> int | None:
+    value = int(token)
+    return value if 1 <= value <= 31 else None
+
+
+def _range(year: int, start_month: str, start_day: str, end_month: str, end_day: str) -> ParsedDate:
+    first, last = MONTH_NAMES[start_month], MONTH_NAMES[end_month]
+    # "December 27th - January 2nd, 2027": the range starts the year before.
+    start_year = year - 1 if first > last else year
+    day = _day(start_day)
+    return ParsedDate(
+        year=year,
+        month=last,
+        day=_day(end_day),
+        start=(start_year, first, day) if day else None,
+    )
 
 
 def parse_date(title: str, page_url: str = "") -> ParsedDate:
@@ -39,24 +63,45 @@ def parse_date(title: str, page_url: str = "") -> ParsedDate:
     - "27th Edition, 2026" → (2026, None)
     """
     title_lower = title.lower()
+    months = "january|february|march|april|may|june|july|august|september|october|november|december"
 
-    # Pattern 1: "Month DD, YYYY" or "Month DDth-DDth, YYYY"
+    # Ranges across months: "March 28th-April 3rd, 2026", "28 March - 3 April 2026".
+    # The path month stays the end month, as the patterns below always gave.
     m = re.search(
-        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
-        r"\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[-–]\s*\d{1,2}(?:st|nd|rd|th)?)?,?\s*(\d{4})",
+        rf"({months})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*[-–]\s*({months})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s*(\d{{4}})",
         title_lower,
     )
     if m:
-        return ParsedDate(year=int(m.group(2)), month=MONTH_NAMES[m.group(1)])
-
-    # Pattern 2: "DD Month YYYY" or "DDth Month YYYY" (European format)
+        return _range(int(m.group(5)), m.group(1), m.group(2), m.group(3), m.group(4))
     m = re.search(
-        r"\d{1,2}(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)"
+        rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({months})\s*[-–]\s*(\d{{1,2}})(?:st|nd|rd|th)?\s+({months})\s+(\d{{4}})",
+        title_lower,
+    )
+    if m:
+        return _range(int(m.group(5)), m.group(2), m.group(1), m.group(4), m.group(3))
+
+    # Pattern 1: "Month DD, YYYY" or "Month DDth-DDth, YYYY" (day = first day)
+    m = re.search(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*[-–]\s*\d{1,2}(?:st|nd|rd|th)?)?,?\s*(\d{4})",
+        title_lower,
+    )
+    if m:
+        return ParsedDate(
+            year=int(m.group(3)), month=MONTH_NAMES[m.group(1)], day=_day(m.group(2))
+        )
+
+    # Pattern 2: "DD Month YYYY", "DDth Month YYYY" or "DD-DD Month YYYY" (day = first day)
+    m = re.search(
+        r"(\d{1,2})(?:st|nd|rd|th)?(?:\s*[-–]\s*\d{1,2}(?:st|nd|rd|th)?)?\s+"
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
         r"\s+(\d{4})",
         title_lower,
     )
     if m:
-        return ParsedDate(year=int(m.group(2)), month=MONTH_NAMES[m.group(1)])
+        return ParsedDate(
+            year=int(m.group(3)), month=MONTH_NAMES[m.group(2)], day=_day(m.group(1))
+        )
 
     # Pattern 3: "Month-Month YYYY" or "Month/Month YYYY"
     m = re.search(
@@ -105,6 +150,16 @@ def parse_date(title: str, page_url: str = "") -> ParsedDate:
             return ParsedDate(year=int(m.group(1)), month=None)
 
     return ParsedDate()
+
+
+def canonical_file(path: str | Path) -> Path:
+    """One identity per library file: symlinks resolved, ``..`` and ``~`` collapsed.
+
+    Non-strict, so a destination that does not exist yet still resolves
+    through its existing parent directories. Grouping, per-file locks,
+    adoption and duplicate completion all key on this.
+    """
+    return Path(path).expanduser().resolve()
 
 
 def strip_accents(s: str) -> str:

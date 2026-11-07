@@ -786,6 +786,7 @@ def config(
         table.add_row("limewire.constants", lw_status)
         table.add_row("notifications.enabled", str(cfg.notifications.enabled))
         table.add_row("notifications.apprise_urls", ", ".join(cfg.notifications.apprise_urls) or "(none)")
+        table.add_row("metadata.stamp", str(cfg.metadata.stamp))
 
         console.print(table)
 
@@ -961,6 +962,95 @@ def repair_titles(
     finally:
         idx.close()
     _print_repair(report.as_dict(), dry_run=dry_run)
+
+
+_METADATA_LINES = {
+    "stamped": "[green]✓[/green] {label}",
+    "ambiguous": "[yellow]?[/yellow] {label}: rows sharing this file disagree on its metadata, left alone",
+    "edited": "[yellow]![/yellow] {label}: written by another tool, left alone",
+    "modified": "[yellow]![/yellow] {label}: changed outside magsync, left alone",
+    "unstampable": "[dim]·[/dim] {label}: cannot be stamped ({detail})",
+    "missing": "[yellow]?[/yellow] {label}: recorded file is missing",
+    "busy": "[yellow]~[/yellow] {label}: in use right now, run again later",
+    "failed": "[red]✗[/red] {label}: {detail}",
+}
+
+
+def _print_metadata(report: dict, *, dry_run: bool) -> None:
+    """Metadata-repair output, shared by standalone and daemon-executed runs."""
+    if not report["total"]:
+        console.print("[green]No downloaded files to check.[/green]")
+        return
+    suffix = " [dim](dry run — nothing will be written)[/dim]" if dry_run else ""
+    console.print(f"Checked {report['done']} of {report['total']} file(s){suffix}")
+    for kind, label, detail in report["lines"]:
+        template = _METADATA_LINES.get(kind)
+        if template is None:  # "current" files are only counted
+            continue
+        if kind == "stamped" and dry_run:
+            template = "[cyan]→[/cyan] {label} (would stamp)"
+        console.print(template.format(label=escape(label), detail=escape(detail or "")))
+    counts = report["counts"]
+    verb = "would be stamped" if dry_run else "stamped"
+    parts = [f"[bold]{counts['stamped']} {verb}[/bold]", f"{counts['current']} already current"]
+    for kind, noun in (
+        ("ambiguous", "ambiguous"), ("edited", "edited by another tool"), ("modified", "modified"),
+        ("unstampable", "unstampable"), ("missing", "missing"), ("busy", "busy"), ("failed", "failed"),
+    ):
+        if counts.get(kind):
+            parts.append(f"{counts[kind]} {noun}")
+    console.print("\n" + ", ".join(parts))
+    if report.get("interrupted"):
+        console.print("[yellow]Stopped early; run the command again to continue.[/yellow]")
+    if dry_run:
+        console.print("[dim]Dry run: no files or index rows were changed.[/dim]")
+
+
+def _render_metadata(kind: str, operation: dict, body: dict, store) -> int:
+    code = _render_operation_error(operation)
+    if code is not None:
+        return code
+    result = operation["result"]
+    _print_metadata(result, dry_run=bool(body.get("dry_run")))
+    return 1 if result.get("outcome") == "partial" else 0
+
+
+@app.command("repair-metadata")
+@coordinated("metadata", render=_render_metadata)
+def repair_metadata(
+    query: str = typer.Argument(None, help="Only repair files of this magazine"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would change without writing anything"
+    ),
+    verify: bool = typer.Option(
+        False, "--verify", help="Hash every file instead of trusting unchanged size/mtime/inode"
+    ),
+):
+    """Stamp accurate metadata into PDFs that are already downloaded.
+
+    Source PDFs carry junk embedded metadata (e.g. "downmagaz.net" as title,
+    author and tags). New downloads are stamped automatically; this command
+    stamps — or, after a title repair, re-stamps — files already in the
+    library: clean title, issue date, series and series number, genre.
+
+    The original bytes stay intact, a file magsync cannot prove it owns is
+    never touched, every replacement is atomic, and it is safe to re-run:
+    unchanged files are skipped without being read.
+    """
+    from magsync.core.repair import repair_metadata as run_repair
+
+    cfg = load_config()
+    idx = MagazineIndex()
+    try:
+        report = run_repair(
+            idx, cfg.output_dir, query=query, dry_run=dry_run, verify=verify,
+            on_progress=lambda progress: console.print(progress.progress_line(), markup=False, highlight=False),
+        )
+    finally:
+        idx.close()
+    _print_metadata(report.as_dict(), dry_run=dry_run)
+    if report.outcome == "partial":
+        raise typer.Exit(1)
 
 
 @app.command(name="backfill-urls")

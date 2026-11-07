@@ -954,3 +954,134 @@ def test_still_unusable_reprobe_is_reparked_on_the_long_backoff(tmp_path):
     assert row["download_status"] == "unsupported"
     assert row["next_action"] == "REFRESH_LINK"
     idx.close()
+
+
+# --- on-disk vs source identity (metadata stamping) ------------------------------------
+
+
+def test_source_identity_columns_migrate_additively(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE magazines (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+            normalized_title TEXT NOT NULL UNIQUE,
+            first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+            last_updated TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE issues (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            magazine_id INTEGER NOT NULL REFERENCES magazines(id), title TEXT NOT NULL,
+            page_url TEXT NOT NULL UNIQUE, limewire_url TEXT, year INTEGER, month INTEGER,
+            date_raw TEXT, genre TEXT, file_size TEXT, cover_image_url TEXT,
+            discovered_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE downloads (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id INTEGER NOT NULL UNIQUE REFERENCES issues(id),
+            status TEXT NOT NULL DEFAULT 'pending', file_path TEXT, downloaded_at TEXT,
+            file_size_bytes INTEGER, sha256 TEXT);
+        INSERT INTO magazines (id, title, normalized_title) VALUES (7, 'Legacy', 'legacy');
+        INSERT INTO issues (id, magazine_id, title, page_url) VALUES (11, 7, 'Done', 'done');
+        INSERT INTO downloads (issue_id, status, file_path, downloaded_at, file_size_bytes, sha256)
+            VALUES (11, 'complete', '/library/done.pdf', '2025-01-02T03:04:05+00:00', 1234, 'abc');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    idx = MagazineIndex(db_path=db)
+    row = idx.conn.execute("SELECT * FROM downloads WHERE issue_id = 11").fetchone()
+    assert (row["file_path"], row["file_size_bytes"], row["sha256"]) == ("/library/done.pdf", 1234, "abc")
+    assert row["source_sha256"] is None and row["source_size"] is None and row["metadata_stamp"] is None
+    indexes = {r[1] for r in idx.conn.execute("PRAGMA index_list(downloads)")}
+    assert "idx_downloads_source_sha256" in indexes
+    version = idx.conn.execute("SELECT version FROM companion_schema").fetchone()[0]
+    idx.close()
+    idx = MagazineIndex(db_path=db)  # re-open is idempotent and the store still opens
+    assert idx.conn.execute("SELECT version FROM companion_schema").fetchone()[0] == version == 1
+    idx.close()
+
+
+def _complete(idx, issue_id, path, *, sha, size, source=None, source_size=None, stamp=None):
+    idx.update_download_status(
+        issue_id, DownloadStatus.COMPLETE, str(path), size, sha,
+        source_sha256=source, source_size=source_size, metadata_stamp=stamp,
+    )
+
+
+def test_duplicate_lookup_matches_source_identity_and_returns_on_disk_values(tmp_path):
+    idx = _index(tmp_path)
+    stamped = tmp_path / "stamped.pdf"
+    stamped.write_bytes(b"x" * 12)
+    issue_id = _add_one(idx, LW_A)
+    _complete(idx, issue_id, stamped, sha="disk", size=12, source="payload", source_size=10, stamp="1:f:12:1:2")
+    match = idx.find_duplicate("payload")
+    assert (match["file_path"], match["sha256"], match["file_size_bytes"]) == (str(stamped), "disk", 12)
+    assert idx.find_by_hash("payload") == str(stamped)
+    assert idx.find_duplicate("disk") is None  # the on-disk hash is not a payload identity
+    idx.close()
+
+
+def test_duplicate_lookup_falls_back_to_legacy_rows_and_skips_deleted_files(tmp_path):
+    idx = _index(tmp_path)
+    legacy = tmp_path / "legacy.pdf"
+    legacy.write_bytes(b"y")
+    issue_id = _add_one(idx, LW_A)
+    _complete(idx, issue_id, legacy, sha="same", size=1)
+    assert idx.find_duplicate("same")["file_path"] == str(legacy)
+    legacy.unlink()
+    assert idx.find_duplicate("same") is None
+    assert idx.find_duplicate("unknown") is None
+    idx.close()
+
+
+def test_file_identity_matches_equivalent_path_spellings(tmp_path):
+    idx = _index(tmp_path)
+    (tmp_path / "lib" / "AFAR").mkdir(parents=True)
+    target = tmp_path / "lib" / "AFAR" / "x.pdf"
+    target.write_bytes(b"z")
+    (tmp_path / "link").symlink_to(tmp_path / "lib")
+    issue_id = _add_one(idx, LW_A)
+    _complete(idx, issue_id, tmp_path / "lib" / ".." / "lib" / "AFAR" / "x.pdf", sha="d", size=1, stamp="s")
+    for spelling in (target, tmp_path / "link" / "AFAR" / "x.pdf"):
+        found = idx.file_identity(spelling)
+        assert (found["sha256"], found["metadata_stamp"]) == ("d", "s")
+    assert idx.file_identity(tmp_path / "lib" / "AFAR" / "other.pdf") is None
+    idx.close()
+
+
+def test_duplicate_completion_records_the_files_current_identity(tmp_path):
+    from magsync.core.models import DownloadResult
+
+    idx = _index(tmp_path)
+    mag = idx.get_or_create_magazine("Mag", "mag")
+    idx.add_issues(mag, [{"title": "A", "page_url": "pa"}, {"title": "B", "page_url": "pb"}])
+    first, second = (row["id"] for row in idx.get_issues())
+    shared = tmp_path / "shared.pdf"
+    shared.write_bytes(b"s" * 20)
+    _complete(idx, first, shared, sha="restamped", size=20, source="payload", source_size=10, stamp="1:f:20:1:2")
+    # The duplicate result still carries the identity seen at lookup time.
+    stale = DownloadResult(success=True, file_path=shared, file_size_bytes=15, sha256="old",
+                           source_sha256="payload", source_size=10, duplicate=True)
+    idx.record_download_result(second, stale)
+    row = idx.conn.execute("SELECT * FROM downloads WHERE issue_id = ?", (second,)).fetchone()
+    assert (row["sha256"], row["file_size_bytes"], row["metadata_stamp"]) == ("restamped", 20, "1:f:20:1:2")
+    assert (row["source_sha256"], row["source_size"]) == ("payload", 10)
+    idx.close()
+
+
+def test_source_identity_moves_with_the_on_disk_hash(tmp_path):
+    idx = _index(tmp_path)
+    issue_id = _add_one(idx, LW_A)
+
+    def ident():
+        r = idx.conn.execute(
+            "SELECT sha256, source_sha256, source_size, metadata_stamp FROM downloads WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+        return tuple(r)
+
+    _complete(idx, issue_id, tmp_path / "f.pdf", sha="disk", size=12, source="payload", source_size=10, stamp="st")
+    assert ident() == ("disk", "payload", 10, "st")
+    idx.record_download_failure(issue_id, DownloadFailureKind.TRANSIENT, "boom")
+    assert ident() == ("disk", "payload", 10, "st")  # failure keeps the prior identity
+    idx.update_download_status(issue_id, DownloadStatus.DOWNLOADING)
+    assert ident() == (None, None, None, None)  # a new attempt clears all of it together
+    idx.close()

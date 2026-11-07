@@ -4,6 +4,42 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] - 2026-10-28
+
+Downloaded PDFs now carry **accurate embedded metadata** instead of the source's junk. Before, library apps such as BookOrbit showed `downmagaz.net` as every issue's title, author, genre and tag. New downloads are stamped automatically; `magsync repair-metadata` fixes files already in the library.
+
+### Added
+- **New downloads carry accurate embedded metadata.** Source PDFs fill their Info dict and XMP packet with junk (`downmagaz.net` as title, author, tags and description).
+  - magsync now appends one PDF incremental update with the clean issue title, the issue date (`dc:date`), the source genre (`dc:subject`), and the series name and series number (`bookorbit:seriesName`, `bookorbit:seriesIndex` as `YYYYMMDD`). Author, description and keywords are removed.
+  - The original bytes stay an exact prefix, so library reading progress keyed on sampled bytes survives.
+  - The stamp is deterministic and verified before placement. Encrypted, truncated, oversized or structurally damaged payloads are placed unstamped, never failed. Damaged means cross-reference data a reader must repair: an appended revision would chain to the broken section, and strict readers would lose the pages.
+- **`magsync repair-metadata [QUERY] [--dry-run] [--verify]`** stamps files downloaded before stamping existed, or re-stamps them after `repair-titles`.
+  - **Proof before truncating.** It truncates back to the original only after proving the whole file is magsync's own output. Revisions another tool appended are reported as `modified` and never discarded.
+  - **Shared files.** A file several issues share is judged and updated as one unit, and a magazine filter selects files, not rows. Files whose rows disagree are `ambiguous`. Files BookOrbit wrote back are `edited`.
+  - **Safe replacement.** The stamped copy is staged beside the target with its permissions, then swapped in atomically.
+  - **Cheap re-runs.** Unchanged files are skipped by size, mtime and inode; `--verify` hashes everything.
+  - **Reporting.** A progress line every 10 files, and a final report with per-file lines. The run exits nonzero when a file fails.
+- **`metadata.stamp` setting** (default `true`; env `MAGSYNC_METADATA__STAMP`). It controls whether new downloads get accurate embedded metadata. A running daemon or service applies a change after restart.
+
+### Changed
+- **`downloads.sha256` now always describes the bytes on disk.** Three nullable columns are added by additive migration:
+  - `source_sha256` and `source_size`: the original payload before any metadata stamp;
+  - `metadata_stamp`: the stamp fingerprint plus the file state last verified.
+
+  Duplicate detection matches on the source identity (falling back to `sha256` for older rows). A duplicate records the existing file's current on-disk hash and size, so companion export integrity checks keep passing for stamped files. The companion schema version is unchanged, and rolling back leaves the new columns ignored.
+
+### Fixed
+- **LimeWire downloads are now placed atomically.** The decrypted file used to be written straight to its final name. A crash mid-write left a truncated PDF that a later run accepted as "already on disk". Every host now writes a hidden temp file in the destination folder and renames it into place.
+- **"Already on disk" adoption records the file's real hash.** It used to record no hash at all. When the file carries a magsync stamp, its original payload identity is recorded too.
+- **Boolean environment overrides no longer crash configuration loading.** `MAGSYNC_<SECTION>__<KEY>=false` (or `0`, `no`, `off`) used to reach `int()`, because `bool` was checked after `int`. These values now parse as booleans, and an invalid value raises an error that names the variable.
+
+> **Upgrading from 0.9.2:**
+> - **Migration:** three nullable `downloads` columns are added on first open. The companion schema version is unchanged.
+> - **Rollback:** 0.9.x ignores the new columns, and stamped files stay valid PDFs. 0.9.x deduplicates on the stamped hash, so a re-posted identical payload would be saved again rather than deduplicated.
+> - **Already-downloaded files:** run `magsync repair-metadata --dry-run`, then `magsync repair-metadata`.
+> - **BookOrbit:** run *Scan library*, then bulk-clear the old `downmagaz.net` Authors (and Genres where the source listed none) once.
+> - **New dependency:** `pypdf>=6,<7`.
+
 ## [0.9.2] - 2026-10-04
 
 Adds **easyupload.us** as a third download host. The source began posting there on 2026-10-01, and some new issues are posted **only** there, for example Business Traveler USA October 2026 and DestinAsian October/November 2026. 0.9.1 parked them as `unsupported` and named the host; 0.9.2 downloads them.

@@ -185,6 +185,10 @@ def test_commands_executed_by_the_daemon_render_like_standalone(paths, live_runt
 
     assert "No failed downloads to retry." in runner.invoke(app, ["retry"]).output
     assert "No titles need repair." in runner.invoke(app, ["repair-titles"]).output
+    metadata = runner.invoke(app, ["repair-metadata"])
+    assert metadata.exit_code == 0, metadata.output
+    assert "Checked 1 of 1 file(s)" in metadata.output and "cannot be stamped" in metadata.output
+    assert "{" not in metadata.output  # rendered like the standalone command
     assert "{" not in fetched.output  # Never a raw operation document.
     states = _operations(paths)
     assert [kind for kind, state in states if state != "succeeded"] == ["local.config"]  # the invalid value
@@ -348,3 +352,46 @@ def test_dry_runs_list_cached_work_without_source_requests(paths, monkeypatch):
         idx.close()
     bad = runner.invoke(app, ["fetch", "Science News", "--dry-run", "--since", "June"])
     assert bad.exit_code == 2 and "YYYY-MM" in bad.output
+
+
+def test_long_metadata_backfill_keeps_the_daemon_heartbeat_fresh(paths, monkeypatch):
+    """Each file takes longer than nothing; the whole run outlasts the stale threshold."""
+    from pdf_factory import make_pdf
+
+    import magsync.core.repair as repair_mod
+
+    monkeypatch.setenv("MAGSYNC_SERVICE__HEARTBEAT_STALE_SECONDS", "1")
+    idx = MagazineIndex(paths / "data" / "index.db")
+    magazine = idx.get_or_create_magazine("AFAR", "afar")
+    for n in range(8):
+        page = f"https://freemagazines.top/afar-{n}/"
+        idx.add_issues(magazine, [{"title": f"AFAR - Issue {n}, March 2025", "page_url": page,
+                                   "year": 2025, "month": 3}])
+        issue_id = idx.conn.execute("SELECT id FROM issues WHERE page_url=?", (page,)).fetchone()[0]
+        target = paths / "out" / "AFAR" / f"AFAR - {n}.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = make_pdf(pages=1 + n % 3)
+        target.write_bytes(data)
+        idx.update_download_status(issue_id, DownloadStatus.COMPLETE, str(target), len(data),
+                                   hashlib.sha256(data).hexdigest())
+    idx.close()
+    real_prepare = repair_mod.prepare_file
+
+    def slow_prepare(group, **kwargs):
+        time.sleep(0.4)  # 8 files: 3.2 s in total, over three times the stale threshold
+        return real_prepare(group, **kwargs)
+
+    monkeypatch.setattr(repair_mod, "prepare_file", slow_prepare)
+
+    async def downloads(issues, _cfg, index, **_kwargs):
+        return _complete(paths, issues, index)
+
+    state, thread = _start_live_runtime(paths, downloads)
+    try:
+        result = runner.invoke(app, ["repair-metadata"])
+    finally:
+        state["loop"].call_soon_threadsafe(state["runtime"].request_stop)
+        thread.join(20)
+    assert result.exit_code == 0, result.output
+    assert "8 stamped" in result.output
+    assert "unavailable" not in result.output.lower()

@@ -6,7 +6,13 @@ bound) and the same outcomes, returned as data the terminal renders.
 """
 from __future__ import annotations
 
+import asyncio
+from collections import defaultdict
+from contextlib import AsyncExitStack
+
 from magsync.config import add_subscription, load_config, remove_subscription, set_config_value
+from magsync.core import repair
+from magsync.core.diagnostics import sanitize_external_error
 from magsync.core.models import DownloadStatus, LinkResolutionKind, SourceError
 from magsync.core.organizer import strip_accents
 from magsync.core.repair import repair_titles
@@ -24,6 +30,77 @@ def _since(value: str | None) -> tuple[int | None, int | None]:
         return int(parts[0]), (int(parts[1]) if len(parts) > 1 and parts[1] else None)
     except ValueError:
         raise ProtocolError('invalid_request') from None
+
+
+async def _metadata_one(runtime, index, group, dest_locks, *, verify: bool, dry_run: bool, token: str):
+    """Re-stamp one file inside the owner: thread for I/O, loop for the swap.
+
+    Lock order is fixed (maintenance, then the file's destination lock, then
+    each sharing issue's publication lock by id), so it cannot deadlock with
+    downloads (destination lock only) or export publication (one issue lock).
+    """
+    if any(issue_id in runtime._active_attempts for issue_id in group.issue_ids):
+        return 'busy', group.label, 'downloading now'
+    ids = sorted(set(group.issue_ids))
+    entries = []
+    for issue_id in ids:
+        entry = runtime._publishing.setdefault(issue_id, [asyncio.Lock(), 0])
+        entry[1] += 1
+        entries.append((issue_id, entry))
+    try:
+        async with dest_locks[str(group.path)], AsyncExitStack() as held:
+            for _issue_id, entry in entries:
+                await held.enter_async_context(entry[0])
+            try:
+                # Read, verify and stage only: a cancelled thread can at most
+                # leave a staging file, never touch the target.
+                plan = await asyncio.to_thread(
+                    repair.prepare_file, group, verify=verify, dry_run=dry_run, token=token
+                )
+                # No await from here on: the swap and the index update cannot interleave.
+                kind = repair.finalize_file(
+                    index, group, plan, dry_run=dry_run, fence=runtime.owner.check, locked_ids=set(ids)
+                )
+                detail = plan.detail if kind == plan.kind else ''
+            except ProtocolError as exc:
+                if runtime.fatal or runtime._is_fatal(exc):
+                    raise  # ownership or the store is gone: end the run
+                kind, detail = 'failed', sanitize_external_error(str(exc))
+            except Exception as exc:  # one file's failure must not end the run
+                kind, detail = 'failed', sanitize_external_error(str(exc))
+    finally:
+        for issue_id, entry in entries:
+            entry[1] -= 1
+            if not entry[1] and runtime._publishing.get(issue_id) is entry:
+                del runtime._publishing[issue_id]
+    return kind, group.label, detail
+
+
+async def _repair_metadata(runtime, body: dict) -> dict:
+    index = runtime.store.index
+    dry_run, verify = bool(body.get('dry_run')), bool(body.get('verify'))
+    report = repair.MetadataRepairReport(dry_run=dry_run)
+    async with runtime.maintenance_lock:
+        groups = repair.metadata_groups(index, body.get('query'))
+        report.total = len(groups)
+        token = repair.new_token()
+        coordinator = runtime.coordinator
+        dest_locks = coordinator.dest_locks if coordinator is not None else defaultdict(asyncio.Lock)
+        for group in groups:
+            if runtime.stopping or runtime.fatal:
+                report.interrupted = True
+                break
+            try:
+                report.add(*await _metadata_one(runtime, index, group, dest_locks,
+                                                verify=verify, dry_run=dry_run, token=token))
+            except ProtocolError:
+                report.interrupted = True
+                break
+            if report.done % repair.PROGRESS_EVERY == 0:
+                runtime.logger.info('%s', report.progress_line())
+        if report.done % repair.PROGRESS_EVERY:
+            runtime.logger.info('%s', report.progress_line())
+    return report.as_dict()
 
 
 def _reconcile_local_configuration(runtime) -> None:
@@ -139,6 +216,10 @@ async def execute_local(runtime, kind: str, body: dict, operation_id: str) -> di
         return {'outcome': 'succeeded', 'configuration_source': 'file'}
 
     if kind == 'repair':
-        return {'outcome': 'succeeded', **repair_titles(index, runtime.config.output_dir).as_dict()}
+        async with runtime.maintenance_lock:
+            return {'outcome': 'succeeded', **repair_titles(index, runtime.config.output_dir).as_dict()}
+
+    if kind == 'metadata':
+        return await _repair_metadata(runtime, body)
 
     raise ProtocolError('incompatible_protocol')

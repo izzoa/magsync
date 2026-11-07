@@ -46,3 +46,20 @@ def test_boolean_and_numeric_values_are_parsed(paths):
     assert bad.exit_code == 1 and "must be a whole number" in bad.output
     with pytest.raises(ValueError, match="value is required"):
         set_config_value("download.max_concurrent", None)
+
+
+def test_metadata_stamp_round_trips_through_config_command(paths):
+    assert runner.invoke(app, ["config", "metadata.stamp", "false"]).exit_code == 0
+    assert load_config().metadata.stamp is False
+    assert "[metadata]" in (paths / "config" / "config.toml").read_text()
+    assert runner.invoke(app, ["config", "metadata.stamp", "on"]).exit_code == 0
+    assert load_config().metadata.stamp is True
+    listing = runner.invoke(app, ["config"])
+    assert "metadata.stamp" in listing.output
+
+
+def test_metadata_stamp_is_environment_managed(paths, monkeypatch):
+    monkeypatch.setenv("MAGSYNC_METADATA__STAMP", "false")
+    result = runner.invoke(app, ["config", "metadata.stamp", "true"])
+    assert result.exit_code == 1
+    assert "MAGSYNC_METADATA__STAMP" in result.output

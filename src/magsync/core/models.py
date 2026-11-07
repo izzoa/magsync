@@ -318,6 +318,22 @@ class Issue:
     discovered_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class StampSpec:
+    """Metadata magsync embeds in a downloaded PDF (see ``core/pdfmeta.py``).
+
+    Built from the same issue whose title names the file, so a file's name
+    and its embedded metadata always agree.
+    """
+
+    title: str
+    series_name: str
+    year: int | None = None
+    month: int | None = None
+    day: int | None = None
+    genres: tuple[str, ...] = ()
+
+
 @dataclass
 class DownloadRecord:
     id: int | None = None
@@ -338,6 +354,14 @@ class DownloadResult:
     unsupported: bool = False  # live share but non-PDF payload — terminal, never retried
     failure_kind: DownloadFailureKind | None = None
     attempt_count: int = 0
+    # sha256/file_size_bytes describe the bytes on disk; source_* the original
+    # payload before any metadata stamp. metadata_stamp records the stamp.
+    source_sha256: str | None = None
+    source_size: int | None = None
+    metadata_stamp: str | None = None
+    # Completed by pointing at an existing file of the same payload: its
+    # on-disk identity is read from the index when the row is recorded.
+    duplicate: bool = False
 
     def __post_init__(self) -> None:
         """Bridge the legacy ``unsupported`` flag during caller migration.

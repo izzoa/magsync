@@ -12,6 +12,7 @@ class DownloadCapacityPaused(Exception):
 download_admission = ContextVar('magsync_download_admission', default=None)
 
 import asyncio
+import hashlib
 import inspect
 import logging
 from collections import defaultdict
@@ -35,8 +36,10 @@ from magsync.core.models import (
     SourceError,
     SourceFailure,
     SourceFailureKind,
+    StampSpec,
 )
-from magsync.core.organizer import organize_path
+from magsync.core import pdfmeta
+from magsync.core.organizer import canonical_file, organize_path
 from magsync.core.policy import (
     dead_link_reprobe_at,
     get_download_failure_policy,
@@ -432,6 +435,43 @@ def _typed_result(result: Any) -> DownloadResult:
     return result
 
 
+def _adopt_existing(dest: Path, stamp: StampSpec | None) -> DownloadResult:
+    """Complete from a file already at the organized path, with its real hash.
+
+    Usually a file magsync placed just before a crash. Its on-disk hash is
+    always recorded (exports verify against it). Its original payload, and a
+    stamp record, only when the file is provably magsync's: exactly the stamp
+    of its marker's original under this issue's metadata. A hash merely
+    observed here never becomes proof that magsync wrote the bytes.
+    """
+    size = dest.stat().st_size
+    source_sha256 = source_size = record = None
+    if size <= pdfmeta.STAMP_SIZE_LIMIT:
+        data = dest.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        facts = pdfmeta.inspect_pdf(data)
+        marker = facts.marker if facts else None
+        if stamp is not None and marker and marker.source_size < len(data):
+            original = data[: marker.source_size]
+            if hashlib.sha256(original).hexdigest() == marker.source_sha256:
+                rebuilt = pdfmeta.stamp_payload(original, stamp, source_sha256=marker.source_sha256)
+                if rebuilt.appended is not None and original + rebuilt.appended == data:
+                    source_sha256, source_size = marker.source_sha256, marker.source_size
+                    st = dest.stat()
+                    record = pdfmeta.stamp_record(pdfmeta.fingerprint(stamp), st.st_size, st.st_mtime_ns, st.st_ino)
+    else:
+        sha256, size = pdfmeta.file_sha256(dest)
+    return DownloadResult(
+        success=True,
+        file_path=dest,
+        file_size_bytes=size,
+        sha256=sha256,
+        source_sha256=source_sha256,
+        source_size=source_size,
+        metadata_stamp=record,
+    )
+
+
 async def _perform_url_download(
     url: str,
     dest: Path,
@@ -441,20 +481,17 @@ async def _perform_url_download(
     dest_locks: dict[str, asyncio.Lock],
     *,
     retry_attempts: int,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """Perform the physical operation for one single-flight leader."""
-    dest_lock = dest_locks[str(dest.absolute())]
+    dest_lock = dest_locks[str(canonical_file(dest))]
     async with dest_lock:
         if dest.exists():
             logger.info(
                 "Already on disk, skipping: %s",
                 sanitize_external_error(dest.name),
             )
-            return DownloadResult(
-                success=True,
-                file_path=dest,
-                file_size_bytes=dest.stat().st_size,
-            )
+            return await asyncio.to_thread(_adopt_existing, dest, stamp)
 
         async with semaphore:
             await rate_gate.wait()
@@ -471,6 +508,7 @@ async def _perform_url_download(
                     constants=cfg.limewire,
                     rate_gate=rate_gate,
                     retry_attempts=retry_attempts,
+                    **({"stamp": stamp} if stamp is not None else {}),
                 )
             except asyncio.CancelledError:
                 raise
@@ -565,6 +603,10 @@ async def _download_one_impl(
         )
 
     dest = organize_path(issue["title"], issue["page_url"], cfg.output_dir)
+    # Built from the same issue that names the file: the leader's name and
+    # embedded metadata always agree, and aliases share both.
+    metadata = getattr(cfg, "metadata", None)
+    stamp = pdfmeta.stamp_spec_for(issue) if getattr(metadata, "stamp", False) else None
 
     # Per-issue lifecycle callbacks and state remain independent even when the
     # external operation below is shared with exact-URL aliases.
@@ -582,6 +624,7 @@ async def _download_one_impl(
             rate_gate,
             dest_locks,
             retry_attempts=cfg.download.retry_attempts,
+            stamp=stamp,
         ),
     )
     result = _typed_result(result)
@@ -617,6 +660,7 @@ async def _download_one_impl(
                 rate_gate,
                 dest_locks,
                 retry_attempts=0,
+                stamp=stamp,
             ),
         )
         return await _persist_and_emit(

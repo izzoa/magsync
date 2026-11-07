@@ -12,6 +12,7 @@ import binascii
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -30,8 +31,14 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.keywrap import InvalidUnwrap, aes_key_unwrap
 
 from magsync.config import LimeWireConstants, load_config, save_config
+from magsync.core import pdfmeta
 from magsync.core.diagnostics import sanitize_external_error
-from magsync.core.models import DownloadFailureKind, DownloadResult, LimeWireSession
+from magsync.core.models import (
+    DownloadFailureKind,
+    DownloadResult,
+    LimeWireSession,
+    StampSpec,
+)
 from magsync.core.policy import get_download_failure_policy
 from magsync.core.urls import (
     DownloadHost,
@@ -100,9 +107,7 @@ def _part_path_for(dest: Path, limewire_url: str) -> Path:
     masquerade as a stale-constants failure. Partials keyed to any other URL,
     and legacy un-fingerprinted ``<dest>.part`` files, are deleted here.
     """
-    identity = normalize_download_url(limewire_url)
-    fp = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
-    part_path = dest.parent / f"{dest.name}.{fp}.part"
+    part_path = dest.parent / f"{dest.name}.{_url_fingerprint(limewire_url)}.part"
     if dest.parent.is_dir():
         for existing in dest.parent.iterdir():
             name = existing.name
@@ -110,7 +115,34 @@ def _part_path_for(dest: Path, limewire_url: str) -> Path:
                 continue
             if name.startswith(dest.name + ".") and name.endswith(".part"):
                 existing.unlink(missing_ok=True)
+            elif name.startswith("." + dest.name + ".") and name.endswith(_STAMPING_SUFFIX):
+                # A placement temp left by a crash: never a resumable partial.
+                existing.unlink(missing_ok=True)
     return part_path
+
+
+# Hidden (library scanners skip dot-files) and distinct from ".part", so a
+# placement temp is never adopted as a resumable partial. ".{name}.{fp6}.stamp"
+# is exactly as long as "{name}.{fp8}.part": any name that fits as a partial
+# also fits as a placement temp.
+_STAMPING_SUFFIX = ".stamp"
+
+
+def _url_fingerprint(url: str) -> str:
+    identity = normalize_download_url(url)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+
+
+def _stamping_path_for(dest: Path, url: str) -> Path:
+    return dest.parent / f".{dest.name}.{_url_fingerprint(url)[:6]}{_STAMPING_SUFFIX}"
+
+
+def _discard(path: Path) -> None:
+    """Best-effort removal; a failing cleanup must never replace a typed result."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _cleanup_part(part_path: Path) -> None:
@@ -1140,8 +1172,223 @@ def _int_or_none(value: str | None) -> int | None:
         return None
 
 
-def _finalize_plain_download(
-    part_path: Path, dest: Path, expected_total: int | None, *, host: str = "VK"
+def _find_duplicate(payload_sha256: str) -> dict | None:
+    """A completed download of the same original payload, if any."""
+    from magsync.core.index import MagazineIndex
+
+    try:
+        idx = MagazineIndex()
+        try:
+            return idx.find_duplicate(payload_sha256)
+        finally:
+            idx.close()
+    except Exception:
+        return None
+
+
+def _duplicate_result(match: dict, payload_sha256: str, payload_size: int) -> DownloadResult:
+    """Point at the existing file; the index records its identity as it is
+    when this row completes (it may be re-stamped meanwhile)."""
+    logger.info(
+        "Duplicate detected (same content as %s), skipping save",
+        sanitize_external_error(Path(match["file_path"]).name),
+    )
+    return DownloadResult(
+        success=True,
+        file_path=Path(match["file_path"]),
+        file_size_bytes=match["file_size_bytes"] or payload_size,
+        sha256=match["sha256"] or payload_sha256,
+        source_sha256=payload_sha256,
+        source_size=payload_size,
+        metadata_stamp=match.get("metadata_stamp"),
+        duplicate=True,
+    )
+
+
+class _RestoreFailed(OSError):
+    """A failed stamp append could not be undone; nothing may be placed."""
+
+
+def _append_bytes(handle, data: bytes) -> None:
+    # Separate so tests can inject short writes.
+    handle.write(data)
+
+
+def _append_stamp(temp: Path, appended: bytes, payload_size: int) -> bool:
+    """Append the stamp, or restore the exact payload if appending fails.
+
+    Returns ``True`` when stamped, ``False`` when restored to the payload.
+    Raises :class:`_RestoreFailed` when neither holds.
+    """
+    try:
+        with open(temp, "r+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() != payload_size:
+                raise OSError("placement temp has an unexpected size")
+            _append_bytes(handle, appended)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if temp.stat().st_size != payload_size + len(appended):
+            raise OSError("stamp append was short")
+        return True
+    except OSError:
+        pass
+    # Only appended bytes were ever written: cutting back restores the payload.
+    try:
+        with open(temp, "r+b") as handle:
+            handle.truncate(payload_size)
+            handle.flush()
+            os.fsync(handle.fileno())
+            if os.fstat(handle.fileno()).st_size != payload_size:
+                raise OSError("could not restore payload length")
+    except OSError as exc:
+        raise _RestoreFailed(str(exc)) from exc
+    return False
+
+
+def _build_stamp(temp: Path, payload: bytes | None, payload_size: int, stamp: StampSpec, payload_sha256: str):
+    """Never raises: a stamp that cannot be built leaves the payload unstamped."""
+    try:
+        if payload is None:
+            if payload_size > pdfmeta.STAMP_SIZE_LIMIT:
+                return pdfmeta.StampOutcome(reason=pdfmeta.SKIP_OVERSIZED)
+            payload = temp.read_bytes()
+        return pdfmeta.stamp_payload(payload, stamp, source_sha256=payload_sha256)
+    except Exception as exc:  # e.g. EIO or MemoryError reading a large temp
+        return pdfmeta.StampOutcome(reason=pdfmeta.SKIP_FAILED, error=f"{type(exc).__name__}: {exc}"[:200])
+
+
+def _stage_payload(temp: Path, part_path: Path | None, payload: bytes | None) -> None:
+    temp.unlink(missing_ok=True)
+    if part_path is not None:
+        part_path.replace(temp)  # never stamp the resumable partial itself
+    else:
+        with open(temp, "xb") as handle:
+            handle.write(payload)
+
+
+def _commit_temp(temp: Path, dest: Path) -> os.stat_result:
+    with open(temp, "rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(temp, dest)
+    _fsync_directory(dest.parent)
+    return dest.stat()
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return  # Directory handles are not openable on every platform.
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+async def _place_payload(
+    dest: Path,
+    *,
+    url: str,
+    payload_digest,
+    payload_size: int,
+    part_path: Path | None = None,
+    payload: bytes | None = None,
+    stamp: StampSpec | None = None,
+    host: str = "LimeWire",
+) -> DownloadResult:
+    """Place a validated payload atomically, stamping it when asked.
+
+    The payload reaches ``dest`` only through ``os.replace`` of a hidden temp
+    in the same directory, so ``dest`` is never a partial file. A stamp is
+    built off the event loop and appended; any stamping problem places the
+    payload unstamped, and a failed append is cut back to the payload first.
+    """
+    temp = _stamping_path_for(dest, url)
+    payload_sha256 = payload_digest.hexdigest()
+    # File I/O (large writes, fsync) runs off the event loop.
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_stage_payload, temp, part_path, payload)
+    except OSError as exc:
+        _discard(temp)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error=sanitize_external_error(f"{host} download could not be written: {exc}"),
+        )
+
+    appended = b""
+    if stamp is not None:
+        outcome = await asyncio.to_thread(_build_stamp, temp, payload, payload_size, stamp, payload_sha256)
+        if outcome.appended:
+            try:
+                if await asyncio.to_thread(_append_stamp, temp, outcome.appended, payload_size):
+                    appended = outcome.appended
+                else:
+                    logger.warning("Metadata stamp could not be written; placed unstamped: %s",
+                                   sanitize_external_error(dest.name))
+            except _RestoreFailed:
+                if part_path is not None:
+                    try:
+                        temp.replace(part_path)  # keep the bytes resumable
+                    except OSError:
+                        _discard(temp)
+                else:
+                    _discard(temp)
+                return DownloadResult(
+                    success=False,
+                    failure_kind=DownloadFailureKind.INTERNAL,
+                    error=sanitize_external_error(
+                        f"Could not restore {dest.name} after a failed metadata stamp"
+                    ),
+                )
+        elif outcome.reason == pdfmeta.SKIP_FAILED:
+            # Unexpected: worth seeing at default log levels (e.g. after a pypdf upgrade).
+            logger.warning(
+                "Metadata stamp failed, placed unstamped: %s (%s)",
+                sanitize_external_error(dest.name),
+                sanitize_external_error(outcome.error or "unknown error"),
+            )
+        else:
+            logger.info("Metadata not stamped (%s): %s", outcome.reason, sanitize_external_error(dest.name))
+
+    try:
+        st = await asyncio.to_thread(_commit_temp, temp, dest)
+    except OSError as exc:
+        _discard(temp)
+        return DownloadResult(
+            success=False,
+            failure_kind=DownloadFailureKind.INTERNAL,
+            error=sanitize_external_error(f"{host} download could not be placed: {exc}"),
+        )
+
+    on_disk = payload_digest.copy()
+    on_disk.update(appended)
+    record = None
+    if appended:
+        record = pdfmeta.stamp_record(pdfmeta.fingerprint(stamp), st.st_size, st.st_mtime_ns, st.st_ino)
+    return DownloadResult(
+        success=True,
+        file_path=dest,
+        file_size_bytes=payload_size + len(appended),
+        sha256=on_disk.hexdigest(),
+        source_sha256=payload_sha256,
+        source_size=payload_size,
+        metadata_stamp=record,
+    )
+
+
+async def _finalize_plain_download(
+    part_path: Path,
+    dest: Path,
+    expected_total: int | None,
+    *,
+    host: str = "VK",
+    url: str | None = None,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """Validate, deduplicate, and place a completed plain payload."""
     if not part_path.exists():
@@ -1182,31 +1429,19 @@ def _finalize_plain_download(
             digest.update(block)
     file_hash = digest.hexdigest()
 
-    from magsync.core.index import MagazineIndex
-
-    try:
-        idx = MagazineIndex()
-        existing_path = idx.find_by_hash(file_hash)
-        idx.close()
-    except Exception:
-        existing_path = None
-
-    if existing_path:
-        logger.info(
-            "Duplicate detected (same content as %s), skipping save", existing_path
-        )
+    match = _find_duplicate(file_hash)
+    if match:
         part_path.unlink(missing_ok=True)
-        return DownloadResult(
-            success=True,
-            file_path=Path(existing_path),
-            file_size_bytes=size,
-            sha256=file_hash,
-        )
+        return _duplicate_result(match, file_hash, size)
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    part_path.replace(dest)
-    return DownloadResult(
-        success=True, file_path=dest, file_size_bytes=size, sha256=file_hash
+    return await _place_payload(
+        dest,
+        url=url or str(part_path),
+        payload_digest=digest,
+        payload_size=size,
+        part_path=part_path,
+        stamp=stamp,
+        host=host,
     )
 
 
@@ -1216,6 +1451,7 @@ async def _download_vk_once(
     *,
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """One VK retrieval attempt: derive, stream, validate, place.
 
@@ -1253,7 +1489,9 @@ async def _download_vk_once(
             error=sanitize_external_error(f"VK download could not be written: {exc}"),
         )
 
-    return _finalize_plain_download(part_path, dest, expected_total)
+    return await _finalize_plain_download(
+        part_path, dest, expected_total, url=page_url, stamp=stamp
+    )
 
 
 # easyupload hands out its file URL only through a session-bound, CSRF-checked
@@ -1407,6 +1645,7 @@ async def _download_easyupload_once(
     *,
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """One easyupload retrieval attempt: handshake, stream, validate, place.
 
@@ -1448,7 +1687,9 @@ async def _download_easyupload_once(
             ),
         )
 
-    return _finalize_plain_download(part_path, dest, expected_total, host="easyupload")
+    return await _finalize_plain_download(
+        part_path, dest, expected_total, host="easyupload", url=page_url, stamp=stamp
+    )
 
 
 async def download_and_decrypt(
@@ -1459,6 +1700,7 @@ async def download_and_decrypt(
     on_progress: callable | None = None,
     retry_attempts: int | None = None,
     rate_gate: RateLimitGate | None = None,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """Full pipeline: retrieve a payload from its file host and store it.
 
@@ -1524,21 +1766,23 @@ async def download_and_decrypt(
 
     total = max(retry_attempts, 0) + 1
     last_result: DownloadResult | None = None
+    # Forwarded only when set, so callers and fakes without stamping keep working.
+    stamping = {"stamp": stamp} if stamp is not None else {}
     for attempt in range(1, total + 1):
         await rate_gate.wait()
 
         if host is DownloadHost.VK:
             result = await _download_vk_once(
-                normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate
+                normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate, **stamping
             )
         elif host is DownloadHost.EASYUPLOAD:
             result = await _download_easyupload_once(
-                normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate
+                normalized_url, dest, on_progress=on_progress, rate_gate=rate_gate, **stamping
             )
         else:
             result = await _download_and_decrypt_once(
                 normalized_url, dest, constants=constants, on_progress=on_progress,
-                rate_gate=rate_gate, retry_attempts=retry_attempts,
+                rate_gate=rate_gate, retry_attempts=retry_attempts, **stamping
             )
         result.attempt_count = attempt
         if result.success:
@@ -1588,12 +1832,13 @@ async def _download_and_decrypt_once(
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
     retry_attempts: int = 2,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """Single download attempt (no retry)."""
     try:
         return await _do_download(limewire_url, dest, constants=constants,
                                   on_progress=on_progress, rate_gate=rate_gate,
-                                  retry_attempts=retry_attempts)
+                                  retry_attempts=retry_attempts, stamp=stamp)
     except DownloadPipelineError as e:
         if e.kind is DownloadFailureKind.TRANSIENT and e.retry_after and rate_gate:
             await rate_gate.trigger(e.retry_after, reason="LimeWire transient throttle")
@@ -1668,6 +1913,7 @@ async def _do_download(
     on_progress: callable | None = None,
     rate_gate: RateLimitGate | None = None,
     retry_attempts: int = 2,
+    stamp: StampSpec | None = None,
 ) -> DownloadResult:
     """Inner download logic, separated for 429 handling."""
 
@@ -1930,38 +2176,28 @@ async def _do_download(
                 error=error,
             )
 
-        # Compute content hash for deduplication
-        file_hash = hashlib.sha256(decrypted).hexdigest()
+        # Content hash of the original payload (deduplication identity)
+        digest = hashlib.sha256(decrypted)
+        file_hash = digest.hexdigest()
 
-        # Check for duplicate content in the index
-        from magsync.core.index import MagazineIndex
-        try:
-            idx = MagazineIndex()
-            existing_path = idx.find_by_hash(file_hash)
-            idx.close()
-        except Exception:
-            existing_path = None
-
-        if existing_path:
-            logger.info(f"Duplicate detected (same content as {existing_path}), skipping save")
+        match = _find_duplicate(file_hash)
+        if match:
             part_path.unlink(missing_ok=True)
-            return DownloadResult(
-                success=True,
-                file_path=Path(existing_path),
-                file_size_bytes=len(decrypted),
-                sha256=file_hash,
-            )
+            return _duplicate_result(match, file_hash, len(decrypted))
 
-        # Save and clean up .part file
-        dest.write_bytes(decrypted)
-        part_path.unlink(missing_ok=True)
-
-        return DownloadResult(
-            success=True,
-            file_path=dest,
-            file_size_bytes=len(decrypted),
-            sha256=file_hash,
+        # Never write dest directly: a crash would leave a truncated PDF that a
+        # later "already on disk" check adopts as complete.
+        result = await _place_payload(
+            dest,
+            url=limewire_url,
+            payload_digest=digest,
+            payload_size=len(decrypted),
+            payload=bytes(decrypted),
+            stamp=stamp,
         )
+        if result.success:
+            part_path.unlink(missing_ok=True)  # the encrypted partial is spent
+        return result
 
 
 async def auto_extract_constants(

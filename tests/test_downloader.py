@@ -705,6 +705,9 @@ class _StubIdx:
     def find_by_hash(self, h):
         return None
 
+    def find_duplicate(self, h):
+        return None
+
     def close(self):
         pass
 
@@ -2016,3 +2019,25 @@ async def test_dispatch_routes_easyupload_urls_to_their_backend(tmp_path, monkey
 
     assert result.success
     assert called == [EU_PAGE]  # canonicalized before dispatch
+
+
+async def test_limewire_download_is_stamped_and_placed_atomically(tmp_path, monkeypatch):
+    from pdf_factory import make_pdf
+
+    from magsync.core import pdfmeta
+
+    payload = make_pdf()
+
+    def handler(request):
+        return httpx.Response(200, content=payload)
+
+    dest, _calls = _pipeline(monkeypatch, tmp_path, handler=handler)
+    spec = pdfmeta.stamp_spec_for({"title": "AFAR – Spring 2025", "genre": "Travel"})
+    result = await dl._do_download(DL_URL, dest, constants=CONSTS, stamp=spec)
+    placed = dest.read_bytes()
+    assert result.success and placed.startswith(payload) and len(placed) > len(payload)
+    assert result.source_sha256 == hashlib.sha256(payload).hexdigest()
+    assert result.sha256 == hashlib.sha256(placed).hexdigest()
+    assert pdfmeta.parse_stamp_record(result.metadata_stamp)[0] == pdfmeta.fingerprint(spec)
+    assert not _part_for(dest).exists()
+    assert [p.name for p in dest.parent.iterdir()] == [dest.name]

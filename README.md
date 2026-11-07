@@ -19,6 +19,7 @@ A CLI/TUI tool for indexing and downloading PDF magazines from [freemagazines.to
 - **Search** magazines by title with full pagination across freemagazines.top
 - **Download** PDFs automatically — handles LimeWire's E2E encryption entirely in Python (no browser needed)
 - **Organize** into a flat `[Magazine Title]/` structure with uniform filenames that sort chronologically (Komga/Kavita compatible)
+- **Clean metadata** — replaces the junk embedded in source PDFs (`downmagaz.net` as title, author, tags…) with the real title, issue date, series and genre, so library apps like BookOrbit show them correctly
 - **Track** what you've downloaded with a local SQLite index — never re-download the same issue
 - **Update** your index on demand to discover new issues for tracked magazines
 - **TUI** for interactive browsing, or **CLI** for scripted/headless use
@@ -136,6 +137,12 @@ magsync backfill-urls "The Economist"   # limit to one magazine
 magsync repair-titles --dry-run   # preview every change first
 magsync repair-titles
 
+# Stamp accurate metadata into PDFs downloaded before stamping existed (or after repair-titles)
+magsync repair-metadata --dry-run   # preview every change first
+magsync repair-metadata
+magsync repair-metadata "AFAR"      # limit to one magazine
+magsync repair-metadata --verify    # hash every file instead of trusting unchanged size/mtime/inode
+
 # View/change configuration
 magsync config
 magsync config output_dir ~/MyMagazines
@@ -155,6 +162,25 @@ magsync daemon --dry-run
 **Legacy titles.** The source used to prepend a format label to every listing (`[PDF] …`). A leading bracketed tag is normalized away, so it never affects a magazine's name, its folder, or subscription matching — importantly, an `exact` subscription can match such an issue, which it previously could not. Issues indexed before that fix keep the tag in their *stored* title (indexing never rewrites a title, since it drives derived dates and magazine association), which splits the library into duplicate folders like `[PDF] Science News`. Run `magsync repair-titles` once to consolidate: it strips the tag, re-derives the affected fields, re-associates magazines, moves already-downloaded files into their correct folder, updates the recorded path so deduplication keeps resolving, and prunes emptied records. It never overwrites an existing file, and `--dry-run` previews everything.
 
 The same applies to the site-name suffix the source appends to page titles (`… | Magazine PDF`, earlier `… | Download Magazine PDF`). It is normalized away everywhere: without that, an issue such as `GQ USA Fall 2026 | Magazine PDF` became a magazine of its own, with its own folder. Issues indexed while the suffix was stored can be consolidated with the same `magsync repair-titles`.
+
+**Fixing metadata of files you already have.** New downloads are stamped automatically (see [Embedded metadata](#embedded-metadata)). `magsync repair-metadata` stamps files that were downloaded earlier. Run it again after `magsync repair-titles`, because a corrected title changes the metadata. It reads each file, proves which bytes are the original download, writes a stamped copy next to the file, and atomically swaps it in.
+
+| Report line | Meaning |
+|-------------|---------|
+| `stamped` | metadata written (with `--dry-run`: *would be stamped*) |
+| `current` | already carries this metadata; skipped without reading the file if its size, modification time and inode are unchanged since the last stamp |
+| `ambiguous` | several index rows share this file but disagree on its title or date; left alone |
+| `edited` | another tool (e.g. BookOrbit's write-back) wrote metadata into it; left alone |
+| `modified` | the file changed outside magsync since it was recorded (for example another tool appended a revision); left alone, never truncated |
+| `unstampable` | encrypted, truncated, oversized, unparseable, or with damaged cross-reference data; its hash is still recorded |
+| `missing` / `busy` | the recorded file is gone / it changed or was in use mid-run; run again later |
+| `failed` | an error such as a full disk; the original is untouched and the command exits nonzero |
+
+Re-running is cheap and safe. Through a running daemon, the command runs inside the daemon, which logs a progress line every 10 files, and your terminal prints the final report.
+
+**After a backfill in BookOrbit:**
+- Run *Scan library*, so changed files are re-read.
+- Bulk-clear *Authors* once (and *Genres* for issues whose source listed no genre). BookOrbit's "Series folders" path rules keep a book's existing authors and genres when the file supplies none, so the old `downmagaz.net` entries otherwise stay.
 
 **Status meanings.** `pending` is queued wanted work, `cataloged` is an indexed side-effect entry nobody requested (never auto-downloaded; fetch or select it to make it wanted), `complete` is a stored PDF, `unavailable` is a confirmed dead/orphaned share that may recover only through a refreshed source link or manual retry, `unsupported` is a live link magsync cannot use — a non-PDF payload, or a link on a file host it has no backend for — and `failed` covers a typed transient or deterministic processing failure. An `unsupported` row and an `unavailable` row both keep a scheduled re-probe (30 days and 24 hours respectively), so an issue the site later rehosts or relinks can recover on its own. Only typed transient failures on wanted rows are automatically scheduled for another download attempt.
 
@@ -280,6 +306,7 @@ All config values can be overridden via environment variables:
 | `MAGSYNC_DOWNLOAD__MAX_CONCURRENT` | Max parallel downloads | `3` |
 | `MAGSYNC_DOWNLOAD__RETRY_ATTEMPTS` | Retries after a failed download (0 = no retry — **not recommended**; transient LimeWire throttling won't be retried) | `2` |
 | `MAGSYNC_DOWNLOAD__SCRAPE_DELAY` | Delay between scrape requests (seconds) | `1.0` |
+| `MAGSYNC_METADATA__STAMP` | Embed accurate title/date/series/genre metadata into each new download (`true`/`false`, also `1`/`0`, `yes`/`no`, `on`/`off`). A running daemon or service picks up a change on restart | `true` |
 | `MAGSYNC_NO_PROGRESS` | Disable the live progress bar in bulk commands (use the textual fallback) | (unset) |
 
 ### NAS Deployment (Synology, QNAP)
@@ -333,6 +360,10 @@ scrape_delay = 1.0
 [notifications]
 enabled = false
 apprise_urls = []
+
+# Embed accurate metadata into each new download (restart a running daemon to apply).
+[metadata]
+stamp = true
 
 [[subscriptions]]
 query = "The New Yorker"
@@ -397,6 +428,26 @@ Files are organized in a flat structure per magazine title for Komga/Kavita comp
 - `The Economist - February 16-23, 2026` → `The Economist/The Economist - 2026-02 - February 16-23.pdf`
 - `Science News - Vol 208 No 05, May 2026` → `Science News/Science News - 2026-05 - Vol 208 No 05 May.pdf`
 - Undatable issues use the sanitized original title as the filename
+
+Every file reaches its final name through an atomic rename of a hidden temp file in the same folder. A library scanner never sees a half-written PDF.
+
+### Embedded metadata
+
+Source PDFs usually carry junk metadata: `downmagaz.net` as the title, author, subject and keywords, in both the PDF Info dictionary and the XMP packet. Library apps show that junk. So, by default (`metadata.stamp = true`), magsync appends one small PDF *incremental update* to each new download before placing it. The update carries:
+
+| Field | Value (example: `AFAR – Spring 2025`) |
+|-------|---------------------------------------|
+| Title (`dc:title`, Info `/Title`) | `AFAR – Spring 2025` |
+| Published date (`dc:date`) | `2025-03-01` (day `01` when the title names no day; year only when no month) |
+| Series (`bookorbit:seriesName`) | `AFAR` |
+| Series number (`bookorbit:seriesIndex`) | `20250301`: `YYYYMMDD`, so issues sort chronologically |
+| Genres (`dc:subject`) | the source page's genre, when it lists one |
+| Author, description, keywords | removed |
+
+The original download stays byte-for-byte intact as the start of the file, and the update adds about 2 KB.
+- **Reading progress survives.** Readers that track files by sampled bytes, such as BookOrbit/KOReader, keep their progress.
+- **Encrypted, truncated, unusually large or structurally damaged PDFs are placed unstamped.** They are never failed. A damaged one has a wrong `startxref` or object offsets that readers must repair.
+- **Each stamp is verified before placement.** Its newest trailer, catalog and every field are read back.
 
 ## Dependencies
 

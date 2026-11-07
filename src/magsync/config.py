@@ -79,12 +79,32 @@ class NotificationSettings:
 
 
 @dataclass
+class MetadataSettings:
+    # Embed accurate title/date/series metadata into each downloaded PDF.
+    stamp: bool = True
+
+
+@dataclass
 class Config:
     output_dir: str = field(default_factory=lambda: str(Path.home() / "Magazines"))
     download: DownloadSettings = field(default_factory=DownloadSettings)
     limewire: LimeWireConstants = field(default_factory=LimeWireConstants)
     notifications: NotificationSettings = field(default_factory=NotificationSettings)
+    metadata: MetadataSettings = field(default_factory=MetadataSettings)
     subscriptions: list[Subscription] = field(default_factory=list)
+
+
+_TRUE_WORDS = ("true", "1", "yes", "on")
+_FALSE_WORDS = ("false", "0", "no", "off")
+
+
+def _env_bool(env_key: str, value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in _TRUE_WORDS:
+        return True
+    if lowered in _FALSE_WORDS:
+        return False
+    raise ValueError(f"{env_key} must be true or false (got {value!r}).")
 
 
 def _apply_env_overrides(cfg: Config) -> None:
@@ -104,6 +124,7 @@ def _apply_env_overrides(cfg: Config) -> None:
         "MAGSYNC_LIMEWIRE__FILE_SHA1_IV_B64": ("file_sha1_iv_b64", "limewire"),
         "MAGSYNC_LIMEWIRE__PREVIEW_IV_B64": ("preview_iv_b64", "limewire"),
         "MAGSYNC_LIMEWIRE__PBKDF2_ITERATIONS": ("pbkdf2_iterations", "limewire"),
+        "MAGSYNC_METADATA__STAMP": ("stamp", "metadata"),
     }
 
     for env_key, (attr_name, section) in env_map.items():
@@ -112,12 +133,13 @@ def _apply_env_overrides(cfg: Config) -> None:
             continue
         target = getattr(cfg, section) if section else cfg
         current = getattr(target, attr_name)
-        if isinstance(current, int):
+        # bool before int: bool is an int subclass, so "false" must never reach int().
+        if isinstance(current, bool):
+            setattr(target, attr_name, _env_bool(env_key, val))
+        elif isinstance(current, int):
             setattr(target, attr_name, int(val))
         elif isinstance(current, float):
             setattr(target, attr_name, float(val))
-        elif isinstance(current, bool):
-            setattr(target, attr_name, val.lower() in ("true", "1", "yes"))
         else:
             setattr(target, attr_name, val)
 
@@ -171,6 +193,8 @@ def load_config() -> Config:
                 cfg.notifications.enabled = data["notifications"]["enabled"]
             if "apprise_urls" in data["notifications"]:
                 cfg.notifications.apprise_urls = data["notifications"]["apprise_urls"]
+        if "metadata" in data and "stamp" in data["metadata"]:
+            cfg.metadata.stamp = bool(data["metadata"]["stamp"])
         if "subscriptions" in data:
             for sub in data["subscriptions"]:
                 cfg.subscriptions.append(
@@ -461,9 +485,9 @@ def _parse_setting(key: str, current, value: str):
     """Parse a CLI string for a typed setting; raise ValueError with a sentence."""
     if isinstance(current, bool):
         lowered = value.strip().lower()
-        if lowered in ("true", "1", "yes", "on"):
+        if lowered in _TRUE_WORDS:
             return True
-        if lowered in ("false", "0", "no", "off"):
+        if lowered in _FALSE_WORDS:
             return False
         raise ValueError(f"{key} must be true or false.")
     if isinstance(current, int):

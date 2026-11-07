@@ -38,6 +38,18 @@ def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
+def _like_escape(text: str) -> str:
+    """Escape a literal for a ``LIKE ... ESCAPE '\\'`` pattern."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _name_filter(names: set[str]) -> tuple[str, list[str]]:
+    """SQL matching ``file_path`` values that end in any of ``names``."""
+    ordered = sorted(name for name in names if name)
+    clause = " OR ".join("file_path LIKE ? ESCAPE '\\'" for _ in ordered) or "0"
+    return clause, ["%" + _like_escape(name) for name in ordered]
+
+
 def _utc_timestamp(value: datetime | str | None = None) -> str:
     """Normalize a timestamp for UTC persistence and SQLite comparison."""
     if value is None:
@@ -109,6 +121,9 @@ CREATE TABLE IF NOT EXISTS downloads (
     downloaded_at TEXT,
     file_size_bytes INTEGER,
     sha256 TEXT,
+    source_sha256 TEXT,
+    source_size INTEGER,
+    metadata_stamp TEXT,
     last_error_kind TEXT,
     last_error TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -175,12 +190,21 @@ class MagazineIndex:
             # Provenance ladder NULL < 'subscription' < 'manual'; NULL means
             # side-effect catalog entry, which is never claimable work.
             "requested_by": "TEXT",
+            # sha256/file_size_bytes describe the bytes on disk; these describe
+            # the original payload before a metadata stamp (NULL: same as sha256)
+            # and the stamp itself plus the file state last verified.
+            "source_sha256": "TEXT",
+            "source_size": "INTEGER",
+            "metadata_stamp": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
                 self.conn.execute(
                     f"ALTER TABLE downloads ADD COLUMN {name} {declaration}"
                 )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloads_source_sha256 ON downloads(source_sha256)"
+        )
 
         self.conn.execute(
             """CREATE TABLE IF NOT EXISTS pipeline_state (
@@ -448,12 +472,18 @@ class MagazineIndex:
         file_path: str | None = None,
         file_size_bytes: int | None = None,
         sha256: str | None = None,
+        *,
+        source_sha256: str | None = None,
+        source_size: int | None = None,
+        metadata_stamp: str | None = None,
     ):
         """Update a lifecycle status while preserving the legacy API.
 
         Successful completion also clears any stale typed failure/schedule
         metadata. Typed failures should use :meth:`record_download_failure` so
         their policy metadata is written atomically with the lifecycle status.
+        The source identity and stamp move with ``sha256`` in the same
+        statement, so a row never pairs one file's hash with another's source.
         """
         downloaded_at = _utc_timestamp() if status == DownloadStatus.COMPLETE else None
         if status == DownloadStatus.COMPLETE:
@@ -461,6 +491,7 @@ class MagazineIndex:
                 """UPDATE downloads
                    SET status = ?, file_path = ?, downloaded_at = ?,
                        file_size_bytes = ?, sha256 = ?,
+                       source_sha256 = ?, source_size = ?, metadata_stamp = ?,
                        last_error_kind = NULL, last_error = NULL,
                        attempt_count = 0, last_attempt_at = NULL,
                        next_action = NULL, next_retry_at = NULL
@@ -471,6 +502,9 @@ class MagazineIndex:
                     downloaded_at,
                     file_size_bytes,
                     sha256,
+                    source_sha256,
+                    source_size,
+                    metadata_stamp,
                     issue_id,
                 ),
             )
@@ -478,9 +512,20 @@ class MagazineIndex:
             self.conn.execute(
                 """UPDATE downloads
                    SET status = ?, file_path = ?, downloaded_at = ?,
-                       file_size_bytes = ?, sha256 = ?
+                       file_size_bytes = ?, sha256 = ?,
+                       source_sha256 = ?, source_size = ?, metadata_stamp = ?
                    WHERE issue_id = ?""",
-                (status.value, file_path, downloaded_at, file_size_bytes, sha256, issue_id),
+                (
+                    status.value,
+                    file_path,
+                    downloaded_at,
+                    file_size_bytes,
+                    sha256,
+                    source_sha256,
+                    source_size,
+                    metadata_stamp,
+                    issue_id,
+                ),
             )
         self.conn.commit()
 
@@ -560,12 +605,27 @@ class MagazineIndex:
         """Persist a ``DownloadResult`` without routing on display text."""
         if result.success:
             path = str(result.file_path) if result.file_path is not None else None
+            sha256, size = result.sha256, result.file_size_bytes
+            stamp = getattr(result, "metadata_stamp", None)
+            if getattr(result, "duplicate", False) and path is not None:
+                # The matched file may have been re-stamped since the lookup:
+                # record its identity as it is now, in this same statement.
+                current = self.file_identity(path)
+                if current is not None:
+                    sha256, size, stamp = (
+                        current["sha256"],
+                        current["file_size_bytes"],
+                        current["metadata_stamp"],
+                    )
             self.update_download_status(
                 issue_id,
                 DownloadStatus.COMPLETE,
                 path,
-                result.file_size_bytes,
-                result.sha256,
+                size,
+                sha256,
+                source_sha256=getattr(result, "source_sha256", None),
+                source_size=getattr(result, "source_size", None),
+                metadata_stamp=stamp,
             )
             return
         if result.failure_kind is None:
@@ -584,18 +644,114 @@ class MagazineIndex:
             next_action=next_action,
         )
 
-    def find_by_hash(self, sha256: str) -> str | None:
-        """Find an existing download with the same SHA-256 hash. Returns file_path or None."""
+    def find_duplicate(self, payload_sha256: str) -> dict | None:
+        """Find a completed download of the same original payload.
+
+        Matches the recorded source identity, or ``sha256`` for rows stamped
+        before source identities existed. Returns the file path with its
+        on-disk ``sha256`` and ``file_size_bytes``, or ``None``.
+        """
         rows = self.conn.execute(
-            "SELECT file_path FROM downloads WHERE sha256 = ? AND status = 'complete'",
-            (sha256,),
+            """SELECT file_path, sha256, file_size_bytes, source_sha256, source_size, metadata_stamp
+               FROM downloads
+               WHERE status = 'complete'
+                 AND (source_sha256 = ? OR (source_sha256 IS NULL AND sha256 = ?))""",
+            (payload_sha256, payload_sha256),
         ).fetchall()
         # A deleted file cannot stand in for new bytes: deduplicating against
         # it would record a completion that points at nothing.
         for row in rows:
             if row["file_path"] and Path(row["file_path"]).exists():
-                return row["file_path"]
+                return dict(row)
         return None
+
+    def find_by_hash(self, sha256: str) -> str | None:
+        """Path of a completed download of the same original payload, or None."""
+        match = self.find_duplicate(sha256)
+        return match["file_path"] if match else None
+
+    def file_identity(self, path: str | Path) -> dict | None:
+        """The recorded on-disk identity of one library file.
+
+        Rows may spell one file differently (``..``, ``~``, a symlinked
+        directory), so candidates are compared by canonical path.
+        """
+        from magsync.core.organizer import canonical_file
+
+        target = canonical_file(path)
+        names = {target.name, Path(path).name}
+        clause, params = _name_filter(names)
+        rows = self.conn.execute(
+            f"""SELECT file_path, sha256, file_size_bytes, source_sha256, source_size, metadata_stamp
+               FROM downloads
+               WHERE status = 'complete' AND file_path IS NOT NULL AND sha256 IS NOT NULL
+                 AND ({clause})""",
+            params,
+        ).fetchall()
+        for row in rows:
+            if canonical_file(row["file_path"]) == target:
+                return dict(row)
+        return None
+
+    _FILE_ROW_COLUMNS = """i.id AS issue_id, i.title, i.page_url, i.year, i.month, i.genre,
+                      m.normalized_title, d.file_path, d.sha256, d.file_size_bytes,
+                      d.source_sha256, d.source_size, d.metadata_stamp"""
+
+    def complete_downloads_with_files(self) -> list[dict]:
+        """Every completed download that records a file, with the issue fields
+        a metadata stamp is derived from."""
+        rows = self.conn.execute(
+            f"""SELECT {self._FILE_ROW_COLUMNS}
+                FROM downloads d JOIN issues i ON i.id = d.issue_id
+                JOIN magazines m ON m.id = i.magazine_id
+                WHERE d.status = 'complete' AND d.file_path IS NOT NULL AND d.file_path != ''
+                ORDER BY m.normalized_title, i.year, i.month, i.id"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def downloads_for_file(self, path: str | Path, *, names: set[str] | None = None) -> list[dict]:
+        """The completed rows that reference one library file (canonical match).
+
+        Candidates are pre-filtered by basename: the canonical file's, the
+        given path's, and any ``names`` the caller knows (symlink spellings).
+        """
+        from magsync.core.organizer import canonical_file
+
+        target = canonical_file(path)
+        clause, params = _name_filter({target.name, Path(path).name, *(names or ())})
+        rows = self.conn.execute(
+            f"""SELECT {self._FILE_ROW_COLUMNS}
+                FROM downloads d JOIN issues i ON i.id = d.issue_id
+                JOIN magazines m ON m.id = i.magazine_id
+                WHERE d.status = 'complete' AND ({clause.replace("file_path", "d.file_path")})
+                ORDER BY i.id""",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows if canonical_file(row["file_path"]) == target]
+
+    def record_file_identity(
+        self,
+        issue_ids: list[int],
+        *,
+        sha256: str,
+        file_size_bytes: int,
+        source_sha256: str | None,
+        source_size: int | None,
+        metadata_stamp: str | None,
+    ) -> int:
+        """Record one file's identity on every row that shares it, atomically."""
+        if not issue_ids:
+            return 0
+        placeholders = ",".join("?" for _ in issue_ids)
+        changed = self.conn.execute(
+            f"""UPDATE downloads
+                SET sha256 = ?, file_size_bytes = ?, source_sha256 = ?, source_size = ?,
+                    metadata_stamp = ?
+                WHERE status = 'complete' AND issue_id IN ({placeholders})""",
+            (sha256, file_size_bytes, source_sha256, source_size, metadata_stamp, *issue_ids),
+        ).rowcount
+        self.conn.commit()
+        return changed
 
     def get_issues(
         self,

@@ -234,6 +234,9 @@ class Runtime:
         # per-issue publication locks with their user counts.
         self._active_attempts: dict[int, str] = {}
         self._publishing: dict[int, list] = {}
+        # Library maintenance (repair-titles, repair-metadata) moves or rewrites
+        # organized files: one such command at a time.
+        self.maintenance_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1395,7 +1398,8 @@ class Runtime:
                 row = self.store.conn.execute('SELECT limewire_url FROM issues WHERE id=?', (issue_id,)).fetchone()
                 if row and is_valid_download_url(row['limewire_url'] or ''):
                     reacquire = bool(self.store.conn.execute("""UPDATE downloads SET status='pending',file_path=NULL,
-                        downloaded_at=NULL,file_size_bytes=NULL,sha256=NULL,next_action=NULL,next_retry_at=NULL
+                        downloaded_at=NULL,file_size_bytes=NULL,sha256=NULL,source_sha256=NULL,source_size=NULL,
+                        metadata_stamp=NULL,next_action=NULL,next_retry_at=NULL
                         WHERE issue_id=? AND status='complete'""", (issue_id,)).rowcount)
         if reacquire:
             self.logger.warning('Organized file for a requested issue is missing; downloading it again')

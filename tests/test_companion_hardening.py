@@ -888,3 +888,35 @@ def test_termination_signal_withdraws_a_queued_command(tmp_path):
         LocalWaiter(store, operation, store.limits).wait()
     assert op_state(store, operation) == ("failed", {"code": "withdrawn"})
     idx.close()
+
+
+async def test_missing_original_reset_clears_source_identity_and_stamp(tmp_path):
+    seen = []
+
+    async def batch(issues, _cfg, index, on_start=None, **_kwargs):
+        for issue in issues:
+            row = index.conn.execute(
+                "SELECT sha256, source_sha256, source_size, metadata_stamp FROM downloads WHERE issue_id=?",
+                (issue["id"],),
+            ).fetchone()
+            seen.append(tuple(row))
+        return [{"issue": issue, "success": False, "error": "x", "failure_kind": "transient"} for issue in issues]
+
+    runtime, idx, _ = make_runtime(tmp_path, batch=batch)
+    store = runtime.store
+    store.initialize()
+    missing = add_issue(idx, "Remote Title - June 2025", slug="gone")
+    idx.update_download_status(
+        missing, DownloadStatus.COMPLETE, str(tmp_path / "deleted.pdf"), 10, "0" * 64,
+        source_sha256="1" * 64, source_size=8, metadata_stamp="1:abc:10:1:2",
+    )
+    await runtime.start(background=False)
+    try:
+        client, scope = remote_scope(store)
+        store.create_request(client, scope, {"issue_id": store.provider_issue(missing)})
+        await runtime.tick(scan=False)
+        await runtime.tick(scan=False)
+        assert seen and seen[0] == (None, None, None, None)
+    finally:
+        await runtime.stop()
+        idx.close()
