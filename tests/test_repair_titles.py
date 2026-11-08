@@ -214,3 +214,106 @@ def test_site_suffixed_title_is_repaired_and_its_file_relocated(tmp_path, monkey
     titles = [m["title"] for m in idx.get_tracked_magazines()]
     assert SUFFIXED not in titles  # the emptied suffixed record is pruned
     idx.close()
+
+
+SHARED = "FlyPast – July 2026 | Magazine [PDF]"
+
+
+def _shared_file_library(tmp_path, titles):
+    """Several rows pointing at one file, as content deduplication leaves them."""
+    from magsync.core.index import MagazineIndex as Index
+
+    idx = Index(db_path=tmp_path / "index.db")
+    out = tmp_path / "magazines"
+    shared = out / "FlyPast" / "FlyPast - 2026-07 - July 2026 Magazine [PDF].pdf"
+    shared.parent.mkdir(parents=True)
+    shared.write_bytes(b"%PDF-1.6 payload")
+    ids = []
+    for n, title in enumerate(titles):
+        mag = idx.get_or_create_magazine(title, title.lower())
+        idx.add_issues(mag, [{"title": title, "page_url": f"https://freemagazines.top/flypast-{n}/",
+                              "limewire_url": LW, "year": 2026, "month": 7}])
+        issue_id = max(r["id"] for r in idx.get_issues())
+        idx.update_download_status(issue_id, DownloadStatus.COMPLETE, file_path=str(shared))
+        ids.append(issue_id)
+    return idx, out, shared, ids
+
+
+def _paths(idx, ids):
+    rows = {r["id"]: r for r in idx.get_issues()}
+    return [Path(rows[i]["file_path"]) for i in ids]
+
+
+def test_every_row_sharing_a_moved_file_follows_it(tmp_path):
+    from magsync.core.repair import repair_titles
+
+    idx, out, shared, ids = _shared_file_library(tmp_path, [SHARED, SHARED])
+    report = repair_titles(idx, out)
+
+    assert (report.moved, report.missing) == (1, 0)
+    first, second = _paths(idx, ids)
+    assert first == second and first.exists() and not shared.exists()
+    assert "[PDF]" not in first.name
+    assert [line[0] for line in report.lines] == ["moved", "shared"]
+    idx.close()
+
+
+def test_a_clean_row_sharing_the_file_is_repointed_too(tmp_path):
+    # Only the decorated row is a candidate; the clean row must not be left
+    # naming the file's old location.
+    from magsync.core.repair import repair_titles
+
+    idx, out, shared, ids = _shared_file_library(tmp_path, ["FlyPast – July 2026", SHARED])
+    repair_titles(idx, out)
+
+    clean, decorated = _paths(idx, ids)
+    assert clean == decorated and clean.exists() and not shared.exists()
+    idx.close()
+
+
+def test_dry_run_counts_a_shared_file_once(tmp_path):
+    from magsync.core.repair import repair_titles
+
+    idx, out, shared, ids = _shared_file_library(tmp_path, [SHARED, SHARED])
+    report = repair_titles(idx, out, dry_run=True)
+
+    assert (report.moved, report.missing) == (1, 0)
+    assert shared.exists() and _paths(idx, ids) == [shared, shared]
+    idx.close()
+
+
+def test_every_decorated_suffix_spelling_is_pruned_when_emptied(tmp_path):
+    from magsync.core.repair import repair_titles
+
+    idx = MagazineIndex(db_path=tmp_path / "index.db")
+    for title in ("Edge | Magazine [PDF]", "Total Film | Magazine (PDF)", "BBC Science Focus | PDF",
+                  "GQ USA Fall 2026 - Magazine PDF", "[PDF] Orphan", "Wired [UK]", "Mac|Life"):
+        idx.get_or_create_magazine(title, title.lower())
+    report = repair_titles(idx, tmp_path / "out")
+
+    assert sorted(report.pruned) == sorted([
+        "Edge | Magazine [PDF]", "Total Film | Magazine (PDF)", "BBC Science Focus | PDF",
+        "GQ USA Fall 2026 - Magazine PDF", "[PDF] Orphan"])
+    titles = {m["title"] for m in idx.get_tracked_magazines()}
+    assert {"Wired [UK]", "Mac|Life"} <= titles  # undecorated empty records stay
+    idx.close()
+
+
+def test_every_suffix_spelling_is_a_repair_candidate(tmp_path):
+    # The candidate query once prefiltered on "|...PDF" and silently skipped
+    # spellings the stripper already handled.
+    from magsync.core.repair import repair_titles
+
+    idx = MagazineIndex(db_path=tmp_path / "index.db")
+    titles = ["Astronomy - July 2026 - Magazine PDF", "Edge 2026 - | Free Download",
+              "Sky at Night - March 2026 - Free Download", "Wired - May 2026 – PDF"]
+    for n, title in enumerate(titles):
+        mag = idx.get_or_create_magazine(title, title.lower())
+        idx.add_issues(mag, [{"title": title, "page_url": f"https://freemagazines.top/s{n}/",
+                              "limewire_url": LW}])
+    report = repair_titles(idx, tmp_path / "out")
+
+    assert report.candidates == len(titles)
+    assert sorted(r["title"] for r in idx.get_issues()) == sorted([
+        "Astronomy - July 2026", "Edge 2026", "Sky at Night - March 2026", "Wired - May 2026"])
+    idx.close()

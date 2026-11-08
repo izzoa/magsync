@@ -4,6 +4,31 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.1] - 2026-11-07
+
+`repair-metadata` refused most of a real library. On the production index, 922 of 1599 files (58%) were reported `ambiguous` and never stamped. The source posts one issue under several page URLs with cosmetically different titles, and deduplication points every later row at the first file. Those rows then "disagreed" over a dash, an apostrophe, a missing genre, or a site suffix.
+
+### Fixed
+- **Rows that share a file now agree when they differ only in source presentation.** The agreement test compares title and series name after the folding subscription matching already uses: accents, apostrophe and dash variants, case, and whitespace. Issue date and series index are still compared exactly, so rows that name different issues are still refused.
+- **A deterministic row wins when agreeing rows differ in exact text.** The row whose title names the file on disk wins, so a file's name and its embedded metadata keep agreeing. When no row names the file, the smallest exact text wins. The choice never depends on row order, and a second run reports the file as `current`.
+- **Genres are combined, not compared.** A row with no genre no longer conflicts with one that has a genre. Different genres are merged without duplicates (ignoring case): the winning row's genres come first in their own order, then the rest sorted.
+- **`ambiguous` now says what differed.** The report line names the disagreeing parts (`title`, `series name`, `date`, `series index`), or says that a row has no usable title.
+- **The whole family of source suffixes is stripped, not one spelling.** Besides `… | Magazine PDF` and `… | Download Magazine PDF`, these are now removed:
+  - a bracketed or parenthesized format word (`… | Magazine [PDF]`, `… | PDF`);
+  - a hyphen or dash separator (`… - Magazine PDF`, `… – Magazine PDF`);
+  - `… | Free Download`;
+  - a separator left dangling at the end (`… August 2026 -`, `… - | Free Download`).
+
+  Bracketed names such as `PC Gamer [UK]` and endings such as `PDF Edition` are kept. This affects magazine names, file placement and subscription matching. The matcher version is bumped, so the companion re-evaluates stored matches.
+- **Site decoration is no longer stamped into PDFs.** A single-row file whose stored title carried one of the newly covered suffixes was stamped with it verbatim, for example `Science News – July 2026 | Magazine [PDF]`. Those files are now re-stamped with the clean title.
+- **`repair-titles` moves a shared file for every row that points at it.** When deduplication left two or more rows on one file, the first row moved the file and updated only its own path. The others kept naming a file that no longer existed, so `repair-metadata` and companion exports reported them missing. Every row at the old path now follows the file, including rows whose own title was already clean. On a copy of the production index, a run would have left 116 rows pointing at missing files (64 shared files are newly reached by the wider suffix rule); it now leaves none. Rows that follow a moved file are listed as sharing it.
+- **`repair-titles` covers every suffix spelling the normalizer strips.** Its candidate query prefiltered on `…|…PDF`, so 228 production rows were skipped (`… - Magazine PDF`, `… - | Free Download`) and their files stayed in folders named after the decoration. Candidates are now chosen by the same rule that normalizes titles.
+- **Emptied magazine records are pruned for every suffix spelling.** Pruning only matched `[…]`, `| Magazine PDF` and `| Download Magazine PDF`, so records such as `… | Magazine [PDF]` stayed in the library with no issues, and `magsync update` searched the site for them on every run.
+
+> **Upgrading from 0.10.0:** run `magsync repair-titles --dry-run`, then `magsync repair-titles`, then `magsync repair-metadata --dry-run`, then `magsync repair-metadata`, then *Scan library* in BookOrbit. Many previously `ambiguous` files are stamped for the first time. No schema change; rollback is clean.
+>
+> **Still refused:** titles separated by an em dash (`Aerospace — July 2022`) still disagree with a hyphenated duplicate. Magazine-name normalization does not split on an em dash, so the two rows name different series.
+
 ## [0.10.0] - 2026-10-28
 
 Downloaded PDFs now carry **accurate embedded metadata** instead of the source's junk. Before, library apps such as BookOrbit showed `downmagaz.net` as every issue's title, author, genre and tag. New downloads are stamped automatically; `magsync repair-metadata` fixes files already in the library.

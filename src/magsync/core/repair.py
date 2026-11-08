@@ -20,7 +20,7 @@ import secrets
 import shutil
 import stat
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from magsync.core import pdfmeta
@@ -48,7 +48,7 @@ class RepairReport:
     pruned: list[str] = field(default_factory=list)
     removed_dirs: int = 0
     # (kind, sanitized label, detail) — kinds: renamed, correct, missing,
-    # collision, moved.
+    # collision, moved, shared (follows a file another row just moved).
     lines: list[tuple[str, str, str]] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -74,6 +74,10 @@ def repair_titles(index, output_dir: str | Path, *, dry_run: bool = False) -> Re
     ]
     report.candidates = len(candidates)
     touched_dirs: set[Path] = set()
+    # Files this run has moved. Deduplication points several rows at one
+    # file; the first row to move it repoints them all, and the others must
+    # not then see the old path as missing.
+    moved: dict[Path, Path] = {}
 
     for row in candidates:
         new_title = strip_source_decorations(row["title"])
@@ -98,6 +102,9 @@ def repair_titles(index, output_dir: str | Path, *, dry_run: bool = False) -> Re
             report.lines.append(("renamed", label, norm))
             continue
 
+        if old_path in moved:
+            report.lines.append(("shared", label, moved[old_path].parent.name))
+            continue
         new_path = organize_path(new_title, row["page_url"] or "", str(output_dir))
         if old_path == new_path:
             report.lines.append(("correct", label, ""))
@@ -115,7 +122,8 @@ def repair_titles(index, output_dir: str | Path, *, dry_run: bool = False) -> Re
         if not dry_run:
             new_path.parent.mkdir(parents=True, exist_ok=True)
             old_path.replace(new_path)
-            index.set_download_file_path(row["id"], str(new_path))
+            index.repoint_download_file_path(row["file_path"], str(new_path))
+        moved[old_path] = new_path
         touched_dirs.add(old_path.parent)
         report.moved += 1
         report.lines.append(("moved", label, new_path.parent.name))
@@ -254,14 +262,58 @@ def _unchanged_since_stamp(row: dict, fingerprint: str, observed: tuple[int, int
     return record is not None and record[0] == fingerprint and record[1:] == observed
 
 
-def _single_fingerprint(rows: list[dict]) -> tuple[pdfmeta.StampSpec, str] | None:
-    specs = [pdfmeta.stamp_spec_for(row) for row in rows]
-    if not specs or any(spec is None for spec in specs):
-        return None
-    fingerprints = {pdfmeta.fingerprint(spec) for spec in specs}
-    if len(fingerprints) != 1:
-        return None
-    return specs[0], fingerprints.pop()
+@dataclass(frozen=True)
+class StampChoice:
+    """The stamp for a shared file, or why its rows cannot agree on one."""
+
+    spec: pdfmeta.StampSpec | None = None
+    fingerprint: str | None = None
+    disagreement: str = ""
+
+
+def _names_file(row: dict, names: set[str]) -> bool:
+    """Whether this row's title produces the file's name on disk."""
+    title = row.get("title") or ""
+    return bool(title) and organize_path(title, row.get("page_url") or "", "").name in names
+
+
+def _combined_genres(winner: pdfmeta.StampSpec, specs: list[pdfmeta.StampSpec]) -> tuple[str, ...]:
+    """The winner's genres in its own order, then any others, sorted.
+
+    A row without a genre says nothing about genre, so it never conflicts.
+    Deduplicated ignoring case (first spelling kept); independent of row order.
+    """
+    others = sorted({genre for spec in specs for genre in spec.genres}, key=lambda g: (g.casefold(), g))
+    combined: dict[str, str] = {}
+    for genre in (*winner.genres, *others):
+        combined.setdefault(genre.casefold(), genre)
+    return tuple(combined.values())
+
+
+def choose_stamp(rows: list[dict], path: Path) -> StampChoice:
+    """Decide what to stamp into a file every one of ``rows`` references.
+
+    Rows agree when their stamps are equal once source presentation is folded
+    away (``pdfmeta.comparison_key``); rows that name different issues do not.
+    Among agreeing rows, the one whose title names the file wins, so the
+    file's name and its embedded metadata agree; failing that, the smallest by
+    exact text. Nothing depends on row order, so every run chooses alike.
+    """
+    if not rows:
+        return StampChoice(disagreement="no rows reference this file")
+    pairs = [(row, pdfmeta.stamp_spec_for(row)) for row in rows]
+    if any(spec is None for _row, spec in pairs):
+        return StampChoice(disagreement="a row sharing this file has no usable title")
+    keys = [pdfmeta.comparison_key(spec) for _row, spec in pairs]
+    differing = [field for field in keys[0] if len({key[field] for key in keys}) > 1]
+    if differing:
+        return StampChoice(disagreement="rows sharing this file disagree on its " + ", ".join(differing))
+    names = {path.name} | {Path(row["file_path"]).name for row in rows if row.get("file_path")}
+    naming = [spec for row, spec in pairs if _names_file(row, names)]
+    pool = naming or [spec for _row, spec in pairs]
+    winner = min(pool, key=lambda spec: (spec.title, spec.series_name, spec.genres))
+    spec = replace(winner, genres=_combined_genres(winner, [spec for _row, spec in pairs]))
+    return StampChoice(spec, pdfmeta.fingerprint(spec))
 
 
 def sweep_staging(path: Path) -> None:
@@ -289,10 +341,10 @@ def prepare_file(group: FileGroup, *, verify: bool, dry_run: bool, token: str) -
         return MetadataPlan("missing")
     if not group.rows:
         return MetadataPlan("missing")
-    chosen = _single_fingerprint(group.rows)
-    if chosen is None:
-        return MetadataPlan("ambiguous", "rows sharing this file disagree on its metadata")
-    spec, fingerprint = chosen
+    chosen = choose_stamp(group.rows, path)
+    if chosen.spec is None:
+        return MetadataPlan("ambiguous", chosen.disagreement)
+    spec, fingerprint = chosen.spec, chosen.fingerprint
     if not verify and all(_unchanged_since_stamp(row, fingerprint, observed) for row in group.rows):
         return MetadataPlan("current")
     if observed[0] > pdfmeta.STAMP_SIZE_LIMIT:
@@ -427,11 +479,9 @@ def finalize_file(
     if plan.action == "replace" and locked_ids is not None and not {row["issue_id"] for row in rows} <= locked_ids:
         discard()
         return "busy"
-    if plan.fingerprint is not None:
-        chosen = _single_fingerprint(rows)
-        if chosen is None or chosen[1] != plan.fingerprint:
-            discard()
-            return "ambiguous"
+    if plan.fingerprint is not None and choose_stamp(rows, path).fingerprint != plan.fingerprint:
+        discard()
+        return "ambiguous"
     state = plan.observed
     if plan.action == "replace":
         try:

@@ -40,6 +40,7 @@ from pypdf.generic import (
     read_object,
 )
 
+from magsync.core.matching import canonicalize_for_match
 from magsync.core.models import StampSpec
 from magsync.core.organizer import normalize_title, parse_date, strip_source_decorations
 
@@ -104,6 +105,23 @@ def stamp_spec_for(issue: Mapping[str, Any]) -> StampSpec | None:
         day=day,
         genres=genres,
     )
+
+
+def comparison_key(spec: StampSpec) -> dict[str, str | None]:
+    """What decides whether two stamps describe the same issue.
+
+    Title and series name are folded the way subscription matching folds them
+    (accents, apostrophe and dash variants, case, whitespace): source spelling
+    is not a disagreement. Date and series index are compared as they are, so
+    rows naming different issues still disagree. Genres are not part of it;
+    they are combined across rows instead. Only for deciding: never embedded.
+    """
+    return {
+        "title": canonicalize_for_match(spec.title),
+        "series name": canonicalize_for_match(spec.series_name),
+        "date": date_text(spec),
+        "series index": series_index(spec),
+    }
 
 
 def date_text(spec: StampSpec) -> str | None:

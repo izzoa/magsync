@@ -454,6 +454,8 @@ def _print_repair(report: dict, *, dry_run: bool) -> None:
             console.print(f"  [yellow]![/yellow] {label}: destination already exists, both files left in place")
         elif kind == "moved":
             console.print(f"  [green]→[/green] {label}: moved into {escape(detail)}")
+        elif kind == "shared":
+            console.print(f"  [green]→[/green] {label}: shares a file already moved into {escape(detail)}")
     pruned = report.get("pruned") or []
     console.print(
         f"\n[bold]{report['repaired']} title(s) repaired[/bold], {report['moved']} file(s) moved"

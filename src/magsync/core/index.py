@@ -17,6 +17,7 @@ from magsync.core.matching import (
     title_match,
 )
 from magsync.core.models import DownloadStatus, IndexOutcome, RequestedBy
+from magsync.core.organizer import strip_source_decorations
 from magsync.core.urls import (
     is_valid_download_url,
     normalize_download_url,
@@ -883,21 +884,25 @@ class MagazineIndex:
         return {url for url in wanted if url not in linked}
 
     def get_issues_with_tagged_titles(self) -> list[dict]:
-        """Return issues whose stored title may still carry source decorations.
+        """Return issues whose stored title still carries source decorations.
 
-        That is a legacy format tag or the source's site suffix. ``[`` and
-        ``]`` are literal in SQLite ``LIKE``, so this is a coarse prefilter;
-        the caller applies the anchored patterns to decide.
+        That is a legacy format tag or any spelling of the source's site
+        suffix. The rule lives in ``strip_source_decorations`` alone: a SQL
+        ``LIKE`` prefilter fell behind it once already (it missed
+        ``- Magazine PDF`` and ``| Free Download``), and scanning every title
+        is cheap at library scale.
         """
         rows = self.conn.execute(
             """SELECT i.id, i.title, i.page_url, i.magazine_id,
                       d.status AS download_status, d.file_path
                FROM issues i
                LEFT JOIN downloads d ON d.issue_id = i.id
-               WHERE i.title LIKE '[%]%' OR i.title LIKE '%|%PDF%'
                ORDER BY i.id"""
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            dict(row) for row in rows
+            if row["title"] and strip_source_decorations(row["title"]) != row["title"]
+        ]
 
     def repair_issue_title(
         self,
@@ -928,18 +933,18 @@ class MagazineIndex:
         self.conn.commit()
         return cursor.rowcount == 1
 
-    def set_download_file_path(self, issue_id: int, file_path: str) -> bool:
-        """Point a download row at a relocated file.
+    def repoint_download_file_path(self, old_path: str, new_path: str) -> int:
+        """Point every download row recorded at ``old_path`` at ``new_path``.
 
-        Content deduplication resolves a hash to this path, so a moved file
-        whose path is not updated would leave dedup naming a missing file.
+        Deduplication lets several rows share one file, so a relocation must
+        move all of them together or the rest are left naming a missing file.
         """
         cursor = self.conn.execute(
-            "UPDATE downloads SET file_path = ? WHERE issue_id = ?",
-            (str(file_path), issue_id),
+            "UPDATE downloads SET file_path = ? WHERE file_path = ?",
+            (str(new_path), str(old_path)),
         )
         self.conn.commit()
-        return cursor.rowcount == 1
+        return cursor.rowcount
 
     def prune_empty_tagged_magazines(self) -> list[str]:
         """Delete source-decorated magazine rows that have no issues.
@@ -950,13 +955,16 @@ class MagazineIndex:
         the correctly-named magazine, or because historical indexing created
         them and the issues stayed attached elsewhere.
         """
-        rows = self.conn.execute(
+        empty = self.conn.execute(
             """SELECT id, title FROM magazines
-               WHERE (title LIKE '[%]%'
-                      OR title LIKE '% | Magazine PDF'
-                      OR title LIKE '% | Download Magazine PDF')
-                 AND id NOT IN (SELECT DISTINCT magazine_id FROM issues)"""
+               WHERE id NOT IN (SELECT DISTINCT magazine_id FROM issues)"""
         ).fetchall()
+        # The same rule that decides what a repair strips decides what counts
+        # as decorated here, so every suffix spelling it consolidates is pruned.
+        rows = [
+            row for row in empty
+            if row["title"] and strip_source_decorations(row["title"]) != row["title"]
+        ]
         if not rows:
             return []
         self.conn.executemany(

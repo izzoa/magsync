@@ -192,12 +192,22 @@ def strip_format_tag(title: str) -> str:
     return _FORMAT_TAG_RE.sub("", title, count=1)
 
 
-# The source's site-name suffix on page titles ("... | Magazine PDF", earlier
-# "... | Download Magazine PDF"). Issues indexed while the scraper did not
-# strip the current spelling still carry it in their stored title.
+# The source's site-name suffix on page titles, as a family rather than one
+# spelling: "... | Magazine PDF", "... | Download Magazine PDF",
+# "... | Magazine [PDF]", "... - Magazine PDF", "... | Free Download", and a
+# bare separator left dangling at the end ("... August 2026 -"). Issues indexed
+# while the scraper did not strip a spelling still carry it in their stored
+# title. One trailing segment per match: the separator needs whitespace before
+# it (so hyphenated words survive), and the decoration comes from a closed
+# vocabulary, so an unknown ending stays visible rather than being eaten.
 _SOURCE_SUFFIX_RE = re.compile(
-    r"\s+\|\s+(?:Download\s+)?Magazine\s+PDF\s*$", re.IGNORECASE
+    r"\s+[|\-–—]"
+    r"(?:\s+(?:(?:Download\s+)?(?:Magazine\s+)?(?:PDF|\[PDF\]|\(PDF\))|Free\s+Download))?"
+    r"\s*$",
+    re.IGNORECASE,
 )
+# "... - | Free Download" is a decoration after a dangling separator.
+_MAX_SUFFIX_SEGMENTS = 3
 
 
 def strip_source_decorations(title: str) -> str:
@@ -206,11 +216,18 @@ def strip_source_decorations(title: str) -> str:
     Neither is part of the publication's name or issue. A trailing suffix is
     worse than a tag: on a title with no other separator it becomes part of
     the magazine name, splitting the library and blocking ``exact`` matches,
-    and elsewhere it ends up in the issue detail of the filename.
+    and elsewhere it ends up in the issue detail of the filename and in the
+    title stamped into the PDF.
     """
     if not title:
         return title
-    return _SOURCE_SUFFIX_RE.sub("", strip_format_tag(title), count=1)
+    title = strip_format_tag(title)
+    for _ in range(_MAX_SUFFIX_SEGMENTS):
+        stripped = _SOURCE_SUFFIX_RE.sub("", title, count=1)
+        if stripped == title:
+            break
+        title = stripped
+    return title
 
 
 def normalize_title(title: str) -> str:

@@ -35,7 +35,7 @@ from magsync.core.organizer import normalize_title, strip_accents
 
 # Part of every stored materialization fingerprint: bump it whenever the
 # matching rules below change so persisted incremental state re-evaluates.
-MATCHER_VERSION = 1
+MATCHER_VERSION = 2  # 2: the whole family of source suffixes is stripped
 
 
 class SubscriptionLike(Protocol):

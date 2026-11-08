@@ -161,7 +161,7 @@ magsync daemon --dry-run
 
 **Legacy titles.** The source used to prepend a format label to every listing (`[PDF] …`). A leading bracketed tag is normalized away, so it never affects a magazine's name, its folder, or subscription matching — importantly, an `exact` subscription can match such an issue, which it previously could not. Issues indexed before that fix keep the tag in their *stored* title (indexing never rewrites a title, since it drives derived dates and magazine association), which splits the library into duplicate folders like `[PDF] Science News`. Run `magsync repair-titles` once to consolidate: it strips the tag, re-derives the affected fields, re-associates magazines, moves already-downloaded files into their correct folder, updates the recorded path so deduplication keeps resolving, and prunes emptied records. It never overwrites an existing file, and `--dry-run` previews everything.
 
-The same applies to the site-name suffix the source appends to page titles (`… | Magazine PDF`, earlier `… | Download Magazine PDF`). It is normalized away everywhere: without that, an issue such as `GQ USA Fall 2026 | Magazine PDF` became a magazine of its own, with its own folder. Issues indexed while the suffix was stored can be consolidated with the same `magsync repair-titles`.
+The same applies to the site-name suffix the source appends to page titles (`… | Magazine PDF`, earlier `… | Download Magazine PDF`, plus variants such as `… | Magazine [PDF]`, `… - Magazine PDF`, `… | Free Download`, or a separator left dangling at the end). It is normalized away everywhere: in magazine names, file placement, subscription matching and the stamped PDF title. Without that, an issue such as `GQ USA Fall 2026 | Magazine PDF` became a magazine of its own, with its own folder. Issues indexed while any of these suffixes was stored can be consolidated with the same `magsync repair-titles`. A file several issues share moves once, and every issue that points at it follows.
 
 **Fixing metadata of files you already have.** New downloads are stamped automatically (see [Embedded metadata](#embedded-metadata)). `magsync repair-metadata` stamps files that were downloaded earlier. Run it again after `magsync repair-titles`, because a corrected title changes the metadata. It reads each file, proves which bytes are the original download, writes a stamped copy next to the file, and atomically swaps it in.
 
@@ -169,7 +169,7 @@ The same applies to the site-name suffix the source appends to page titles (`…
 |-------------|---------|
 | `stamped` | metadata written (with `--dry-run`: *would be stamped*) |
 | `current` | already carries this metadata; skipped without reading the file if its size, modification time and inode are unchanged since the last stamp |
-| `ambiguous` | several index rows share this file but disagree on its title or date; left alone |
+| `ambiguous` | several index rows share this file but name different issues (different date, series index, or a title that differs beyond punctuation, case or site suffix); left alone, and the line names what differed |
 | `edited` | another tool (e.g. BookOrbit's write-back) wrote metadata into it; left alone |
 | `modified` | the file changed outside magsync since it was recorded (for example another tool appended a revision); left alone, never truncated |
 | `unstampable` | encrypted, truncated, oversized, unparseable, or with damaged cross-reference data; its hash is still recorded |
