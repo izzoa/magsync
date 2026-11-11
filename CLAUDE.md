@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**magsync** is a Python CLI/TUI tool that indexes and downloads PDF magazines from freemagazines.top, organizing them into `[Magazine Title]/[YYYY]/[MM]/` directories. Downloads go through LimeWire's E2E encrypted file-sharing service, which magsync decrypts natively in Python (no browser needed).
+**magsync** is a Python CLI/TUI tool that indexes and downloads PDF magazines from freemagazines.top, organizing them flat into one folder per magazine: `[Magazine Title]/[Magazine Title] - [YYYY]-[MM] - [Detail].pdf` (e.g. `The New Yorker/The New Yorker - 2026-04 - April 13.pdf`). Downloads come from LimeWire (E2E-encrypted, decrypted natively in Python, no browser needed), VK or easyupload.us.
 
 ## Tech Stack
 
@@ -37,7 +37,9 @@ src/magsync/
 │   ├── scraper.py       # freemagazines.top scraping (search, detail pages)
 │   ├── downloader.py    # LimeWire session, key derivation, download+decrypt
 │   ├── index.py         # SQLite index (magazines, issues, downloads tables)
-│   └── organizer.py     # Date parsing, title normalization, file placement
+│   ├── organizer.py     # Date parsing, title normalization, file placement
+│   ├── pdfmeta.py       # Embedded PDF metadata stamp (XMP + Info), provenance proof
+│   └── repair.py        # repair-titles / repair-metadata over an existing library
 └── tui/
     └── app.py           # Textual TUI (search, downloads, library tabs)
 ```
@@ -60,6 +62,7 @@ Encryption constants (salt, IVs) are in `~/.magsync/config.toml` and auto-extrac
 - **Self-healing constants** — on decryption failure, auto-scrapes LimeWire's JS bundles for fresh constants
 - **Two LimeWire URL formats** — short ID (passphrase path) and UUID (raw key path)
 - **User-Agent required** — freemagazines.top returns 403 without a browser User-Agent header
+- **Multi-vocabulary metadata stamp** — each PDF gets one appended update stating series, index and date in BookOrbit's, calibre's and PRISM's keys (one XMP `rdf:Description` each), laid out by the source's cross-reference chain (a stream only for a uniform all-stream chain, otherwise a table with fresh object numbers) so Kavita sees it; tests check stamps with independent ports of each app's reader (`tests/*_emulation.py`). See README "Embedded metadata"
 
 ## Documentation Requirements
 

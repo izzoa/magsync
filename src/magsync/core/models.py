@@ -332,6 +332,8 @@ class StampSpec:
     month: int | None = None
     day: int | None = None
     genres: tuple[str, ...] = ()
+    # The issue text that follows the magazine name ("Spring 2025"), if any.
+    cover_display: str | None = None
 
 
 @dataclass

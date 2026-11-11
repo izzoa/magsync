@@ -389,11 +389,18 @@ def prepare_file(group: FileGroup, *, verify: bool, dry_run: bool, token: str) -
             fingerprint=fingerprint if stamped else None, observed=observed,
         )
 
-    if found.kind == "healed":
+    if found.kind == "healed" and found.stamp_version == pdfmeta.STAMP_VERSION:
         return record("current", "healed", stamped=True)
+    # A file healed from an older stamp version is re-stamped below: its
+    # bytes are provably magsync's, so truncating to the original is safe.
     original = data[: found.original_size]
     outcome = pdfmeta.stamp_payload(original, spec, source_sha256=found.original_sha256)
     if outcome.appended is None:
+        if found.stamp_version is not None:
+            # Already magsync's stamp (an older version, or this one under
+            # older metadata): report it, but keep its rows and stamp record,
+            # which still describe the file on disk exactly.
+            return MetadataPlan("unstampable", outcome.reason or "")
         return record("unstampable", outcome.reason or "", stamped=False)
     stamped = original + outcome.appended
     if stamped == data:

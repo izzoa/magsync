@@ -297,3 +297,28 @@ def test_production_cross_record_name_variant_still_refuses(lib):
     )
     assert lib.run().counts["ambiguous"] == 1
     assert path.read_bytes() == payload
+
+
+# --- 6. version-2 vocabularies follow the winning row ------------------------------------
+
+
+def _prism(path: Path) -> dict[str, str]:
+    """The PRISM fields of the newest packet, read with pypdf and ElementTree (not pdfmeta)."""
+    import io
+    import xml.etree.ElementTree as ET
+
+    from pypdf import PdfReader
+
+    packet = PdfReader(io.BytesIO(path.read_bytes())).trailer["/Root"]["/Metadata"].get_data()
+    prism = "{http://prismstandard.org/namespaces/basic/2.0/}"
+    return {el.tag[len(prism):]: el.text for el in ET.fromstring(packet).iter() if el.tag.startswith(prism)}
+
+
+@pytest.mark.parametrize(("naming", "other"), [("Aerospace – July 2022", "Aerospace – JULY 2022"),
+                                               ("Aerospace – JULY 2022", "Aerospace – July 2022")])
+def test_rows_differing_in_cover_text_style_stamp_once_with_the_winners(lib, naming, other):
+    _, path = _named(lib, naming)
+    lib.add(title=other, magazine="Aerospace", path=path)
+    assert lib.run().counts["stamped"] == 1
+    assert _prism(path)["coverDisplayDate"] == naming.partition(" – ")[2]
+    assert lib.run().counts["current"] == 1

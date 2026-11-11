@@ -10,6 +10,7 @@ import hashlib
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,65 @@ def test_date_and_series_index(issue, date, index):
     assert pdfmeta.series_index(spec) == index
 
 
+@pytest.mark.parametrize(
+    ("issue", "ordinal", "cover", "created"),
+    [
+        ({"title": "Bon Appétit – August 2024"}, "2024214", "2024-08", "D:20240801120000Z"),
+        ({"title": "The Economist – April 4th-10th, 2026"}, "2026094", "2026-04-04", "D:20260404120000Z"),
+        ({"title": "New Scientist – 21 March 2026"}, "2026080", "2026-03-21", "D:20260321120000Z"),
+        ({"title": "The Economist – March 28th-April 3rd, 2026"}, "2026087", "2026-03-28", "D:20260328120000Z"),
+        ({"title": "Radio Times – 4-10 April 2026"}, "2026094", "2026-04-04", "D:20260404120000Z"),
+        ({"title": "AFAR – Spring 2025"}, "2025060", "2025-03", "D:20250301120000Z"),
+        ({"title": "Weekly – December 31, 2024"}, "2024366", "2024-12-31", "D:20241231120000Z"),
+        ({"title": "Annual Guide – 27th Edition, 2026"}, "2026000", "2026", "D:20260101120000Z"),
+        ({"title": "Mystery Magazine", "page_url": "https://x/mystery"}, None, None, None),
+    ],
+)
+def test_ordinal_index_cover_date_and_creation_date(issue, ordinal, cover, created):
+    spec = _spec(issue)
+    assert pdfmeta.ordinal_index(spec) == ordinal
+    assert pdfmeta.cover_date(spec) == cover
+    assert pdfmeta.creation_date(spec) == created
+
+
+def test_year_only_issue_sorts_before_the_years_dated_issues():
+    year_only = _spec({"title": "Annual Guide – 27th Edition, 2026"})
+    new_year = _spec({"title": "Weekly – January 1, 2026"})
+    assert pdfmeta.series_index(year_only) < pdfmeta.series_index(new_year) == "20260101"
+    assert pdfmeta.ordinal_index(year_only) < pdfmeta.ordinal_index(new_year) == "2026001"
+
+
+def test_ordinal_index_is_exact_in_float32_and_under_calibres_cap():
+    """Every day 1900-2100 survives a 32-bit float round trip, distinct and in order."""
+    import datetime
+    import struct
+
+    previous = None
+    day = datetime.date(1900, 1, 1)
+    while day.year <= 2100:
+        spec = StampSpec(title="X – d", series_name="X", year=day.year, month=day.month, day=day.day)
+        value = int(pdfmeta.ordinal_index(spec))
+        as_float32 = struct.unpack("f", struct.pack("f", value))[0]
+        assert as_float32 == value and value <= 10_000_000
+        assert previous is None or value > previous
+        previous = value
+        day += datetime.timedelta(days=1)
+
+
+@pytest.mark.parametrize(
+    ("title", "display"),
+    [
+        ("AFAR – Spring 2025", "Spring 2025"),
+        ("The Economist – April 4th-10th, 2026", "April 4th-10th, 2026"),
+        ("Science News - Vol 208 No 05, May 2026", "Vol 208 No 05, May 2026"),
+        ("Wired | June 2026", "June 2026"),
+        ("Special Collector Issue", None),
+    ],
+)
+def test_cover_display_is_the_issue_text_after_the_magazine_name(title, display):
+    assert _spec({"title": title}).cover_display == display
+
+
 def test_spec_strips_source_decorations_and_splits_genres():
     spec = _spec({"title": "[PDF] AFAR – Spring 2025 | Magazine PDF", "genre": " Travel ,Lifestyle,, Travel "})
     assert spec.title == "AFAR – Spring 2025"
@@ -103,22 +163,140 @@ def test_fingerprint_tracks_metadata_and_record_round_trips():
     assert pdfmeta.parse_stamp_record("garbage") is None
 
 
+def test_version_1_fingerprint_is_what_0_10_recorded():
+    """Records written by 0.10.x stay comparable: same input, same version-1 value."""
+    assert pdfmeta.fingerprint(_spec(), 1) == "1:c50352f06e6953b9"
+
+
+def test_version_2_fingerprint_tracks_the_new_fields():
+    spec = _spec()
+    assert pdfmeta.fingerprint(spec, 2).startswith("2:")
+    assert pdfmeta.fingerprint(spec, 2) != pdfmeta.fingerprint(spec, 1)
+    # Same title, date and series; only the cover text the stamp embeds differs.
+    other = replace(spec, cover_display="Spring Issue 2025")
+    assert pdfmeta.fingerprint(other, 1) == pdfmeta.fingerprint(spec, 1)
+    assert pdfmeta.fingerprint(other, 2) != pdfmeta.fingerprint(spec, 2)
+
+
 # --- the packet -------------------------------------------------------------------------
 
 
-def test_packet_is_strict_xml_without_late_declaration_or_junk_fields():
-    xmp = pdfmeta.build_xmp(_spec(), page_count=114, source_sha256="a" * 64, source_size=100)
+@pytest.mark.parametrize("version", [1, 2])
+def test_packet_is_strict_xml_without_late_declaration_or_junk_fields(version):
+    xmp = pdfmeta.build_xmp(_spec(), page_count=114, source_sha256="a" * 64, source_size=100, version=version)
     ET.fromstring(xmp)  # strict parser accepts it
     assert b"<?xml" not in xmp
-    for absent in (b"dc:creator", b"dc:description", b"pdf:Keywords"):
+    for absent in (b"dc:creator", b"pdf:Keywords"):
         assert absent not in xmp
-    assert pdfmeta.build_xmp(_spec(), page_count=114, source_sha256="a" * 64, source_size=100) == xmp
+    # Version 2 writes the description empty, so revision-merging readers drop the junk one.
+    description = pdfmeta.read_xmp_namespaced(xmp)["properties"].get("{http://purl.org/dc/elements/1.1/}description")
+    assert description == ([""] if version == 2 else None)
+    assert pdfmeta.build_xmp(_spec(), page_count=114, source_sha256="a" * 64, source_size=100, version=version) == xmp
 
 
 def test_packet_omits_unknown_date_and_genre():
     spec = _spec({"title": "Mystery Magazine"})
     xmp = pdfmeta.build_xmp(spec, page_count=1, source_sha256="a" * 64, source_size=1)
     assert b"dc:date" not in xmp and b"seriesIndex" not in xmp and b"dc:subject" not in xmp
+
+
+# --- the version-2 packet: one Description per vocabulary --------------------------------
+
+RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
+# The 0.10.x packet for AFAR (page_count=114, sha "a"*64, size 100), from magsync@b9a111a.
+V1_PACKET_SHA256 = "6e970cf9adc0b613a4e530c25e9e3893c1cdfd763290b850f5277a98d9771cc7"
+V2_PREFIXES = [{"dc"}, {"bookorbit"}, {"calibre", "calibreSI"}, {"prism"}, {"magsync"}]
+
+
+def _v2(spec=None, **kwargs) -> bytes:
+    return pdfmeta.build_xmp(
+        spec or _spec(), page_count=114, source_sha256="a" * 64, source_size=100, version=2, **kwargs
+    )
+
+
+def test_v2_packet_has_one_description_per_vocabulary_in_order():
+    from xml.dom import minidom
+
+    xmp = _v2()
+    rdf = minidom.parseString(xmp).getElementsByTagName("rdf:RDF")[0]
+    blocks = [n for n in rdf.childNodes if n.nodeType == n.ELEMENT_NODE]
+    assert all(block.tagName == "rdf:Description" for block in blocks)
+    declared = [{name[6:] for name, _ in block.attributes.items() if name.startswith("xmlns:")} for block in blocks]
+    assert declared == V2_PREFIXES
+    used = [
+        {child.tagName.partition(":")[0] for child in block.childNodes if child.nodeType == child.ELEMENT_NODE}
+        for block in blocks
+    ]
+    assert used == [{"dc"}, {"bookorbit"}, {"calibre"}, {"prism"}, {"magsync"}]
+    assert _v2() == xmp  # deterministic
+
+
+def test_v2_packet_writes_each_property_once_and_no_junk_carriers():
+    xmp = _v2()
+    read = pdfmeta.read_xmp_namespaced(xmp)
+    assert read["repeated"] == []
+    props = read["properties"]
+    assert "{http://purl.org/dc/elements/1.1/}creator" not in props
+    assert "{http://ns.adobe.com/pdf/1.3/}Keywords" not in props and b"Keywords" not in xmp
+    assert props["{http://purl.org/dc/elements/1.1/}description"] == [""]  # present, empty
+
+
+def test_v2_calibre_series_has_calibres_shape():
+    root = ET.fromstring(_v2())
+    series = root.find(".//{http://calibre-ebook.com/xmp-namespace}series")
+    assert series.get(f"{RDF}parseType") == "Resource"
+    children = {child.tag: child.text for child in series}
+    assert children == {
+        f"{RDF}value": "AFAR",
+        "{http://calibre-ebook.com/xmp-namespace-series-index}series_index": "2025060",
+    }
+
+
+def test_v2_prism_fields():
+    props = pdfmeta.read_xmp_namespaced(_v2())["properties"]
+    prism = {k.rpartition("}")[2]: v for k, v in props.items() if k.startswith("{http://prismstandard.org/")}
+    assert prism == {
+        "publicationName": "AFAR",
+        "aggregationType": "magazine",
+        "coverDate": "2025-03",
+        "coverDisplayDate": "Spring 2025",
+    }
+    assert all(k.startswith("{http://prismstandard.org/namespaces/basic/2.0/}") for k in props if "prism" in k)
+
+
+def test_v2_packet_for_an_undated_untitled_issue():
+    spec = _spec({"title": "Mystery Magazine"})
+    xmp = _v2(spec)
+    for absent in (b"dc:date", b"seriesIndex", b"series_index", b"coverDate", b"coverDisplayDate", b"dc:subject"):
+        assert absent not in xmp
+    series = ET.fromstring(xmp).find(".//{http://calibre-ebook.com/xmp-namespace}series")
+    assert [child.tag for child in series] == [f"{RDF}value"]
+
+
+def test_v2_packet_reads_back_as_derived_from_the_spec():
+    for issue in (AFAR, {"title": "Annual Guide – 27th Edition, 2026"}, {"title": "Mystery Magazine"}):
+        spec = _spec(issue)
+        xmp = pdfmeta.build_xmp(spec, page_count=3, source_sha256="b" * 64, source_size=7, version=2)
+        expected = pdfmeta.expected_namespaced(spec, page_count=3, source_sha256="b" * 64, source_size=7)
+        assert pdfmeta.read_xmp_namespaced(xmp) == expected
+
+
+def test_bookorbit_reads_the_v2_packet_exactly_as_the_v1_packet():
+    from bookorbit_emulation import parse_xmp
+
+    kwargs = {"page_count": 114, "source_sha256": "a" * 64, "source_size": 100}
+    v1, _ = parse_xmp(pdfmeta.build_xmp(_spec(), version=1, **kwargs).decode())
+    v2, _ = parse_xmp(pdfmeta.build_xmp(_spec(), version=2, **kwargs).decode())
+    assert v2 == v1
+    assert v2["description"] is None and v2["tags"] == [] and v2["authors"] == []
+    assert (v2["seriesName"], v2["seriesIndex"], v2["pageCount"]) == ("AFAR", "20250301", 114.0)
+
+
+def test_v1_packet_is_frozen():
+    """The version-1 builder still writes exactly what 0.10.x wrote."""
+    xmp = pdfmeta.build_xmp(_spec(), page_count=114, source_sha256="a" * 64, source_size=100, version=1)
+    assert hashlib.sha256(xmp).hexdigest() == V1_PACKET_SHA256
+    assert b"<magsync:stampVersion>1</magsync:stampVersion>" in xmp
 
 
 # --- stamping across PDF containers -----------------------------------------------------
@@ -160,7 +338,8 @@ def test_stamp_reads_back_through_bookorbit_rules(kind):
     assert parsed["pageCount"] == before["parsed"]["pageCount"]
     info = view["info"]
     assert info["Title"] == "AFAR – Spring 2025"
-    assert info["Author"] is None and info["Subject"] is None and info["Keywords"] is None
+    # Blanked, not omitted: present and empty clears the junk in revision-merging readers.
+    assert info["Author"] == "" and info["Subject"] == "" and info["Keywords"] == ""
     assert info["Creator"] != "bookorbit"
 
 
@@ -199,11 +378,13 @@ def test_build_error_and_failed_self_check_are_skips(monkeypatch):
     assert pdfmeta.stamp_payload(source, spec).reason == pdfmeta.SKIP_FAILED
     monkeypatch.undo()
 
-    def explode(self, stream):
+    def explode(*args, **kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(PdfWriter, "write", explode)
+    monkeypatch.setattr(pdfmeta, "_write_v2", explode)
     assert pdfmeta.stamp_payload(source, spec).reason == pdfmeta.SKIP_FAILED
+    monkeypatch.setattr(PdfWriter, "write", explode)  # the frozen version-1 writer
+    assert pdfmeta.stamp_payload(source, spec, version=1).reason == pdfmeta.SKIP_FAILED
 
 
 # --- provenance --------------------------------------------------------------------------
@@ -374,12 +555,17 @@ def test_library_app_creator_is_never_carried_forward():
 def test_failed_stamp_carries_a_reason(monkeypatch):
     source = _pdf()
 
-    def explode(self, stream):
+    def explode(*args, **kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(PdfWriter, "write", explode)
+    monkeypatch.setattr(pdfmeta, "_write_v2", explode)
     outcome = pdfmeta.stamp_payload(source, _spec())
     assert outcome.reason == pdfmeta.SKIP_FAILED and "boom" in outcome.error
+
+
+def test_unknown_stamp_version_is_a_skip():
+    outcome = pdfmeta.stamp_payload(_pdf(), _spec(), version=7)
+    assert outcome.reason == pdfmeta.SKIP_FAILED and outcome.appended is None
 
 
 def test_hash_observed_on_adoption_never_authorizes_truncation():

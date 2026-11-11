@@ -4,6 +4,41 @@ All notable changes to magsync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-11-10
+
+Stamped PDFs now carry their series, issue number and date in the keys other library apps read, not only BookOrbit's. Apps checked against their source: calibre (and through it Calibre-Web and Calibre-Web-Automated), Kavita, Booklore, Grimmory, Readest, OpenComic and polyreader.
+
+### Added
+- **calibre's series keys in every stamp.** These are `calibre:series` with `calibreSI:series_index`, in calibre's own shape and namespaces. calibre, Kavita, Booklore, Grimmory, Readest, OpenComic and polyreader read them from a PDF. Before this, Kavita showed no magazine series: issues of most files fell under the source's junk title, and the rest each became a series named after the issue title.
+- **A float-safe series index for those apps.** calibre's index is the ordinal date `YYYYDDD` (`2025060` for 1 March 2025; `YYYY000` when only the year is known). Kavita, Booklore and Grimmory keep the index as a 32-bit float, which cannot hold BookOrbit's `YYYYMMDD` exactly (`20250303` and `20250305` both became `20250304`), and calibre's editor caps it at 10,000,000. BookOrbit keeps `bookorbit:seriesIndex` as `YYYYMMDD`, since it stores the index exactly.
+- **PRISM magazine fields.** `prism:publicationName`, `prism:aggregationType` (`magazine`), `prism:coverDate` (only as precise as the title states) and `prism:coverDisplayDate` (for example `Spring 2025`), under the PRISM 2.0 namespace the apps that know PRISM use.
+- **The issue date in Info `/CreationDate`**, at noon UTC so no time zone from UTC−11 to UTC+11 shows a different day. Booklore and Stump read the date only from there. A year-only issue gets 1 January. An undated issue keeps the source's value.
+
+### Changed
+- **Stamp format version 2.** The XMP packet holds one `rdf:Description` per vocabulary (Dublin Core, BookOrbit, calibre, PRISM, magsync). Strict XMP parsers drop a whole Description when it uses a namespace they don't know, and before this change Dublin Core shared one with `bookorbit:` and `magsync:`. BookOrbit reads exactly what it read before.
+- **Junk author, subject, keywords and description are written empty instead of left out.** Kavita applies a file's older revisions first, and only a present value replaced the source's `downmagaz.net`. Every other app checked treats an empty value as absent.
+- **magsync now writes the appended update itself, laid out by the file's cross-reference chain.**
+  - Kavita lets an older table's entry win wherever the table sits in the chain. So for any file whose chain contains a table, magsync appends a table, with the stamped catalog, Info dict and packet under new object numbers. That includes a table-based file another tool later revised with a stream.
+  - Before this, Kavita read the original packet of every such file: junk title, no series. A live check against Kavita 0.9.1.4 confirmed both the failure and the fix.
+  - A file made only of cross-reference streams, all naming the same catalog and Info dict, gets a stream that replaces the catalog and Info dict under their own numbers, so Kavita reads only the stamp.
+  - New object numbers start above every number the source uses, whatever its `/Size` claims. A source with an understated `/Size`, or a macOS Preview save whose xref stream sits at `/Size`, can no longer have page content overwritten.
+  - The source's Info values are copied in directly rather than by reference, so Kavita, which cannot follow a reference into an object stream, still reads them. An undated issue on a source whose creation date was such a reference now stamps instead of failing its self-check.
+  - Objects that sat compressed in an object stream are written uncompressed, because Kavita skips compressed entries.
+  - pypdf's incremental writer, which always appended a stream, is no longer used for new stamps.
+- **Kavita users:** use the *Book* or *Comic (Flexible)* library type. The plain *Comic* type names a series after its volume ("AFAR (2025060)"), which splits every issue into its own series.
+- **The self-check reads each stamp back three ways** before placing it: as BookOrbit does (literal prefixes), namespace-aware (Dublin Core, calibre, PRISM, marker), and through the Info dict. It also checks the update's form, its object numbers and the page count. Any mismatch places the download unstamped, as before.
+- **`repair-metadata` keeps a magsync stamp's rows when it cannot redo the stamp.** It used to record such a file as unstamped, wiping the stamp record that still described it. It now reports `unstampable` and leaves the rows as they are.
+
+### Fixed
+- **`CLAUDE.md` described the old `[Title]/[YYYY]/[MM]/` layout.** It now describes the flat `Title/Title - YYYY-MM - Detail.pdf` layout magsync has written since the Komga/Kavita change, and names all three download hosts.
+
+> **Upgrading from 0.10.x:**
+> 1. Run `magsync repair-metadata --dry-run`. Every stamped file should be listed as `stamped`.
+> 2. Run `magsync repair-metadata`. Each version-1 stamp is replaced: the file is truncated to its proven original and gets one version-2 update.
+> 3. Rescan the library apps that read your folders (BookOrbit *Scan library*, Kavita, Komga, Booklore/Grimmory). calibre and Calibre-Web keep their own copies of each file, so re-add the files there (or replace the PDF format) to pick up the new keys.
+>
+> Version-1 files are still recognized as magsync's own, so an interrupted run heals and continues, and adopting a version-1 file records its version-1 fingerprint, so a later repair upgrades it. Keep BookOrbit's write-back off: it rewrites the packet with only its own keys. No schema change. To roll back, deploy 0.10.1 and run its `repair-metadata`, which re-stamps the files as version 1.
+
 ## [0.10.1] - 2026-11-07
 
 `repair-metadata` refused most of a real library. On the production index, 922 of 1599 files (58%) were reported `ambiguous` and never stamped. The source posts one issue under several page URLs with cosmetically different titles, and deduplication points every later row at the first file. Those rows then "disagreed" over a dash, an apostrophe, a missing genre, or a site suffix.

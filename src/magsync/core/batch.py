@@ -441,7 +441,8 @@ def _adopt_existing(dest: Path, stamp: StampSpec | None) -> DownloadResult:
     Usually a file magsync placed just before a crash. Its on-disk hash is
     always recorded (exports verify against it). Its original payload, and a
     stamp record, only when the file is provably magsync's: exactly the stamp
-    of its marker's original under this issue's metadata. A hash merely
+    of its marker's original under this issue's metadata, in the stamp
+    version the marker names. A hash merely
     observed here never becomes proof that magsync wrote the bytes.
     """
     size = dest.stat().st_size
@@ -454,11 +455,17 @@ def _adopt_existing(dest: Path, stamp: StampSpec | None) -> DownloadResult:
         if stamp is not None and marker and marker.source_size < len(data):
             original = data[: marker.source_size]
             if hashlib.sha256(original).hexdigest() == marker.source_sha256:
-                rebuilt = pdfmeta.stamp_payload(original, stamp, source_sha256=marker.source_sha256)
+                rebuilt = pdfmeta.stamp_payload(
+                    original, stamp, source_sha256=marker.source_sha256, version=marker.version
+                )
                 if rebuilt.appended is not None and original + rebuilt.appended == data:
                     source_sha256, source_size = marker.source_sha256, marker.source_size
                     st = dest.stat()
-                    record = pdfmeta.stamp_record(pdfmeta.fingerprint(stamp), st.st_size, st.st_mtime_ns, st.st_ino)
+                    # The fingerprint of the version on disk: an older stamp is
+                    # then never "current", and repair-metadata upgrades it.
+                    record = pdfmeta.stamp_record(
+                        pdfmeta.fingerprint(stamp, marker.version), st.st_size, st.st_mtime_ns, st.st_ino
+                    )
     else:
         sha256, size = pdfmeta.file_sha256(dest)
     return DownloadResult(

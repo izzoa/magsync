@@ -178,6 +178,8 @@ The same applies to the site-name suffix the source appends to page titles (`…
 
 Re-running is cheap and safe. Through a running daemon, the command runs inside the daemon, which logs a progress line every 10 files, and your terminal prints the final report.
 
+**After upgrading to a new stamp format.** A file carries the version of the stamp that produced it. When magsync's stamp format changes (0.11.0 introduced version 2: calibre and PRISM keys, the issue date in `/CreationDate`), `repair-metadata` re-stamps every older file once. It truncates each one to its proven original download and appends one new update, so files never grow with each format. Run `magsync repair-metadata --dry-run` first: every stamped file should be listed as `stamped`. Then run `magsync repair-metadata`, and rescan each library app that reads your folders (BookOrbit, Kavita, Komga, Booklore/Grimmory). calibre and Calibre-Web keep their own copies, so re-add the files there (or replace the PDF format) to pick up the new keys. Files from an older format are still recognized as magsync's own, so an interrupted run heals and continues. To roll back, run the older release's `repair-metadata`: it re-stamps the files in its own format the same way.
+
 **After a backfill in BookOrbit:**
 - Run *Scan library*, so changed files are re-read.
 - Bulk-clear *Authors* once (and *Genres* for issues whose source listed no genre). BookOrbit's "Series folders" path rules keep a book's existing authors and genres when the file supplies none, so the old `downmagaz.net` entries otherwise stay.
@@ -433,21 +435,39 @@ Every file reaches its final name through an atomic rename of a hidden temp file
 
 ### Embedded metadata
 
-Source PDFs usually carry junk metadata: `downmagaz.net` as the title, author, subject and keywords, in both the PDF Info dictionary and the XMP packet. Library apps show that junk. So, by default (`metadata.stamp = true`), magsync appends one small PDF *incremental update* to each new download before placing it. The update carries:
+Source PDFs usually carry junk metadata: `downmagaz.net` as the title, author, subject and keywords, in both the PDF Info dictionary and the XMP packet. Library apps show that junk. So, by default (`metadata.stamp = true`), magsync appends one small PDF *incremental update* to each new download before placing it.
 
-| Field | Value (example: `AFAR – Spring 2025`) |
-|-------|---------------------------------------|
-| Title (`dc:title`, Info `/Title`) | `AFAR – Spring 2025` |
-| Published date (`dc:date`) | `2025-03-01` (day `01` when the title names no day; year only when no month) |
-| Series (`bookorbit:seriesName`) | `AFAR` |
-| Series number (`bookorbit:seriesIndex`) | `20250301`: `YYYYMMDD`, so issues sort chronologically |
-| Genres (`dc:subject`) | the source page's genre, when it lists one |
-| Author, description, keywords | removed |
+Library apps read different keys, so the update states the same facts in several vocabularies. Each sits in its own XMP `rdf:Description`, so an app that does not know one vocabulary still reads the others.
 
-The original download stays byte-for-byte intact as the start of the file, and the update adds about 2 KB.
+| Field | Key | Value (example: `AFAR – Spring 2025`) |
+|-------|-----|---------------------------------------|
+| Title | `dc:title`, Info `/Title` | `AFAR – Spring 2025` |
+| Published date | `dc:date` | `2025-03-01` (day `01` when the title names no day; year only when no month) |
+| | Info `/CreationDate` | `D:20250301120000Z`: noon UTC, so no time zone from UTC−11 to UTC+11 shows another day; `1 January` for a year-only issue |
+| Genres | `dc:subject` | the source page's genre, when it lists one |
+| Series (BookOrbit) | `bookorbit:seriesName` / `bookorbit:seriesIndex` | `AFAR` / `20250301` (`YYYYMMDD`; `YYYY0000` when only the year is known) |
+| Series (calibre's keys) | `calibre:series` with `calibreSI:series_index` | `AFAR` / `2025060` (`YYYYDDD`: the year, then the day of the year; `YYYY000` when only the year is known) |
+| Magazine (PRISM) | `prism:publicationName`, `prism:aggregationType` | `AFAR`, `magazine` |
+| Cover date (PRISM) | `prism:coverDate`, `prism:coverDisplayDate` | `2025-03` (only as precise as the title), `Spring 2025` |
+| Author, description, keywords | Info `/Author`, `/Subject`, `/Keywords`, `dc:description` | written **empty**: an app that applies a file's older revisions first (Kavita) would otherwise keep the source's junk |
+
+**Which app reads what:**
+- **BookOrbit:** the `bookorbit:` series keys and `dc:date`.
+- **calibre** (and so Calibre-Web and Calibre-Web-Automated), **Kavita**, **Booklore**, **Grimmory**, **Readest**, **OpenComic** and **polyreader:** calibre's series keys.
+- **Kavita, calibre and Grimmory:** `dc:date`.
+- **Booklore and Stump:** the date only from Info `/CreationDate`.
+- **Komga, Stump and Audiobookshelf:** embedded series data is ignored; series come from folders. magsync's flat `Title/Title - YYYY-MM - …` layout already groups and orders issues for them.
+- **PRISM** is the publishing industry's magazine vocabulary. Few library apps read it today, but it describes the issue in a standard way.
+
+The two series numbers differ on purpose. BookOrbit stores its index exactly, as text, so it gets the readable `YYYYMMDD`. Kavita, Booklore and Grimmory store calibre's index as a 32-bit float, which cannot hold `YYYYMMDD` exactly (`20250303` and `20250305` both become `20250304`), and calibre's editor caps it at 10,000,000. `YYYYDDD` is exact everywhere and still sorts chronologically.
+
+The original download stays byte-for-byte intact as the start of the file, and the update adds about 2.5 KB.
 - **Reading progress survives.** Readers that track files by sampled bytes, such as BookOrbit/KOReader, keep their progress.
+- **The update is laid out so every reader finds it.** A file whose cross-reference sections are all streams (all naming the same catalog and Info dict) gets a stream, with the catalog and Info dict replaced under their own numbers. Any other file gets a table, with the stamped catalog, Info dict and packet under new object numbers. That includes a file that ends in a stream another tool added over an original table. Readers that resolve a file's revisions differently from the PDF standard, such as Kavita, then still find the stamp.
+- **In Kavita, use the *Book* or *Comic (Flexible)* library type.** Both group a magazine's issues as one series. The plain *Comic* type names a series after its volume ("AFAR (2025060)"), so every issue becomes its own series. Kavita shows calibre's index as the volume, e.g. `2025060`.
 - **Encrypted, truncated, unusually large or structurally damaged PDFs are placed unstamped.** They are never failed. A damaged one has a wrong `startxref` or object offsets that readers must repair.
-- **Each stamp is verified before placement.** Its newest trailer, catalog and every field are read back.
+- **Each stamp is verified before placement.** Its newest trailer, catalog, Info dict and every field are read back, both the way BookOrbit reads them (literal prefixes) and the way namespace-aware apps do, along with the update's layout.
+- **Keep BookOrbit's write-back off.** BookOrbit's metadata write-back, including its manual *write and rename* action (which ignores the library's write-back switch), rewrites the packet with only its own keys. The calibre and PRISM keys are lost, and `repair-metadata` then reports the file as `edited`. Editing a series in calibre or polyreader updates calibre's keys but not BookOrbit's.
 
 ## Dependencies
 
